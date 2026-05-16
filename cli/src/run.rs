@@ -1,3 +1,4 @@
+#[cfg(feature = "npz")]
 use fs::File;
 use std::fmt::{Debug, Display};
 use std::path::PathBuf;
@@ -6,6 +7,7 @@ use std::str::FromStr;
 use crate::TractResult;
 use crate::{Model, Parameters};
 use fs_err as fs;
+#[cfg(feature = "npz")]
 use ndarray_npy::NpzWriter;
 use nu_ansi_term::Color::*;
 use tract_core::ops::cnn::conv::Im2Col;
@@ -18,6 +20,7 @@ use tract_nnef::tensors::write_tensor;
 use tract_pulse::internal::*;
 
 /// Add a tensor entry into a npz file.
+#[cfg(feature = "npz")]
 fn npz_add_tensor(npz: &mut NpzWriter<File>, name: String, tensor: &Tensor) -> TractResult<()> {
     match tensor.datum_type() {
         DatumType::F16 => {
@@ -87,25 +90,30 @@ pub fn handle(
         }
     }
 
-    if let Some(file_path) = sub_matches.get_one::<String>("save-outputs-npz") {
-        let file = fs::File::create(file_path).with_context(|| format!("Creating {file_path}"))?;
-        let mut npz = ndarray_npy::NpzWriter::new_compressed(file);
+    if let Some(_file_path) = sub_matches.get_one::<String>("save-outputs-npz") {
+        #[cfg(feature = "npz")]
+        {
+            let file = fs::File::create(_file_path).with_context(|| format!("Creating {_file_path}"))?;
+            let mut npz = ndarray_npy::NpzWriter::new_compressed(file);
 
-        for (ix, outputs) in outputs.iter().enumerate() {
-            let name = params
-                .tract_model
-                .outlet_label(params.tract_model.output_outlets()[ix])
-                .map(|name| name.to_string())
-                .unwrap_or_else(|| format!("output_{ix}"));
-            if outputs.len() == 1 {
-                npz_add_tensor(&mut npz, name, &outputs[0])?;
-            } else {
-                for (turn, output) in outputs.iter().enumerate() {
-                    let name = format!("turn_{turn}/{name}");
-                    npz_add_tensor(&mut npz, name, output)?;
+            for (ix, outputs) in outputs.iter().enumerate() {
+                let name = params
+                    .tract_model
+                    .outlet_label(params.tract_model.output_outlets()[ix])
+                    .map(|name| name.to_string())
+                    .unwrap_or_else(|| format!("output_{ix}"));
+                if outputs.len() == 1 {
+                    npz_add_tensor(&mut npz, name, &outputs[0])?;
+                } else {
+                    for (turn, output) in outputs.iter().enumerate() {
+                        let name = format!("turn_{turn}/{name}");
+                        npz_add_tensor(&mut npz, name, output)?;
+                    }
                 }
             }
         }
+        #[cfg(not(feature = "npz"))]
+        bail!("--save-outputs-npz requires --features npz");
     }
 
     if let Some(count) = sub_matches.get_one::<String>("assert-output-count") {
@@ -145,13 +153,18 @@ pub fn handle(
     Ok(())
 }
 
+#[cfg(feature = "npz")]
+type RunRegularNpz = Option<NpzWriter<File>>;
+#[cfg(not(feature = "npz"))]
+type RunRegularNpz = Option<()>;
+
 fn run_regular_t<F, O>(
     state: &mut SimpleState<F, O>,
     inputs: RunTensors,
     steps: bool,
     check_f16_overflow: bool,
     assert_sane_floats: bool,
-    mut npz: Option<NpzWriter<File>>,
+    #[allow(unused_mut)] mut npz: RunRegularNpz,
 ) -> TractResult<TVec<Vec<TValue>>>
 where
     F: Fact + Clone + 'static,
@@ -253,6 +266,7 @@ where
                             );
                         }
                     }
+                    #[cfg(feature = "npz")]
                     if let Some(npz) = npz.as_mut() {
                         for (ix, t) in clarified_r.iter().enumerate() {
                             let mut name = if ix == 0 {
@@ -324,9 +338,16 @@ fn run_regular(
     let steps = sub_matches.get_flag("steps");
     let check_f16_overflow = sub_matches.get_flag("check-f16-overflow");
     let assert_sane_floats = sub_matches.get_flag("assert-sane-floats");
+    #[cfg(feature = "npz")]
     let npz = if let Some(npz) = sub_matches.get_one::<String>("save-steps") {
         let npz = fs::File::create(npz).with_context(|| format!("Creating {npz}"))?;
         Some(ndarray_npy::NpzWriter::new_compressed(npz))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "npz"))]
+    let npz: Option<()> = if sub_matches.get_one::<String>("save-steps").is_some() {
+        bail!("--save-steps requires --features npz");
     } else {
         None
     };

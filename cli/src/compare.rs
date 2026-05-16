@@ -30,8 +30,13 @@ pub fn handle(
     if sub_matches.get_one::<String>("stage").is_some() {
         // --with is by pipeline and put in params
         return handle_reference_stage(cumulative, params, &output_params, &run_params);
-    } else if let Some(npz) = sub_matches.get_one::<String>("npz") {
-        return handle_npz(cumulative, npz, params, &output_params, &run_params);
+    } else if let Some(_npz) = sub_matches.get_one::<String>("npz") {
+        #[cfg(feature = "npz")]
+        {
+            return handle_npz(cumulative, _npz, params, &output_params, &run_params);
+        }
+        #[cfg(not(feature = "npz"))]
+        bail!("npz comparison disabled; rebuild tract-cli with --features npz");
     } else if sub_matches.get_flag("twice") {
         return handle_twice(cumulative, params, &output_params, &run_params);
     }
@@ -132,6 +137,7 @@ pub fn handle_tensorflow(
     ))
 }
 
+#[cfg(feature = "npz")]
 pub fn handle_npz(
     cumulative: bool,
     npz: &str,

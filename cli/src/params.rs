@@ -1,6 +1,7 @@
 use fs_err as fs;
 use reqwest::Url;
 use scan_fmt::scan_fmt;
+#[cfg(feature = "npz")]
 use std::io::Cursor;
 use std::io::Read;
 use std::path::PathBuf;
@@ -479,6 +480,7 @@ impl Parameters {
         Ok(subs)
     }
 
+    #[cfg(feature = "npz")]
     pub fn parse_npz(
         input: &str,
         get_values: bool,
@@ -499,6 +501,15 @@ impl Parameters {
             })
             .collect::<TractResult<Vec<_>>>()?;
         Ok(Self::tensor_values_from_iter(triples.into_iter(), get_values, get_facts))
+    }
+
+    #[cfg(not(feature = "npz"))]
+    pub fn parse_npz(
+        _input: &str,
+        _get_values: bool,
+        _get_facts: bool,
+    ) -> TractResult<Vec<TensorValues>> {
+        bail!("npz support disabled; rebuild tract-cli with --features npz")
     }
 
     fn parse_tensors(

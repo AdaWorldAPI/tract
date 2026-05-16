@@ -1,5 +1,7 @@
 use std::collections::HashSet;
-use std::io::{Read, Seek};
+use std::io::Read;
+#[cfg(feature = "npz")]
+use std::io::Seek;
 use std::ops::Range;
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -196,15 +198,24 @@ pub fn for_data(
             panic!("Loading tensor from protobuf requires onnx features");
         }
     } else if filename.contains(".npz:") {
-        let mut tokens = filename.split(':');
-        let (_filename, inner) = (tokens.next().unwrap(), tokens.next().unwrap());
-        let mut npz = ndarray_npy::NpzReader::new(reader)?;
-        Ok((None, for_npz(&mut npz, inner)?.into()))
+        #[cfg(feature = "npz")]
+        {
+            let mut tokens = filename.split(':');
+            let (_filename, inner) = (tokens.next().unwrap(), tokens.next().unwrap());
+            let mut npz = ndarray_npy::NpzReader::new(reader)?;
+            Ok((None, for_npz(&mut npz, inner)?.into()))
+        }
+        #[cfg(not(feature = "npz"))]
+        {
+            let _ = reader;
+            bail!("npz support disabled; rebuild tract-libcli with --features npz");
+        }
     } else {
         Ok((None, tensor_for_text_data(symbol_table, filename, reader)?.into()))
     }
 }
 
+#[cfg(feature = "npz")]
 pub fn for_npz(
     npz: &mut ndarray_npy::NpzReader<impl Read + Seek>,
     name: &str,

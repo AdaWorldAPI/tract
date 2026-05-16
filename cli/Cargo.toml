@@ -40,7 +40,7 @@ inventory.workspace = true
 lazy_static.workspace = true
 litemap.workspace = true
 log.workspace = true
-ndarray-npy.workspace = true
+ndarray-npy = { workspace = true, optional = true }
 nu-ansi-term.workspace = true
 num_cpus.workspace = true
 py_literal.workspace = true
@@ -87,6 +87,9 @@ default = [
   "transformers",
   "extra",
 ]
+# WORK-STEAL: ndarray-npy 0.10 targets ndarray 0.16; our AdaWorldAPI fork
+# is 0.17. Opt-in until ndarray-npy ships a 0.17-compatible release.
+npz = ["dep:ndarray-npy", "tract-libcli/npz"]
 apple-amx-ios = ["tract-linalg/apple-amx-ios"]
 onnx = ["tract-onnx", "tract-libcli/hir", "tract-libcli/onnx"]
 extra = ["tract-extra"]
