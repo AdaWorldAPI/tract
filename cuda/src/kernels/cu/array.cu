@@ -219,3 +219,63 @@ INSTANTIATE_CAST_FROM(u64, uint64_t)
 // Rotate half: only float types
 INSTANTIATE_ROTATE_HALF(f32, float)
 INSTANTIATE_ROTATE_HALF(f16, __half)
+
+// Diagonal gather (Transformer-XL rel-pos skew, folded):
+//   out[..., i, k] = in[..., i, offset + k - i], 0 on out-of-bounds.
+// Leading axes are flattened by the host into one batch axis.  Each thread
+// owns one (b, i, k) output element — bandwidth-bound, no shared memory.
+#define INSTANTIATE_DIAG_GATHER(name, T)                                       \
+    extern "C" __global__ void diag_gather_##name(                             \
+        const T *input, T *output, const int32_t offset,                       \
+        const int32_t batch, const int32_t t_q, const int32_t r_in,            \
+        const int32_t out_len, const int32_t in_stride_b,                      \
+        const int32_t in_stride_i, const int32_t in_stride_r,                  \
+        const int32_t out_stride_b, const int32_t out_stride_i,                \
+        const int32_t out_stride_k) {                                          \
+        const int32_t k = blockIdx.x * blockDim.x + threadIdx.x;               \
+        if (k >= out_len)                                                      \
+            return;                                                            \
+        const int32_t i = blockIdx.y;                                          \
+        const int32_t b = blockIdx.z;                                          \
+        const int32_t r = offset + k - i;                                      \
+        T *out_ptr = output + b * out_stride_b + i * out_stride_i +            \
+                     k * out_stride_k;                                         \
+        if (r >= 0 && r < r_in) {                                              \
+            const T *in_ptr =                                                  \
+                input + b * in_stride_b + i * in_stride_i + r * in_stride_r;   \
+            *out_ptr = *in_ptr;                                                \
+        } else {                                                               \
+            *out_ptr = (T)0;                                                   \
+        }                                                                      \
+    }
+
+INSTANTIATE_DIAG_GATHER(f32, float)
+INSTANTIATE_DIAG_GATHER(f16, __half)
+
+// Gather along one axis:
+//   out[i_pre, i_n, i_post] = data[i_pre, indices[i_n], i_post]
+// where the host flattens to (pre × a_size × post) for data and
+// (pre × n_indices × post) for output.  `n_indices` here is the *flat*
+// indices count (product of the indices tensor's shape).  Negative indices
+// wrap with `a_size`, matching the CPU contract.
+#define INSTANTIATE_GATHER(name, T)                                            \
+    extern "C" __global__ void gather_##name(                                  \
+        const T *data, const int64_t *indices, T *output, const int32_t pre,   \
+        const int32_t a_size, const int32_t post, const int32_t n_indices) {   \
+        const int32_t i_post = blockIdx.x * blockDim.x + threadIdx.x;          \
+        if (i_post >= post)                                                    \
+            return;                                                            \
+        const int32_t i_n = blockIdx.y;                                        \
+        const int32_t i_pre = blockIdx.z;                                      \
+        int64_t k = indices[i_n];                                              \
+        if (k < 0)                                                             \
+            k += a_size;                                                       \
+        const int64_t in_off =                                                 \
+            ((int64_t)i_pre * a_size + k) * post + i_post;                     \
+        const int64_t out_off =                                                \
+            ((int64_t)i_pre * n_indices + i_n) * post + i_post;                \
+        output[out_off] = data[in_off];                                        \
+    }
+
+INSTANTIATE_GATHER(f32, float)
+INSTANTIATE_GATHER(f16, __half)

@@ -15,6 +15,52 @@ fn include_amx() -> bool {
         || (env::var("CARGO_FEATURE_APPLE_AMX_IOS").is_ok() && os == "ios" && arch == "aarch64")
 }
 
+fn include_sme() -> bool {
+    let arch = var("CARGO_CFG_TARGET_ARCH");
+    let os = var("CARGO_CFG_TARGET_OS");
+    arch == "aarch64" && (os == "macos" || os == "linux")
+}
+
+// Probe whether the target assembler can actually assemble SME instructions.
+// Old binutils (e.g. the Debian stretch aarch64 cross-toolchain used in CI)
+// predate SME and reject the mnemonics even with `.arch armv9-a+sme2`, which
+// breaks the build. When the probe fails we skip the SME kernels entirely;
+// the matching `tract_sme` cfg keeps the Rust side from referencing the
+// (now absent) kernel symbols, and dispatch falls back to the portable path.
+fn assembler_supports_sme() -> bool {
+    cc::Build::new()
+        .file("arm64/sme/dummy_sme.S")
+        .cargo_metadata(false)
+        .cargo_warnings(false)
+        .warnings(false)
+        .try_compile("tract_sme_probe")
+        .is_ok()
+}
+
+fn include_sve() -> bool {
+    // SVE/SVE2 lives on ARMv9 server/mobile cores (Neoverse V1+/N2+, Cortex-X2+,
+    // Graviton 3/4) — Linux aarch64. No Apple silicon has SVE.
+    var("CARGO_CFG_TARGET_ARCH") == "aarch64" && var("CARGO_CFG_TARGET_OS") == "linux"
+}
+
+// Probe whether the C compiler supports SVE intrinsics (arm_sve.h + `+sve`).
+// Old toolchains (e.g. the Debian stretch cross-gcc) lack them; when the probe
+// fails we skip the SVE kernels and the `tract_sve` cfg, so the Rust side never
+// references the (absent) symbols and dispatch falls back to NEON.
+fn compiler_supports_sve() -> bool {
+    let out_dir = path::PathBuf::from(var("OUT_DIR"));
+    let probe = out_dir.join("sve_probe.c");
+    fs::write(&probe, "#include <arm_sve.h>\nint p(void){ return (int)svcntw(); }\n").unwrap();
+    cc::Build::new()
+        .file(&probe)
+        .flag("-march=armv8.2-a+sve")
+        .cargo_metadata(false)
+        .cargo_warnings(false)
+        .warnings(false)
+        .try_compile("tract_sve_probe")
+        .is_ok()
+}
+
 fn jump_table() -> Vec<String> {
     println!("cargo:rerun-if-changed=src/frame/mmm/fuse.rs");
     std::fs::read_to_string("src/frame/mmm/fuse.rs")
@@ -78,6 +124,12 @@ fn main() {
 
     let suffix = env!("CARGO_PKG_VERSION").replace(['-', '.'], "_");
     make_extern_kernel_decl_macro(&out_dir, &suffix);
+
+    // `tract_sme` is set below only when both include_sme() and the assembler
+    // SME probe succeed; declare it so rustc's unexpected-cfg lint stays quiet.
+    println!("cargo:rustc-check-cfg=cfg(tract_sme)");
+    // Set below only when include_sve() and the SVE compiler probe both pass.
+    println!("cargo:rustc-check-cfg=cfg(tract_sve)");
 
     match arch.as_ref() {
         "x86_64" => {
@@ -155,6 +207,30 @@ fn main() {
             if include_amx() {
                 let files = preprocess_files("arm64/apple_amx", &[], &suffix, false);
                 cc::Build::new().files(files).compile("appleamx");
+            }
+            if include_sme() && assembler_supports_sme() {
+                let files = preprocess_files("arm64/sme", &[], &suffix, false);
+                cc::Build::new().files(files).compile("sme");
+                println!("cargo:rustc-cfg=tract_sme");
+            }
+            if include_sve() && compiler_supports_sve() {
+                // VLA SVE kernels (C intrinsics, fixed symbols — not suffix-templated).
+                cc::Build::new()
+                    .file("arm64/sve/sve_mmm_f32.c")
+                    .file("arm64/sve/sve_mmv_f32_64x1.c")
+                    .file("arm64/sve/sve_mmm_i32.c")
+                    .file("arm64/sve/sve_mmm_i32_64x1.c")
+                    .flag("-march=armv8.2-a+sve")
+                    .compile("tract_sve_kernels");
+                // f16 kernels need native FP16 arithmetic (+fp16); compiled
+                // separately so the +sve-only kernels above never gain fp16
+                // codegen. Runtime-gated on has_fp16() as well as SVE2.
+                cc::Build::new()
+                    .file("arm64/sve/sve_mmm_f16.c")
+                    .file("arm64/sve/sve_mmv_f16_64x1.c")
+                    .flag("-march=armv8.2-a+sve+fp16")
+                    .compile("tract_sve_f16_kernels");
+                println!("cargo:rustc-cfg=tract_sve");
             }
             if std::env::var("CARGO_FEATURE_NO_FP16").is_err() {
                 let config =

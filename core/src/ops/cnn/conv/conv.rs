@@ -33,7 +33,7 @@ use crate::ops::matmul::optimized::{OptMatMul, ProtoFusedSpec};
 use crate::ops::nn::{BaseDataShape, DataFormat, DataShape};
 
 use tract_linalg::mmm::{MMMInputFormat, MatMatMul};
-use tract_linalg::pack::PackedFormat;
+use tract_linalg::pack::{PackedFormat, PackedI8K4};
 
 #[derive(Debug, Clone, new, Hash, PartialEq, Eq)]
 pub struct Conv {
@@ -123,13 +123,11 @@ impl Conv {
                 &[kernel],
             )?
         } else {
-            let format = format
-                .downcast_ref::<PackedFormat>()
-                .context("Expect regular packing for numeric weights")?;
+            // PackedFormat or a custom numeric packer (e.g. PackedI8K4).
             model.wire_node(
                 format!("{name}.prep_kernel.pack"),
                 OptMatMulPack {
-                    packers: vec![format.clone()],
+                    packers: vec![dyn_clone::clone_box(format)],
                     k_axis: 2,
                     mn_axis: 1,
                     mode_picker: ModePicker::Single,
@@ -240,7 +238,11 @@ impl Conv {
             &sum_ker_n_g_c,
         )?;
 
-        ensure!(mmm.packings()[packing].1.downcast_ref::<PackedFormat>().is_some());
+        ensure!(
+            mmm.packings()[packing].1.downcast_ref::<PackedFormat>().is_some()
+                || mmm.packings()[packing].1.downcast_ref::<PackedI8K4>().is_some(),
+            "Im2Col/QSumB support PackedFormat or PackedI8K4 activation packings"
+        );
         let mut sum_x = model.wire_node(
             format!("{name}.sum_x"),
             super::QSumB { dt: b_fact.datum_type, n, r: mmm.nr(), k },
@@ -664,6 +666,86 @@ impl Conv {
         )?[0];
         let op = DepthWise::new(patch, input_shape, output_shape);
         Ok(model.wire_node(name, op, &[x, kernel[0], bias])?[0])
+    }
+
+    /// Eligibility for the direct register-blocked conv (see `blocked.rs`):
+    /// f32 NCHW, kernel width 1 (extent on H only), unit stride/dilation on the
+    /// contiguous W axis, grouped with a *small* number of out-channels per group
+    /// (where the im2col matmul's M-tile would be mostly wasted). Concrete shape
+    /// required. Returns the fully-parameterised op, or None to fall back.
+    fn try_blocked_conv(&self, input_fact: &TypedFact) -> Option<super::BlockedConv> {
+        // The direct blocked conv beats im2col on wasm (no AMX; the gather +
+        // wasted-M-tile matmul is slow) but LOSES on native, where shape-aware
+        // AMX dispatch already handles the tiny-M matmul well. So: on by default
+        // on wasm, opt-in on native. Env overrides either way for A/B.
+        let enabled = if cfg!(target_family = "wasm") {
+            std::env::var("TRACT_DISABLE_BLOCKED_CONV").is_err()
+        } else {
+            std::env::var("TRACT_ENABLE_BLOCKED_CONV").is_ok()
+        };
+        if !enabled {
+            return None;
+        }
+        if self.q_params.is_some() {
+            return None;
+        }
+        if input_fact.datum_type != f32::datum_type() {
+            return None;
+        }
+        if self.pool_spec.data_format != crate::ops::nn::DataFormat::NCHW {
+            return None;
+        }
+        if self.pool_spec.rank() != 2 || self.pool_spec.kernel_shape[1] != 1 {
+            return None;
+        }
+        if self.pool_spec.stride(1) != 1 || self.pool_spec.dilation(1) != 1 {
+            return None;
+        }
+        let group = self.group;
+        let oc = self.output_channels();
+        let c_in = self.input_channels();
+        if group == 0 || !oc.is_multiple_of(group) || !c_in.is_multiple_of(group) {
+            return None;
+        }
+        let ocg = oc / group;
+        // Win condition: tiny per-group output count makes the im2col matmul's
+        // m-tile wasteful. Large ocg packs the tile fine — leave it to im2col.
+        if ocg == 0 || ocg > 8 {
+            return None;
+        }
+        let concrete = input_fact.shape.as_concrete()?;
+        let shape = self.pool_spec.data_format.shape(concrete).ok()?;
+        let h_axis = shape.h_axis();
+        let h_in = concrete[h_axis];
+        let w = concrete[h_axis + 1];
+        let pads = self.pool_spec.computed_padding(shape.hw_dims());
+        Some(super::BlockedConv {
+            n: *shape.n().unwrap_or(&1),
+            c_in,
+            h_in,
+            w,
+            oc,
+            group,
+            kh: self.pool_spec.kernel_shape[0],
+            stride_h: self.pool_spec.stride(0),
+            dil_h: self.pool_spec.dilation(0),
+            pad_before_h: pads[0].pad_before,
+            h_out: pads[0].convoluted,
+        })
+    }
+
+    fn wire_as_blocked_conv(
+        &self,
+        model: &mut TypedModel,
+        name: &str,
+        wire: &[OutletId],
+        op: super::BlockedConv,
+    ) -> TractResult<OutletId> {
+        let &[x, kernel, bias] = wire else { bail!("Wrong number of inputs") };
+        // Kernel → [group, ocg, icg·kh] (group-major, i-major/h-minor); its flat
+        // layout is exactly the [oc, icg·kh] the op indexes.
+        let g_o_ihw = self.wire_kernel_as_g_o_ihw(model, name, kernel)?;
+        Ok(model.wire_node(name, op, &[x, g_o_ihw[0], bias])?[0])
     }
 
     fn declutter_stride_slice_to_downsample(
@@ -1195,16 +1277,21 @@ impl TypedOp for Conv {
                 patch.shunt_outside(model, node.id.into(), wire[0])?;
                 patch.obliterate(node.id)?;
                 Ok(Some(patch))
+            } else if let Some(op) = self.try_blocked_conv(input_fact) {
+                // Direct register-blocked conv for the small-ocg NCHW kw=1 class;
+                // beats lazy im2col by avoiding the gather + wasted M-tile matmul.
+                let mut patch = TypedModelPatch::new("blocked-conv");
+                let inputs = patch.taps(model, &node.inputs)?;
+                let wire = self
+                    .wire_as_blocked_conv(&mut patch, &node.name, &inputs, op)
+                    .context("wire_as_blocked_conv")?;
+                patch.shunt_outside(model, OutletId::new(node.id, 0), wire)?;
+                patch.obliterate(node.id)?;
+                Ok(Some(patch))
             } else if input_fact
                 .shape
                 .as_concrete()
-                .map(|s| {
-                    should_use_lazy(
-                        &self.pool_spec.data_format.shape(s.into()).unwrap(),
-                        &self.pool_spec,
-                        self.group,
-                    )
-                })
+                .map(|s| should_use_lazy(&self.pool_spec, self.group, s, input_fact.datum_type))
                 .unwrap_or(false)
             {
                 let mut patch = TypedModelPatch::new("lazy-im2col");
@@ -1265,7 +1352,45 @@ fn lazy_im2col_min_kernel() -> usize {
     })
 }
 
-fn should_use_lazy(input_shape: &DataShape, pool_spec: &PoolSpec, group: usize) -> bool {
+/// Default eager-Im2col scratch-size ceiling, in bytes, above which LazyIm2col is
+/// preferred regardless of kernel volume.
+///
+/// Eager Im2col materialises a `[k, n]` packed scratch of `k·n·sizeof` bytes — it is
+/// allocated, written, then read back by the matmul. While that scratch is small it
+/// stays hot in cache and the round-trip is cheap, so the kernel-volume rule above
+/// governs. Once it is large, the materialisation becomes a pure memory-bandwidth tax
+/// (write + read of multiple MB every inference) that outweighs LazyIm2col's per-panel
+/// gather indirection — so prefer lazy. The kernel-volume rule alone misses this case:
+/// a *small* kernel over a *large* output (big `n`) still materialises multiple MB.
+///
+/// The crossover is target-dependent. On WASM the materialisation tax bites harder
+/// (no hardware-prefetch help, bounds-checked stores), so lazy wins from ~1 MiB of
+/// scratch upward. On native CPUs the caches and prefetchers absorb a few MB, so the
+/// crossover sits higher (~4 MiB, measured on Apple Silicon). Hence the per-family
+/// defaults below. Override on either target via `TRACT_LAZY_IM2COL_MAX_EAGER_BYTES`;
+/// this value is the key knob for the canary-model regression gate.
+#[cfg(target_family = "wasm")]
+const DEFAULT_LAZY_IM2COL_MAX_EAGER_BYTES: usize = 1024 * 1024;
+#[cfg(not(target_family = "wasm"))]
+const DEFAULT_LAZY_IM2COL_MAX_EAGER_BYTES: usize = 4 * 1024 * 1024;
+
+fn lazy_im2col_max_eager_bytes() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TRACT_LAZY_IM2COL_MAX_EAGER_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_LAZY_IM2COL_MAX_EAGER_BYTES)
+    })
+}
+
+fn should_use_lazy(
+    pool_spec: &PoolSpec,
+    group: usize,
+    input_shape: &[usize],
+    dt: DatumType,
+) -> bool {
     // Depthwise convs (group == in_channels == out_channels) have a specialised
     // `DepthWise` op downstream that's much faster than the generic im2col + matmul
     // path on every backend we measured (Apple AMX, x64, aarch64). Don't intercept
@@ -1275,8 +1400,24 @@ fn should_use_lazy(input_shape: &DataShape, pool_spec: &PoolSpec, group: usize) 
     if is_depthwise {
         return false;
     }
-    input_shape.n().unwrap_or(&1) == &1
-        && pool_spec.kernel_shape.iter().product::<usize>() >= lazy_im2col_min_kernel()
+    let Ok(output_shape) = pool_spec.output_shape(input_shape) else { return false };
+    // LazyIm2col's offset tables are built for a single batch.
+    if output_shape.n().unwrap_or(&1) != &1 {
+        return false;
+    }
+    let kernel_volume = pool_spec.kernel_shape.iter().product::<usize>();
+    // Primary rule: kernel volume. LazyIm2col's per-output-position gather indirection
+    // is cheap relative to materialising the scratch for a sizeable kernel.
+    if kernel_volume >= lazy_im2col_min_kernel() {
+        return true;
+    }
+    // Shape-aware rule: prefer lazy when the eager scratch (`k·n·sizeof`) is large,
+    // even for a small kernel. `n` is the output spatial volume — the dimension the
+    // kernel-volume rule ignores but which actually drives the materialisation cost.
+    let n: usize = output_shape.hw_dims().iter().product();
+    let k = pool_spec.input_channels * kernel_volume / group;
+    let eager_scratch_bytes = k.saturating_mul(n).saturating_mul(dt.size_of());
+    eager_scratch_bytes >= lazy_im2col_max_eager_bytes()
 }
 
 #[allow(non_snake_case)]

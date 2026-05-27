@@ -516,7 +516,14 @@ fn declutter_neutral(
 }
 
 /// When one input is the absorbing element (e.g. 0 for Mul, false for And),
-/// replace the entire op with the uniform (absorbing) input.
+/// replace the entire op with a uniform-value tensor of the output shape.
+///
+/// We can't shunt the uniform input directly: it may be lower-rank or have
+/// broadcast-from-1 dims that don't match the op's output shape (e.g.
+/// `Mul([4, 1], scalar-0)` outputs `[4, 1]`, not `[1]`).  Wire a
+/// `MultiBroadcastTo` from the uniform constant to the output shape;
+/// subsequent declutter folds it into a pure constant when the shape is
+/// fully concrete.
 fn declutter_absorbing(
     model: &TypedModel,
     node: &TypedNode,
@@ -528,13 +535,36 @@ fn declutter_absorbing(
             .map(|absorb| tensor0(absorb).close_enough(&uniform.uni, false).is_ok())
             .unwrap_or(false);
         if is_absorbing {
+            let output_fact = model.outlet_fact(node.id.into())?;
+            let output_dt = output_fact.datum_type;
+            let output_shape = output_fact.shape.clone();
             let uni_inlet = if uniform.left_is_uniform { 0 } else { 1 };
-            return Ok(Some(TypedModelPatch::rewire(
-                model,
-                &[node.inputs[uni_inlet]],
-                &[node.id.into()],
-                &|_, inputs| Ok(inputs.into()),
-            )?));
+            let uni_input_shape = &model.outlet_fact(node.inputs[uni_inlet])?.shape;
+            // Fast path: shapes and types match — shunt the absorbing input directly.
+            if uni_input_shape == &output_shape && uniform.uni.datum_type() == output_dt {
+                return Ok(Some(TypedModelPatch::rewire(
+                    model,
+                    &[node.inputs[uni_inlet]],
+                    &[node.id.into()],
+                    &|_, inputs| Ok(inputs.into()),
+                )?));
+            }
+            // General path: create a constant encoded in the output type.
+            // This handles both shape mismatches and quantization mismatches
+            // (e.g. absorbing input is QU8(Z:61 S:1) but output is QU8(Z:0 S:0.5)).
+            let absorb_val = mini_op.absorbing_element().unwrap();
+            let absorbing_const =
+                tensor0(absorb_val as f32).cast_to_dt(output_dt)?.into_owned().into_arc_tensor();
+            let mut patch = TypedModelPatch::default();
+            let uni_const =
+                patch.add_const(format!("{}.absorbing_const", node.name), absorbing_const)?;
+            let bcast = patch.wire_node(
+                format!("{}.absorbing_bcast", node.name),
+                crate::ops::array::MultiBroadcastTo { shape: output_shape },
+                &[uni_const],
+            )?[0];
+            patch.shunt_outside(model, node.id.into(), bcast)?;
+            return Ok(Some(patch));
         }
     }
     Ok(None)
@@ -635,6 +665,20 @@ impl EvalOp for OptBinByScalar {
 
     fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (a, b) = args_2!(inputs);
+        // Same as OptBinUnicast: the fast path uses at_prefix + as_slice_mut
+        // and relies on natural C-order strides for the slice math. Fall back
+        // to the generic eval if either operand has non-natural strides or a
+        // storage size that doesn't match its declared shape (e.g. after
+        // Tensor::insert_axis which leaves non-natural strides behind).
+        let a_natural = a.len() == a.shape().iter().product::<usize>()
+            && a.strides() == &*Tensor::natural_strides(a.shape());
+        let b_natural = b.len() == b.shape().iter().product::<usize>()
+            && b.strides() == &*Tensor::natural_strides(b.shape());
+        if !a_natural || !b_natural {
+            let c_dt = self.binop.result_datum_type(a.datum_type(), b.datum_type())?;
+            return Ok(tvec!(self.binop.eval(a, b, c_dt)?.into_tvalue()));
+        }
+
         // Not a requirement as TensorView doesn't require a owned tensor but in reality
         // "a "should be mutable (it's omitted here as Rust compiler advise to remove it)
         let a = a.into_tensor();
@@ -765,6 +809,25 @@ impl EvalOp for OptBinUnicast {
 
     fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (a, b) = args_2!(inputs);
+        // The unicast fast path indexes each input's storage via at_prefix +
+        // as_slice_mut, which uses `strides[i-1]` to size the resulting slice
+        // (data/src/tensor/view.rs:99). That formula only matches ∏(shape[i..])
+        // when the tensor has natural C-order strides. Producers like
+        // Tensor::insert_axis leave non-natural strides on a tensor (e.g.
+        // shape `[1, 1, 640]` with strides `[1, 1, 1]` after two insert_axis
+        // on a `[640]` tensor), which silently breaks the slice math. Fall
+        // back to the generic broadcasting eval when either operand is not in
+        // natural strides (or has a storage size that doesn't match the
+        // declared shape).
+        let a_natural = a.len() == a.shape().iter().product::<usize>()
+            && a.strides() == &*Tensor::natural_strides(a.shape());
+        let b_natural = b.len() == b.shape().iter().product::<usize>()
+            && b.strides() == &*Tensor::natural_strides(b.shape());
+        if !a_natural || !b_natural {
+            let c_dt = self.binop.result_datum_type(a.datum_type(), b.datum_type())?;
+            return Ok(tvec!(self.binop.eval(a, b, c_dt)?.into_tvalue()));
+        }
+
         // Not a requirement as TensorView doesn't require a owned tensor but in reality
         // "a "should be mutable (it's omitted here as Rust compiler advise to remove it)
         let a = a.into_tensor();
@@ -1155,4 +1218,55 @@ pub(crate) fn one_input_is_uniform(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reproducer for the OptBinUnicast panic seen on Nemotron decoder CI
+    /// (cuda-lovelace + Darwin). A 1-D tensor that goes through `insert_axis`
+    /// twice ends up with declared shape `[1, 1, 640]` but strides `[1, 1, 1]`
+    /// instead of the natural `[640, 640, 1]`. TensorView::at_prefix then
+    /// returns a view whose `len()` reads `strides[1] = 1`, so the unicast
+    /// kernel sees `a.len = 1, b.len = 640` and OOBs into the tile buffer.
+    ///
+    /// Pre-fix this test panics inside `linalg/src/frame/unicast.rs` with
+    /// "range end index 640 out of range for slice of length …". With the
+    /// natural-strides guard in `OptBinUnicast::eval`, the call falls back to
+    /// `BinMiniOp::eval` and produces correct output.
+    #[test]
+    fn opt_bin_unicast_falls_back_on_non_natural_strides() {
+        // Construct `a` the way the LSTM bias path does: build a 640-element
+        // 1-D tensor, then insert two leading unit dims.
+        let a_data: Vec<f32> = (0..640).map(|i| i as f32).collect();
+        let mut a = tensor1(&a_data);
+        a.insert_axis(0).unwrap();
+        a.insert_axis(0).unwrap();
+        assert_eq!(a.shape(), &[1, 1, 640]);
+        assert_eq!(a.strides(), &[1, 1, 1]);
+        assert_ne!(a.strides(), &*Tensor::natural_strides(a.shape()));
+
+        // `b` is a normal contiguous tensor of the same declared shape.
+        let b_data: Vec<f32> = vec![1.0; 640];
+        let mut b = tensor1(&b_data);
+        b.insert_axis(0).unwrap();
+        b.insert_axis(0).unwrap();
+        // Reset b to natural strides so we exercise only the a-broken path
+        // and let the b-side go through cleanly.
+        b = b.into_shape(&[1, 1, 640]).unwrap();
+
+        let linalg_fn = tract_linalg::bin_unicast(f32::datum_type(), BinOp::Add)
+            .expect("f32 unicast Add kernel available");
+        let op = OptBinUnicast { binop: Box::new(Add), eval_fn: Arc::from(linalg_fn) };
+
+        let out = op.eval(tvec!(a.into_tvalue(), b.into_tvalue())).unwrap();
+        let out = &out[0];
+        assert_eq!(out.shape(), &[1, 1, 640]);
+        let plain = out.try_as_plain().unwrap();
+        let out_slice = plain.as_slice::<f32>().unwrap();
+        for (i, v) in out_slice.iter().enumerate() {
+            assert_eq!(*v, i as f32 + 1.0, "mismatch at {i}");
+        }
+    }
 }

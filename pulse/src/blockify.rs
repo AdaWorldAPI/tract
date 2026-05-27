@@ -132,6 +132,7 @@ use crate::internal::*;
 use std::collections::{BTreeSet, HashMap};
 use tract_core::axes::AxesMapping;
 use tract_core::model::TypedModelPatch;
+use tract_core::ops::binary::TypedBinOp;
 use tract_core::ops::change_axes::AxisOp;
 use tract_core::ops::einsum::EinSum;
 use tract_core::ops::nn::{Reduce, Reducer};
@@ -251,7 +252,29 @@ pub fn blockify_output(model: &TypedModel) -> Option<(Symbol, i64)> {
     Some((model.symbols.sym(name), k))
 }
 
-/// Streaming-axis positions on a typed fact.
+/// If `einsum_node`'s only multi-T-axis successor in `sec` is a single
+/// DiagGather, return its node id — the pair forms a fused initiator
+/// (DiagGather drives the chunked rewrite; the einsum is tapped through).
+fn section_only_diag_gather_consumer(
+    model: &TypedModel,
+    einsum_node: &TypedNode,
+    sec: &QuadraticSection,
+) -> Option<usize> {
+    let consumers: Vec<_> = model
+        .outlet_successors(OutletId::new(einsum_node.id, 0))
+        .iter()
+        .filter(|s| sec.section.contains(&s.node))
+        .collect();
+    if consumers.len() != 1 {
+        return None;
+    }
+    let dg_id = consumers[0].node;
+    if !model.nodes[dg_id].op_is::<DiagGather>() {
+        return None;
+    }
+    Some(dg_id)
+}
+
 fn streaming_positions(fact: &TypedFact, stream_sym: &Symbol) -> TVec<usize> {
     fact.shape
         .iter()
@@ -642,9 +665,50 @@ fn build_section_patch(
     let mut patch = TypedModelPatch::default();
     // Map from original outlet to its chunked equivalent inside the patch.
     let mut chunked: HashMap<OutletId, OutletId> = HashMap::default();
+    // Nodes wired as part of a fused initiator (e.g. einsum → DiagGather
+    // for the Transformer-XL relative-position pattern).  These should be
+    // skipped by the regular initiator and body loops since their
+    // chunked equivalent is already in `chunked`.
+    let mut already_wired: BTreeSet<usize> = BTreeSet::new();
     // Boundary outlets to redirect via `shunt_outside` after wiring the
     // merge reshape: (original outlet, chunked-form outlet inside patch).
     let mut shunts: Vec<(OutletId, OutletId)> = vec![];
+
+    // Fused EinSum + DiagGather initiator: when an EinSum's only
+    // multi-T-axis section consumer is a DiagGather, route the pair
+    // through DiagGather's chunker and mark both as already-wired.
+    for &nid in &sec.initiators {
+        let einsum_node = &model.nodes[nid];
+        if !einsum_node.op_is::<EinSum>() {
+            continue;
+        }
+        let Some(dg_id) = section_only_diag_gather_consumer(model, einsum_node, sec) else {
+            continue;
+        };
+        let dg_node = &model.nodes[dg_id];
+        let dg_in_fact = model.outlet_fact(dg_node.inputs[0])?;
+        let dg_in_streaming = streaming_positions(dg_in_fact, chunk_sym);
+        if dg_in_streaming.len() != 1 {
+            bail!(
+                "EinSum+DiagGather initiator: DG input must have a single streaming axis, got {dg_in_streaming:?}"
+            );
+        }
+        let dg_op = dg_node.op_as::<DiagGather>().unwrap();
+        let dg_chunked = wire_initiator_diag_gather(
+            &mut patch,
+            model,
+            dg_node,
+            dg_op,
+            &sec.mask,
+            sec.contracted_axis,
+            chunk_sym,
+            k,
+        )?;
+        chunked.insert(OutletId::new(nid, 0), dg_chunked);
+        chunked.insert(OutletId::new(dg_id, 0), dg_chunked);
+        already_wired.insert(nid);
+        already_wired.insert(dg_id);
+    }
 
     // ── 1. Initiators ────────────────────────────────────────────────────
     // Two flavours:
@@ -659,6 +723,9 @@ fn build_section_patch(
     //     chunked inputs.  The result lives in `chunked` like any other
     //     section wire.
     for &nid in &sec.initiators {
+        if already_wired.contains(&nid) {
+            continue;
+        }
         let node = &model.nodes[nid];
         let out = if node.outputs[0].fact.uniform_tdim.is_some() {
             wire_uniform_tdim_initiator(
@@ -689,6 +756,9 @@ fn build_section_patch(
             continue;
         }
         if sec.initiators.contains(&nid) {
+            continue;
+        }
+        if already_wired.contains(&nid) {
             continue;
         }
         let node = &model.nodes[nid];
@@ -730,10 +800,58 @@ fn build_section_patch(
             chunk_sym,
             k,
         )?;
+        let merged = wire_affine_tail_pad(&mut patch, model, boundary, merged, chunk_sym, k)?;
         patch.shunt_outside(model, boundary, merged)?;
     }
 
     Ok(patch)
+}
+
+/// Pad the chunked outlet with `c` constant-zero frames to match a
+/// boundary outlet with streaming dim `c + k·S` (vs the merged `k·S`).
+/// Restores the tail `wire_chunk_split` trimmed pre-section.
+fn wire_affine_tail_pad(
+    patch: &mut TypedModelPatch,
+    model: &TypedModel,
+    boundary: OutletId,
+    merged: OutletId,
+    chunk_sym: &Symbol,
+    k: i64,
+) -> TractResult<OutletId> {
+    let boundary_fact = model.outlet_fact(boundary)?;
+    let merged_fact = patch.outlet_fact(merged)?.clone();
+    if boundary_fact.shape.len() != merged_fact.shape.len() {
+        return Ok(merged);
+    }
+    let mut pad_axis: Option<(usize, i64)> = None;
+    for (axis, (b, m)) in boundary_fact.shape.iter().zip(merged_fact.shape.iter()).enumerate() {
+        if b == m {
+            continue;
+        }
+        let b_off = affine_chunk_offset(b, chunk_sym, k);
+        let m_off = affine_chunk_offset(m, chunk_sym, k);
+        match (b_off, m_off) {
+            (Some(bc), Some(0)) if bc > 0 => {
+                if pad_axis.is_some() {
+                    return Ok(merged);
+                }
+                pad_axis = Some((axis, bc));
+            }
+            _ => return Ok(merged),
+        }
+    }
+    let Some((axis, c)) = pad_axis else {
+        return Ok(merged);
+    };
+    let mut pads = vec![(0usize, 0usize); merged_fact.shape.len()];
+    pads[axis] = (0, c as usize);
+    let pad_value = Tensor::zero_scalar_dt(merged_fact.datum_type)?.into_arc_tensor();
+    let pad_op = tract_core::ops::array::Pad {
+        pads,
+        mode: tract_core::ops::array::PadMode::Constant(pad_value),
+    };
+    let name = format!("{}.affine_tail_pad", &model.nodes[boundary.node].name);
+    Ok(patch.wire_node(name, pad_op, &[merged])?[0])
 }
 
 // ── Per-role dispatchers ────────────────────────────────────────────────
@@ -757,10 +875,44 @@ fn wire_initiator(
         return wire_initiator_einsum(patch, model, node, op, mask, contracted_axis, chunk_sym, k);
     }
     if node.op_as::<tract_core::ops::array::MultiBroadcastTo>().is_some() {
-        return wire_initiator_multibroadcastto(patch, model, node, chunk_sym);
+        let in_fact = model.outlet_fact(node.inputs[0])?;
+        if streaming_positions(in_fact, chunk_sym).is_empty() {
+            return wire_initiator_multibroadcastto(patch, model, node, chunk_sym);
+        } else {
+            return wire_initiator_multibroadcastto_streaming(
+                patch,
+                model,
+                node,
+                mask,
+                contracted_axis,
+                chunk_sym,
+                k,
+            );
+        }
     }
     if let Some(op) = node.op_as::<DiagGather>() {
-        return wire_initiator_diag_gather(patch, model, node, op, mask, chunk_sym, k);
+        return wire_initiator_diag_gather(
+            patch,
+            model,
+            node,
+            op,
+            mask,
+            contracted_axis,
+            chunk_sym,
+            k,
+        );
+    }
+    if let Some(op) = node.op_as::<TypedBinOp>() {
+        return wire_initiator_typed_binop(
+            patch,
+            model,
+            node,
+            op,
+            mask,
+            contracted_axis,
+            chunk_sym,
+            k,
+        );
     }
     bail!("Unsupported initiator {node}")
 }
@@ -780,8 +932,9 @@ fn wire_initiator_diag_gather(
     patch: &mut TypedModelPatch,
     model: &TypedModel,
     node: &TypedNode,
-    _op: &DiagGather,
+    op: &DiagGather,
     mask: &MaskForm,
+    contracted_axis: usize,
     chunk_sym: &Symbol,
     k: i64,
 ) -> TractResult<OutletId> {
@@ -803,25 +956,165 @@ fn wire_initiator_diag_gather(
 
     let tapped = patch.tap_model(model, node.inputs[0])?;
     let in_fact_patch = patch.outlet_fact(tapped)?.clone();
-    let from = tvec!(in_fact_patch.shape[stream_axis].clone());
-    let to = tvec!(chunk_sym.to_dim(), k.to_dim());
-    let reshape = AxisOp::Reshape(stream_axis, from, to);
-    let chunked = patch.wire_node(format!("{}.blockify_split", node.name), reshape, &[tapped])?[0];
+    let chunked = wire_chunk_split(patch, &node.name, tapped, stream_axis, chunk_sym, k)?;
 
     // The R (relative-position) axis of pos_raw is the last axis: a constant
-    // 2*T_max-1 from the original skew construction.  In batch the DiagGather's
-    // centre is at column T_max-1 = (R-1)/2.  The chunked formula picks
-    //   pos_raw[c·P+δi, T_max-1 + (j-i)]   with j = (c-L)·P + δj
-    // → in[c, δi, (T_max-1) - L·P + δj − δi]
-    // so the chunked DiagGather offset is (T_max-1) - L·P, with out_len = W.
+    // width carrying the rel-pos table.  The DiagGather op's `offset` field
+    // points to the column where rel-pos = 0 lives in the R-axis numbering.
+    // Per chunk c, the W = (L+1)·k key-window starts at chunk
+    // `c + window_start` (= `c − L` for lookback, `c` for lookahead), so the
+    // (δi, δj)-th in-window key has rel-pos `δj − δi + window_start·k`.
+    // Solving `chunked_offset + δj − δi = (op.offset) + (δj − δi + window_start·k)`
+    // gives `chunked_offset = op.offset + window_start·k`.
     let r_axis = in_fact_patch.shape.last().context("DiagGather input has no last axis")?;
     let r = r_axis.to_i64().context("DiagGather R axis must be a constant integer")?;
-    let t_max = (r + 1) / 2;
+    // Prefer `op.offset` if it simplifies to a concrete column index — this is
+    // the path the streaming-rel-pos rewrite (subsequent commit) uses to plant
+    // a centre that doesn't match the canonical `(R-1)/2`.  Fall back to the
+    // T-XL convention `centre = (R-1)/2` for models where the op was built
+    // with a row-count-based symbolic offset (e.g. `T - 1`) that hasn't
+    // simplified post-substitution.
+    let centre = op.offset.to_i64().ok().unwrap_or((r - 1) / 2);
     let l = mask.upper - mask.lower;
     let w = (l + 1) * k;
-    let offset = t_max - 1 - l * k;
-    let chunked_op = DiagGather { offset: offset.to_dim(), out_len: w.to_dim() };
+    let window_start = window_start_for(mask, contracted_axis);
+    let chunked_offset = centre + window_start * k;
+    let chunked_op = DiagGather { offset: chunked_offset.to_dim(), out_len: w.to_dim() };
     Ok(patch.wire_node(format!("{}.blockified", node.name), chunked_op, &[chunked])?[0])
+}
+
+/// Generic initiator for a `TypedBinOp` lifting two single-T-axis inputs
+/// into a multi-T-axis score-shape output via implicit broadcasting (post-
+/// declutter spelling of the pad-mask outer-AND pattern: `Add(at=0)(pad)` AND
+/// `Add(at=1)(pad)` → `[T, T]`).
+///
+/// Per input, the streaming axis tracks via the op's axes_mapping to one of
+/// the section's score axes.  If that score axis lands on the contracted (K)
+/// side of the mask, the input is windowed by `WindowOnAxis(W) + flatten`;
+/// otherwise it's just chunk-split.  Each input's chunks axis is then moved
+/// to the section's `chunks_target_axis` so the chunked op aligns them.
+///
+/// `WindowOnAxis` pads boundary slots with the op's `absorbing_element` (0
+/// for And/Mul/BitAnd, 1 for Or), so the chunked op produces "definitely
+/// excluded" at out-of-stream positions.  Bails if the op has no absorbing
+/// element (e.g. Add, Xor) — we can't safely window-pad those.
+///
+/// Non-streaming inputs are tapped and rank-bumped to the chunked-frame rank
+/// (= score_rank + 1).  The chunked op's own broadcasting fills in the
+/// streaming dims.
+fn wire_initiator_typed_binop(
+    patch: &mut TypedModelPatch,
+    model: &TypedModel,
+    node: &TypedNode,
+    op: &TypedBinOp,
+    mask: &MaskForm,
+    contracted_axis: usize,
+    chunk_sym: &Symbol,
+    k: i64,
+) -> TractResult<OutletId> {
+    let out_streaming_axes = streaming_positions(&node.outputs[0].fact, chunk_sym);
+    ensure!(
+        out_streaming_axes.len() == 2 && out_streaming_axes[1] == out_streaming_axes[0] + 1,
+        "Initiator TypedBinOp output must have two contiguous streaming axes"
+    );
+    let chunks_target_axis = out_streaming_axes[0];
+    let score_rank = node.outputs[0].fact.rank();
+    let rank_diff = score_rank.checked_sub(2).ok_or_else(|| {
+        format_err!("Score rank {score_rank} < 2; cannot translate to mask frame")
+    })?;
+
+    let input_facts: TVec<&TypedFact> =
+        node.inputs.iter().map(|inp| model.outlet_fact(*inp)).collect::<TractResult<_>>()?;
+    let output_facts: TVec<&TypedFact> = node.outputs.iter().map(|o| &o.fact).collect();
+    let mapping = op.axes_mapping(&input_facts, &output_facts)?;
+
+    let mut chunked_inputs: TVec<OutletId> = tvec!();
+    for (ix, &input) in node.inputs.iter().enumerate() {
+        let in_fact = model.outlet_fact(input)?;
+        let streaming = streaming_positions(in_fact, chunk_sym);
+        ensure!(
+            streaming.len() <= 1,
+            "Initiator TypedBinOp input {ix} has {} streaming axes, expected 0 or 1",
+            streaming.len()
+        );
+
+        let tapped = patch.tap_model(model, input)?;
+        let wire = if streaming.is_empty() {
+            let target_rank = score_rank + 1;
+            bump_rank_to(patch, &node.name, ix, tapped, target_rank)?
+        } else {
+            let stream_axis = streaming[0];
+            let split = wire_chunk_split(
+                patch,
+                &format!("{}.{ix}", node.name),
+                tapped,
+                stream_axis,
+                chunk_sym,
+                k,
+            )?;
+
+            let tracked_in_score = mapping
+                .track_axis((InOut::In(ix), stream_axis), InOut::Out(0))?
+                .ok_or_else(|| {
+                    format_err!(
+                        "TypedBinOp stream axis on input {ix} doesn't track to a unique output axis"
+                    )
+                })?;
+            let tracked_in_mask = tracked_in_score.checked_sub(rank_diff).ok_or_else(|| {
+                format_err!(
+                    "Tracked score axis {tracked_in_score} doesn't map to mask frame \
+                     (rank_diff={rank_diff})"
+                )
+            })?;
+
+            let needs_window = !mask.is_block_diag() && tracked_in_mask == contracted_axis;
+            let after_window = if needs_window {
+                let window: usize = (mask.upper - mask.lower + 1) as usize;
+                let start = window_start_for(mask, contracted_axis);
+                let dt = patch.outlet_fact(split)?.datum_type;
+                let absorbing = op.0.absorbing_element().ok_or_else(|| {
+                    format_err!(
+                        "TypedBinOp '{}' has no absorbing_element; cannot safely window-pad \
+                         a section-initiator input",
+                        op.0.name()
+                    )
+                })?;
+                let pad_value = tensor0(absorbing).cast_to_dt(dt)?.into_owned().into_arc_tensor();
+                let windowed = patch.wire_node(
+                    format!("{}.{ix}.window", node.name),
+                    tract_pulse_opl::ops::WindowOnAxis {
+                        axis: stream_axis,
+                        window,
+                        start,
+                        pad_value,
+                    },
+                    &[split],
+                )?[0];
+                let from = tvec!(window.to_dim(), k.to_dim());
+                let to = tvec!(((window as i64) * k).to_dim());
+                patch.wire_node(
+                    format!("{}.{ix}.window_flat", node.name),
+                    AxisOp::Reshape(stream_axis + 1, from, to),
+                    &[windowed],
+                )?[0]
+            } else {
+                split
+            };
+
+            if stream_axis != chunks_target_axis {
+                patch.wire_node(
+                    format!("{}.{ix}.move_chunks", node.name),
+                    AxisOp::Move(stream_axis, chunks_target_axis),
+                    &[after_window],
+                )?[0]
+            } else {
+                after_window
+            }
+        };
+        chunked_inputs.push(wire);
+    }
+
+    Ok(patch.wire_node(format!("{}.blockified", node.name), op.clone(), &chunked_inputs)?[0])
 }
 
 /// Initiator for `MultiBroadcastTo` — the `select(mask, scores, -inf)`
@@ -856,6 +1149,140 @@ fn wire_initiator_multibroadcastto(
         step += 1;
     }
     Ok(wire)
+}
+
+/// Initiator for `MultiBroadcastTo` whose input is streaming:
+/// a `[..., 1, T]` per-key-position mask broadcast to `[..., T, T]`.
+/// The input's streaming axis must track (after broadcast) to the
+/// section's `contracted_axis`.  Chunked form per chunk: split T into
+/// `[S, k]`, window L+1 chunks, flatten `[L+1, k] → W`, move the chunk
+/// axis to first-streaming position, broadcast the size-1 axis up to k.
+fn wire_initiator_multibroadcastto_streaming(
+    patch: &mut TypedModelPatch,
+    model: &TypedModel,
+    node: &TypedNode,
+    mask: &MaskForm,
+    contracted_axis: usize,
+    chunk_sym: &Symbol,
+    k: i64,
+) -> TractResult<OutletId> {
+    ensure!(node.inputs.len() == 1, "MultiBroadcastTo expects 1 input, got {}", node.inputs.len());
+    let input = node.inputs[0];
+    let in_fact = model.outlet_fact(input)?;
+    let in_streaming = streaming_positions(in_fact, chunk_sym);
+    ensure!(
+        in_streaming.len() == 1,
+        "MultiBroadcastTo streaming initiator: input must have exactly one streaming axis, \
+         got {in_streaming:?}"
+    );
+    let in_stream_axis = in_streaming[0];
+
+    let out_streaming = streaming_positions(&node.outputs[0].fact, chunk_sym);
+    ensure!(
+        out_streaming.len() == 2 && out_streaming[1] == out_streaming[0] + 1,
+        "Initiator MultiBroadcastTo output must have two contiguous streaming axes, \
+         got {out_streaming:?}"
+    );
+
+    // The input axis that gets broadcast from 1 to a streaming dim.
+    let bcast_axis = if out_streaming[0] == in_stream_axis {
+        out_streaming[1]
+    } else if out_streaming[1] == in_stream_axis {
+        out_streaming[0]
+    } else {
+        bail!(
+            "MultiBroadcastTo streaming initiator: input stream axis {in_stream_axis} not in \
+             output streaming axes {out_streaming:?}"
+        );
+    };
+    ensure!(
+        in_fact.shape[bcast_axis].is_one(),
+        "MultiBroadcastTo streaming initiator: broadcast-from axis {bcast_axis} must be 1, \
+         got {}",
+        in_fact.shape[bcast_axis]
+    );
+
+    // Translate the score-frame stream axis to mask frame and check it's the
+    // contracted side.  `score_rank - 2` is the leading-batch-dims offset.
+    let score_rank = node.outputs[0].fact.rank();
+    let rank_diff = score_rank.checked_sub(2).ok_or_else(|| {
+        format_err!("Score rank {score_rank} < 2; cannot translate to mask frame")
+    })?;
+    let tracked_in_mask = in_stream_axis.checked_sub(rank_diff).ok_or_else(|| {
+        format_err!(
+            "Tracked score axis {in_stream_axis} doesn't map to mask frame (rank_diff={rank_diff})"
+        )
+    })?;
+    ensure!(
+        tracked_in_mask == contracted_axis,
+        "MultiBroadcastTo streaming initiator: input stream axis must track to the \
+         contracted axis ({contracted_axis}), got {tracked_in_mask}"
+    );
+
+    let tapped = patch.tap_model(model, input)?;
+    let split = wire_chunk_split(patch, &node.name, tapped, in_stream_axis, chunk_sym, k)?;
+    let bcast_axis_post_split =
+        if bcast_axis > in_stream_axis { bcast_axis + 1 } else { bcast_axis };
+
+    let window: usize = (mask.upper - mask.lower + 1) as usize;
+    let start = window_start_for(mask, contracted_axis);
+    let dt = patch.outlet_fact(split)?.datum_type;
+    let pad_value = Tensor::zero_scalar_dt(dt)?.into_arc_tensor();
+    let windowed = patch.wire_node(
+        format!("{}.window", node.name),
+        tract_pulse_opl::ops::WindowOnAxis { axis: in_stream_axis, window, start, pad_value },
+        &[split],
+    )?[0];
+    let bcast_axis_post_window = if bcast_axis_post_split > in_stream_axis {
+        bcast_axis_post_split + 1
+    } else {
+        bcast_axis_post_split
+    };
+
+    // Flatten [L+1, k] back to a single W = (L+1)·k axis.
+    let from = tvec!(window.to_dim(), k.to_dim());
+    let to = tvec!(((window as i64) * k).to_dim());
+    let flat = patch.wire_node(
+        format!("{}.window_flat", node.name),
+        AxisOp::Reshape(in_stream_axis + 1, from, to),
+        &[windowed],
+    )?[0];
+    let bcast_axis_post_flat = if bcast_axis_post_window > in_stream_axis + 1 {
+        bcast_axis_post_window - 1
+    } else {
+        bcast_axis_post_window
+    };
+
+    // Move chunk axis to the original first-streaming output position
+    // (convention shared with `chunkify_einsum`).
+    let chunks_target_axis = out_streaming[0];
+    let mut chunks_axis = in_stream_axis;
+    let mut bcast_axis_now = bcast_axis_post_flat;
+    let mut wire = flat;
+    if chunks_axis != chunks_target_axis {
+        wire = patch.wire_node(
+            format!("{}.move_chunks", node.name),
+            AxisOp::Move(chunks_axis, chunks_target_axis),
+            &[wire],
+        )?[0];
+        // Track the broadcast-from-1 axis through the Move: dims STRICTLY
+        // between source and target shift by one slot — [target, source)
+        // leftward, (source, target] rightward.
+        if chunks_target_axis < chunks_axis {
+            if bcast_axis_now >= chunks_target_axis && bcast_axis_now < chunks_axis {
+                bcast_axis_now += 1;
+            }
+        } else if bcast_axis_now > chunks_axis && bcast_axis_now <= chunks_target_axis {
+            bcast_axis_now = bcast_axis_now.saturating_sub(1);
+        }
+        chunks_axis = chunks_target_axis;
+        let _ = chunks_axis;
+    }
+
+    let mut target_shape: TVec<TDim> = patch.outlet_fact(wire)?.shape.to_tvec();
+    target_shape[bcast_axis_now] = k.to_dim();
+    let bcast = tract_core::ops::array::MultiBroadcastTo { shape: target_shape.into() };
+    Ok(patch.wire_node(format!("{}.blockified", node.name), bcast, &[wire])?[0])
 }
 
 /// Initiator for a multi-T-axis `uniform_tdim` node — typically the
@@ -934,7 +1361,6 @@ fn chunkify_uniform_tdim_input(
     let stream_axis = positions[0];
 
     let tapped = patch.tap_model(model, input)?;
-    let in_fact = patch.outlet_fact(tapped)?.clone();
 
     // Cast TDim → I64 up-front: PulsePad (used by WindowOnAxis pulsifier
     // for the contracted side) fills with `dispatch_copy_by_size!`, which
@@ -957,13 +1383,7 @@ fn chunkify_uniform_tdim_input(
     // Split the T-axis at `k`.  Output rank = input rank + 1, with the
     // chunk axis at `stream_axis` and the within-block axis at
     // `stream_axis + 1`.
-    let from = tvec!(in_fact.shape[stream_axis].clone());
-    let to = tvec!(chunk_sym.to_dim(), k.to_dim());
-    wire = patch.wire_node(
-        format!("{name_prefix}.split"),
-        AxisOp::Reshape(stream_axis, from, to),
-        &[wire],
-    )?[0];
+    wire = wire_chunk_split(patch, name_prefix, wire, stream_axis, chunk_sym, k)?;
 
     // Move chunk axis to position 0 if it isn't already, so the section
     // frame uniformly carries the chunk axis at 0.
@@ -1117,7 +1537,7 @@ fn wire_body(
     let output_facts = node.op.output_facts(&in_refs)?;
     let out_refs: TVec<&TypedFact> = output_facts.iter().collect();
     let am = node.op.axes_mapping(&in_refs, &out_refs)?;
-    for (slot, axis) in chunk_input_axes {
+    for &(slot, axis) in &chunk_input_axes {
         let tracked = am.track_axis((InOut::In(slot), axis), InOut::Out(0))?;
         ensure!(
             tracked.is_some(),
@@ -1127,21 +1547,37 @@ fn wire_body(
     }
 
     // Some body ops carry an explicit axis or axes parameter (Softmax,
-    // Reduce, …) whose values are positions in the *original* rank.
-    // The chunk axis is inserted at position 0 in the chunked frame, so
-    // every original axis shifts right by one.  Translate accordingly.
-    let chunked_op = translate_body_op_axes(node.op.as_ref());
+    // AxisOp::Move/Add/Rm, …) whose values are positions in the *original*
+    // rank.  The chunk axis is inserted at the chunked input's chunk
+    // position; every original axis at or beyond that position shifts
+    // right by one.  Translate accordingly.  When inputs disagree on the
+    // chunk position we punt (no consistent chunk_pos to translate
+    // against); that case shouldn't arise in a valid section.
+    let chunk_pos = chunk_input_axes.iter().map(|&(_, ax)| ax).next();
+    if let Some(cp) = chunk_pos {
+        ensure!(
+            chunk_input_axes.iter().all(|&(_, ax)| ax == cp),
+            "Body op {node}: chunked inputs disagree on chunk axis position {chunk_input_axes:?}"
+        );
+    }
+    let chunked_op = translate_body_op_axes(node.op.as_ref(), chunk_pos);
     Ok(patch.wire_node(&*node.name, chunked_op, &new_inputs)?[0])
 }
 
 /// Rewrite an op's axis/axes parameters for the chunked frame, where
-/// the chunk axis sits at position 0 and every original axis has
-/// shifted right by one.  Currently handles `Softmax`; other axis-
-/// bearing ops fall through unchanged.
-fn translate_body_op_axes(op: &dyn TypedOp) -> Box<dyn TypedOp> {
+/// the chunk axis was inserted at `chunk_pos` (taken from the chunked
+/// input's streaming axis position).  Original axes at or beyond
+/// `chunk_pos` shift right by one; axes strictly before it stay put.
+/// Handles `Softmax`, `AxisOp::Move/Add/Rm`; other axis-bearing ops
+/// fall through unchanged.
+fn translate_body_op_axes(op: &dyn TypedOp, chunk_pos: Option<usize>) -> Box<dyn TypedOp> {
     use tract_core::ops::nn::{Softmax, SoftmaxKind};
+    let shift = |a: usize| match chunk_pos {
+        Some(cp) => chunked_axis_index(a, cp),
+        None => a,
+    };
     if let Some(softmax) = op.downcast_ref::<Softmax>() {
-        let new_axes: TVec<usize> = softmax.axes.iter().map(|&a| a + 1).collect();
+        let new_axes: TVec<usize> = softmax.axes.iter().map(|&a| shift(a)).collect();
         let new_softmax = match &softmax.kind {
             SoftmaxKind::Softmax(exp) => {
                 Softmax::new(new_axes, softmax.quant_output_dt, SoftmaxKind::Softmax(*exp))
@@ -1151,6 +1587,25 @@ fn translate_body_op_axes(op: &dyn TypedOp) -> Box<dyn TypedOp> {
             }
         };
         return Box::new(new_softmax);
+    }
+    if let Some(ax_op) = op.downcast_ref::<AxisOp>() {
+        // `Add(at)` inserts a new axis *before* the original position `at`.
+        // We want the new axis to land in the same broadcast slot relative
+        // to the original tensor, which means it stays at `at` when
+        // `at <= chunk_pos` (placed before the chunk axis) and shifts +1
+        // otherwise.  Move/Rm name existing axes, so their parameters
+        // translate via `chunked_axis_index` like any other label.
+        let add_shift = |a: usize| match chunk_pos {
+            Some(cp) if a > cp => a + 1,
+            _ => a,
+        };
+        let translated = match ax_op {
+            AxisOp::Move(from, to) => AxisOp::Move(shift(*from), shift(*to)),
+            AxisOp::Add(at) => AxisOp::Add(add_shift(*at)),
+            AxisOp::Rm(at) => AxisOp::Rm(shift(*at)),
+            other => other.clone(),
+        };
+        return Box::new(translated);
     }
     tract_core::dyn_clone::clone_box(op)
 }
@@ -1251,12 +1706,14 @@ fn wire_initiator_einsum(
     for (ix, (&input, &stream_axis)) in node.inputs.iter().zip(in_streaming_axes.iter()).enumerate()
     {
         let tapped = patch.tap_model(model, input)?;
-        let in_fact = patch.outlet_fact(tapped)?.clone();
-        let from = tvec!(in_fact.shape[stream_axis].clone());
-        let to = tvec!(chunk_sym.to_dim(), k.to_dim());
-        let reshape = AxisOp::Reshape(stream_axis, from, to);
-        let chunked =
-            patch.wire_node(format!("{}.blockify_split.{ix}", node.name), reshape, &[tapped])?[0];
+        let chunked = wire_chunk_split(
+            patch,
+            &format!("{}.{ix}", node.name),
+            tapped,
+            stream_axis,
+            chunk_sym,
+            k,
+        )?;
 
         // Banded path: if this input's stream axis is on the contracted
         // side of the section, expose `W` chunks per pulse on it.
@@ -1426,14 +1883,14 @@ fn wire_terminator_einsum(
                 .iter()
                 .position(|d| d.symbols().contains(chunk_sym))
                 .ok_or_else(|| format_err!("auxiliary input lost streaming axis"))?;
-            let from = tvec!(in_fact.shape[stream_axis].clone());
-            let to = tvec!(chunk_sym.to_dim(), k.to_dim());
-            let reshape = AxisOp::Reshape(stream_axis, from, to);
-            let new_chunked = patch.wire_node(
-                format!("{}.blockify_split.in{slot}", node.name),
-                reshape,
-                &[tapped],
-            )?[0];
+            let new_chunked = wire_chunk_split(
+                patch,
+                &format!("{}.in{slot}", node.name),
+                tapped,
+                stream_axis,
+                chunk_sym,
+                k,
+            )?;
 
             // Where does this auxiliary's stream axis sit on the score
             // matrix (= input 0 of this einsum)?  If it's the contracted
@@ -1504,6 +1961,60 @@ fn wire_merge_reshape(
     } else {
         Ok(chunked_form)
     }
+}
+
+/// Compute the constant `c` such that `dim == c + k · chunk_sym`, when one
+/// exists.  Encoder-style conv stacks emit dims like `1 + (T+6)/8` which,
+/// after the `T → P · S` substitute, become `1 + 14·S` — affine in `S`
+/// with constant `c = 1`.  Blockify's chunked Reshape can't directly
+/// reshape `c + k·S → [S, k]`; we slice off the trailing `c` tokens
+/// first so the chunkable region is exactly `k·S`.
+///
+/// Returns `Some(c)` only when `c` is a non-negative integer constant.
+/// `c = 0` is the clean case (no slice needed).
+fn affine_chunk_offset(dim: &TDim, chunk_sym: &Symbol, k: i64) -> Option<i64> {
+    let target = chunk_sym.to_dim() * k;
+    let diff = dim.clone() - target;
+    let c = diff.to_i64().ok()?;
+    (c >= 0).then_some(c)
+}
+
+/// Wrap a chunked `Reshape(stream_axis, [dim], [chunk_sym, k])` with an
+/// `AffineChunkTrim` when the input dim is `c + k · chunk_sym` for
+/// `c > 0`, dropping the trailing `c` tokens so the Reshape sees `k·S`.
+fn wire_chunk_split(
+    patch: &mut TypedModelPatch,
+    name: &str,
+    input: OutletId,
+    stream_axis: usize,
+    chunk_sym: &Symbol,
+    k: i64,
+) -> TractResult<OutletId> {
+    let in_fact = patch.outlet_fact(input)?.clone();
+    let dim = in_fact.shape[stream_axis].clone();
+    let target = chunk_sym.to_dim() * k;
+    let mut wire = input;
+    if dim != target
+        && let Some(c) = affine_chunk_offset(&dim, chunk_sym, k)
+        && c > 0
+    {
+        wire = patch.wire_node(
+            format!("{name}.affine_trim"),
+            crate::ops::array::AffineChunkTrim {
+                axis: stream_axis,
+                typed_trim: c as usize,
+                target_per_pulse: k as usize,
+            },
+            &[wire],
+        )?[0];
+    }
+    let from = tvec!(patch.outlet_fact(wire)?.shape[stream_axis].clone());
+    let to = tvec!(chunk_sym.to_dim(), k.to_dim());
+    Ok(patch.wire_node(
+        format!("{name}.blockify_split"),
+        AxisOp::Reshape(stream_axis, from, to),
+        &[wire],
+    )?[0])
 }
 
 /// First streaming-symbol-bearing symbol on a fact's shape.  Used by

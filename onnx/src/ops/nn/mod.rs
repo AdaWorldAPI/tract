@@ -7,13 +7,24 @@ use crate::model::{OnnxOpRegister, ParsingContext};
 use crate::pb::NodeProto;
 use crate::pb_helpers::OptionExt;
 
+mod attention;
 mod batch_norm;
 mod conv_transpose;
 mod dropout;
+mod gelu;
+mod gelu_contrib;
+mod group_norm;
 mod instance_norm;
 mod layer_norm;
+mod lp_norm;
 mod lrn;
+mod mat_mul_nbits;
+mod mish;
+mod mvn;
 mod reduce;
+mod rms_norm;
+mod rms_norm_contrib;
+mod rotary_embedding;
 
 pub fn arg_max_min(
     _ctx: &ParsingContext,
@@ -44,14 +55,18 @@ pub fn register_all_ops(reg: &mut OnnxOpRegister) {
     reg.insert("GlobalAveragePool", |_, _| Ok((expand(ops::nn::GlobalAvgPool), vec![])));
     reg.insert("GlobalLpPool", global_lp_pool);
     reg.insert("GlobalMaxPool", |_, _| Ok((expand(ops::nn::GlobalMaxPool), vec![])));
+    reg.insert("GroupNormalization", group_norm::group_normalization);
     reg.insert("Hardmax", layer_hard_max);
     reg.insert("HardSigmoid", hard_sigmoid);
     reg.insert("InstanceNormalization", instance_norm::instance_normalization);
     reg.insert("LayerNormalization", layer_norm::layer_norm);
     reg.insert("LeakyRelu", leaky_relu);
+    reg.insert("LpNormalization", lp_norm::lp_normalization);
     reg.insert("LogSoftmax", layer_log_soft_max);
     reg.insert("LRN", lrn::lrn);
+    reg.insert("MatMulNBits", mat_mul_nbits::mat_mul_nbits);
     reg.insert("MaxPool", max_pool);
+    reg.insert("MeanVarianceNormalization", mvn::mean_variance_normalization);
     reg.insert("ParametricSoftplus", parametric_softplus);
     reg.insert("QLinearConv", conv_qlinear);
     reg.insert("PRelu", |_, _| Ok((expand(Prelu), vec![])));
@@ -71,8 +86,22 @@ pub fn register_all_ops(reg: &mut OnnxOpRegister) {
     reg.insert("ThresholdedRelu", thresholded_relu);
     reg.insert("Selu", selu);
     reg.insert("Sigmoid", |_, _| Ok((ops::nn::sigmoid().into_hir(), vec![])));
+    reg.insert("Attention", attention::attention);
+    reg.insert("Gelu", gelu::gelu);
+    reg.insert("BiasGelu", gelu_contrib::bias_gelu);
+    reg.insert("FastGelu", gelu_contrib::fast_gelu);
+    reg.insert("QuickGelu", gelu_contrib::quick_gelu);
     reg.insert("HardSwish", |_, _| Ok((ops::nn::hard_swish().into_hir(), vec![])));
+    reg.insert("Mish", |_, _| Ok((expand(mish::Mish), vec![])));
+    reg.insert("RMSNormalization", rms_norm::rms_normalization);
+    reg.insert("RotaryEmbedding", rotary_embedding::rotary_embedding);
+    reg.insert("SimplifiedLayerNormalization", rms_norm::rms_normalization);
+    reg.insert(
+        "SkipSimplifiedLayerNormalization",
+        rms_norm_contrib::skip_simplified_layer_normalization,
+    );
     reg.insert("Softmax", layer_soft_max);
+    reg.insert("Swish", |_, _| Ok((tract_core::ops::nn::silu::silu().into_hir(), vec![])));
     reg.insert("Softplus", |_, _| Ok((expand(ops::activations::Softplus), vec![])));
     reg.insert("Softsign", |_, _| Ok((expand(ops::activations::Softsign), vec![])));
 }

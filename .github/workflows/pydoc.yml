@@ -8,27 +8,34 @@ on:
 env:
   CARGO_INCREMENTAL: false
 
+permissions:
+  contents: read
+
 jobs:
   build_doc:
     name: Build doc
     runs-on: ubuntu-latest
     if: github.repository == 'sonos/tract'
+    permissions:
+      contents: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.12"
 
       - name: Extract version tag
         id: version
         if: github.event_name == 'release' && github.event.action == 'published'
-        run: echo value=$(echo ${{ github.ref }} | cut -f 3 -d / | sed 's/^v//' ) >> $GITHUB_OUTPUT
+        run: echo value=$(echo ${GITHUB_REF} | cut -f 3 -d / | sed 's/^v//' ) >> $GITHUB_OUTPUT
 
       - name: Build doc
         run: |
@@ -48,7 +55,7 @@ jobs:
           git config user.name "CI bot"
           git config user.email ci-bot@tract.rs
 
-          version="${{ steps.version.outputs.value }}"
+          version="${STEPS_VERSION_OUTPUTS_VALUE}"
           if [ -z "$version" ]; then
             version="dev"
           fi
@@ -86,3 +93,5 @@ jobs:
           # clean up worktree
           cd -
           git worktree remove "$workdir"
+        env:
+          STEPS_VERSION_OUTPUTS_VALUE: ${{ steps.version.outputs.value }}

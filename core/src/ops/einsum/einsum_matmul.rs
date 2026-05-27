@@ -3,7 +3,6 @@ use std::ops::Deref;
 
 use tract_itertools::{izip, multiunzip};
 use tract_linalg::block_quant::PackedBlockQuantFormat;
-use tract_linalg::pack::PackedFormat;
 
 use super::*;
 use crate::ops::cast::cast;
@@ -48,6 +47,25 @@ fn merge_same_role_axes_rule(
     let a_order: Vec<char> = op.axes.axes(InOut::In(0)).map(|a| a.repr).collect();
     let b_order: Vec<char> = op.axes.axes(InOut::In(1)).map(|a| a.repr).collect();
     let c_order: Vec<char> = op.axes.axes(InOut::Out(0)).map(|a| a.repr).collect();
+
+    // Per-input shapes, used both to reject broadcast merges and to gauge
+    // whether a merge earns its reshape / axis-permute cost.
+    let input_facts = model.node_input_facts(node.id)?;
+    let input_shapes = op.actual_input_shapes_from_facts(&input_facts)?;
+    // An axis is "non-unit" if its extent is not statically 1 (symbolic extents
+    // count as potentially large). A fold only reduces the number of matmul
+    // invocations when it combines at least two non-unit axes; folding a unit
+    // axis — the streaming axis at pulse=1, or a batch axis of 1 — leaves the
+    // matmul geometry untouched and only adds reshapes (and, in the k-axis
+    // branch, a MoveAxis), so we decline those.
+    let is_non_unit = |c: &char| -> bool {
+        let dim = a_order
+            .iter()
+            .position(|x| x == c)
+            .map(|p| &input_shapes[0][p])
+            .or_else(|| b_order.iter().position(|x| x == c).map(|p| &input_shapes[1][p]));
+        dim.map_or(true, |d| d.as_i64() != Some(1))
+    };
 
     // Find first group of 2+ same-role axes that are consecutive in all inputs.
     // Scan each input's axis order for runs of same-role axes.
@@ -100,10 +118,28 @@ fn merge_same_role_axes_rule(
         }
     }
 
+    if let Some(ref group) = best_group {
+        // Reject the group if any axis has mismatched per-input dims. This
+        // catches broadcasting cases — e.g. GQA `bhgmk,bhgnk->bhgmn` where g has
+        // dim 2 in input[0] and dim 1 in input[1]. Merging would collapse the
+        // broadcast structure into a non-broadcast dim mismatch that downstream
+        // OptMatMul codegen / kernels cannot handle.
+        let dims_match = group.iter().all(|c| {
+            match (a_order.iter().position(|x| x == c), b_order.iter().position(|x| x == c)) {
+                (Some(p0), Some(p1)) => input_shapes[0][p0] == input_shapes[1][p1],
+                _ => true,
+            }
+        });
+        // Decline merges that combine fewer than two non-unit axes: they don't
+        // shrink the matmul loop count, they only add reshapes / a MoveAxis.
+        let worth_merging = group.iter().filter(|c| is_non_unit(c)).count() >= 2;
+        if !dims_match || !worth_merging {
+            best_group = None;
+        }
+    }
+
     if let Some(group) = best_group {
         // Found a mergeable group. Emit the patch.
-        let input_facts = model.node_input_facts(node.id)?;
-        let input_shapes = op.actual_input_shapes_from_facts(&input_facts)?;
         let output_shape = super::eval::output_shape(&op.axes, &input_shapes)?;
 
         let drop_set: Vec<char> = group[1..].to_vec();
@@ -230,6 +266,14 @@ fn merge_same_role_axes_rule(
             let mid_role = role_of(mid);
             let right_role = role_of(right);
             if left_role != right_role || mid_role != Some(k_role) {
+                continue;
+            }
+            // Only move the k-axis aside if the resulting merge is worth it:
+            // both axes we'd bring together must be non-unit. Otherwise the
+            // MoveAxis buys nothing (e.g. a 1×1 conv at pulse=1, where the
+            // batch / streaming axes are 1 and the only real axis was already
+            // the matmul m).
+            if !is_non_unit(&left) || !is_non_unit(&right) {
                 continue;
             }
             // left and right must also be consecutive in other inputs
@@ -819,23 +863,21 @@ fn optimized_mat_mul(
     let name = &node.name;
 
     let pack_a: Box<dyn TypedOp> = if input_facts[0].konst.is_some() {
-        if let Some(pf) = left_pack.downcast_ref::<PackedFormat>() {
-            Box::new(OptMatMulPack {
-                packers: vec![pf.clone()],
-                mode_picker: ModePicker::Single,
-                k_axis: op.a_k(),
-                mn_axis: op.a_m(),
-            })
-        } else if let Some(packed_format) =
-            left_pack.downcast_ref::<PackedBlockQuantFormat>().cloned()
-        {
+        if let Some(packed_format) = left_pack.downcast_ref::<PackedBlockQuantFormat>().cloned() {
             Box::new(OptSimpleMatMulPack {
                 packed_format,
                 k: input_shapes[0][op.a_k()].to_usize().unwrap(),
                 m: input_shapes[0][op.a_m()].to_usize().unwrap(),
             })
         } else {
-            bail!("Unexpected static input format {left_pack:?}");
+            // PackedFormat or a custom packer (e.g. PackedI8K4); OptMatMulPack
+            // dispatches on the concrete format at pack time.
+            Box::new(OptMatMulPack {
+                packers: vec![left_pack],
+                mode_picker: ModePicker::Single,
+                k_axis: op.a_k(),
+                mn_axis: op.a_m(),
+            })
         }
     } else {
         Box::new(OptMatMulPack {
@@ -843,11 +885,8 @@ fn optimized_mat_mul(
                 .iter()
                 .map(|(mmm, p, pe)| {
                     pe.as_ref()
-                        .map(|pe| &pe.from)
-                        .unwrap_or(&mmm.packings()[*p].0)
-                        .downcast_ref::<PackedFormat>()
-                        .unwrap()
-                        .clone()
+                        .map(|pe| pe.from.clone())
+                        .unwrap_or_else(|| mmm.packings()[*p].0.clone())
                 })
                 .collect(),
             mode_picker: mode_picker.clone(),
@@ -862,12 +901,7 @@ fn optimized_mat_mul(
         OptMatMulPack {
             k_axis: op.b_k(),
             mn_axis: op.b_n(),
-            packers: impls
-                .iter()
-                .map(|(mmm, p, _)| {
-                    mmm.packings()[*p].1.downcast_ref::<PackedFormat>().unwrap().clone()
-                })
-                .collect(),
+            packers: impls.iter().map(|(mmm, p, _)| mmm.packings()[*p].1.clone()).collect(),
             mode_picker: mode_picker.clone(),
         },
         &[taps[1]],

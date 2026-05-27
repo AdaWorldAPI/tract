@@ -4,6 +4,11 @@ mod apple_amx;
 mod arm64simd;
 pub mod cortex_a53;
 mod cortex_a55;
+// `tract_sme` is set by build.rs only when the assembler can assemble SME
+// (gates out e.g. the old Debian stretch aarch64 toolchain).
+#[cfg(all(any(target_os = "macos", target_os = "linux"), tract_sme))]
+mod sme;
+mod sve;
 //mod cortex_a72;
 //mod cortex_a73;
 pub use arm64simd::*;
@@ -403,6 +408,9 @@ pub fn plug(ops: &mut Ops) {
         }
     }
     ops.leaky_relu_f32 = Box::new(|| arm64simd_leaky_relu_f32_8n::ew());
+    ops.hardswish_f32 = Box::new(|| arm64simd_hardswish_f32_8n::ew());
+    ops.silu_f32 = Box::new(|| arm64simd_silu_f32_4n_fused::ew());
+    ops.gelu_f32 = Box::new(|| arm64simd_gelu_f32_4n_fused::ew());
     ops.sigmoid_f32 = Box::new(|| arm64simd_sigmoid_f32_4n::ew());
     ops.tanh_f32 = Box::new(|| arm64simd_tanh_f32_4n::ew());
     ops.max_f32 = Box::new(|| arm64simd_max_f32_16n::red());
@@ -425,4 +433,9 @@ pub fn plug(ops: &mut Ops) {
     {
         apple_amx::plug(ops);
     }
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), tract_sme))]
+    {
+        sme::plug(ops);
+    }
+    sve::plug(ops);
 }
