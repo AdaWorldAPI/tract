@@ -33,10 +33,10 @@ tract-data.workspace = true
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 libc.workspace = true
 
-# Pilot v2: one x86_64 GEMM kernel candidate calls the AdaWorldAPI ndarray fork's
-# `hpc::bf16_tile_gemm` tile primitives (AMX / AVX-512-VNNI-bf16 / FMA-polyfill tiers)
-# through the canonical `ndarray::simd` consumer surface, alongside the existing
-# hand-tuned AVX-512 asm kernels and pilot-v1's f32 `blas_gemm` candidate.
+# Pilot: additional x86_64 kernel candidates call the AdaWorldAPI ndarray fork's
+# `simd::*` surface (F32x16 polyfill for leaky_relu; `hpc::bf16_tile_gemm` tile
+# primitives for AMX/AVX-512-VNNI-bf16/FMA-polyfill GEMM) instead of hand-rolled
+# intrinsics/asm, alongside the existing hand-tuned AVX-512 kernels.
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 ndarray.workspace = true
 
