@@ -33,10 +33,10 @@ tract-data.workspace = true
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 libc.workspace = true
 
-# Pilot: one x86_64 GEMM kernel calls the AdaWorldAPI ndarray fork's
-# `hpc::blas_level3::BlasLevel3::blas_gemm` (AVX-512-capable native backend)
-# instead of hand-rolled asm, as an additional candidate alongside the
-# existing hand-tuned AVX-512 asm kernels.
+# Pilot: additional x86_64 kernel candidates call the AdaWorldAPI ndarray fork's
+# `simd::*` surface (F32x16 polyfill for leaky_relu; `BlasLevel3::blas_gemm` for
+# GEMM) instead of hand-rolled intrinsics/asm, alongside the existing hand-tuned
+# AVX-512 kernels.
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 ndarray.workspace = true
 

@@ -9,7 +9,9 @@
 //! never `ndarray::hpc::blas_level3` directly — see the ndarray fork's own `CLAUDE.md`
 //! ("all SIMD from `ndarray::simd`").
 
+#[cfg(target_arch = "x86_64")]
 use ndarray::ArrayView2;
+#[cfg(target_arch = "x86_64")]
 use ndarray::simd::BlasLevel3;
 
 use crate::frame::mmm::FusedKerSpec;
@@ -51,6 +53,7 @@ macro_rules! per_col {
 /// is `(k, NR)` row-major. `A_panel` is transposed into a small contiguous `(MR, k)` buffer
 /// (a copy, not a stride trick) so both operands reach `blas_gemm` as contiguous slices and
 /// take the real backend path instead of ndarray's non-contiguous fallback loop.
+#[cfg(target_arch = "x86_64")]
 unsafe fn add_mat_mul_ndarray<const MR: usize, const NR: usize>(
     pa: *const u8,
     pb: *const u8,
@@ -81,6 +84,22 @@ unsafe fn add_mat_mul_ndarray<const MR: usize, const NR: usize>(
             }
         }
     }
+}
+
+// `linalg/src/lib.rs` compiles this module tree under `feature = "foreign-inventory"`
+// on any host arch (to enumerate x86_64 kernel names as metadata for cross-compiled
+// builds), but `ndarray` is only a dependency on x86_64 (`linalg/Cargo.toml`). This
+// stub keeps the crate compiling there; `MMMRustKernel!(x86_64; ...)` marks the real
+// kernel `built(cfg!(target_arch = "x86_64"))`, so `MmmDispatch` never selects it and
+// this arm never runs off x86_64.
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn add_mat_mul_ndarray<const MR: usize, const NR: usize>(
+    _pa: *const u8,
+    _pb: *const u8,
+    _k: usize,
+    _ab: &mut [[f32; NR]; MR],
+) {
+    unreachable!("ndarray_gemm's kernel is x86_64-only and unbuilt elsewhere")
 }
 
 unsafe fn add_unicast<const MR: usize, const NR: usize>(
@@ -184,7 +203,7 @@ pub(super) unsafe fn kernel<const MR: usize, const NR: usize>(
     0
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod dispatch_stays_default {
     use crate::frame::mmm::{MmmDispatch, Query};
     use tract_data::internal::DatumType;
