@@ -167,6 +167,32 @@ MMMRustKernel!(ndarray_gemm::kernel::<16, 8> => ndarray_avx512_mmm_f32_16x8<f32>
 MMMRustKernel!(ndarray_bf16_gemm::kernel => ndarray_avx512_bf16_mmm_f32_16x16<f32>(16, 16)
     built(cfg!(target_arch = "x86_64")) arch(Some(crate::isa::Arch::X86_64)) isa(X86_64Avx512f)
     lossy_no_exact_tests(true));
+
+// AMX-native sibling of the kernel above: `AddMatMul` consumes operands already converted to
+// bf16 and VNNI-packed at `prepare_one` time (`ndarray_amx_native_pack.rs`'s
+// `NdarrayAmxBf16A`/`NdarrayAmxBf16B`, packing index 1) instead of redoing that work on every
+// tile call -- see `ndarray_bf16_native_gemm.rs`'s module doc. Same non-`inventory::submit!`
+// registration as the kernel above, for the same reason: reachable only by direct
+// construction, never through `MmmDispatch::native()`.
+//
+// `lossy_no_exact_tests(true)` for the same reason as above; packing 1's own
+// `mmm_packed_packed_tests!` (added by the `packing[1]` clause) is this kernel's auto-generated
+// correctness coverage, on top of `ndarray_bf16_native_gemm.rs`'s own `bf16_tolerance` module.
+//
+// `ndarray_amx_native_pack.rs` and `ndarray_bf16_native_gemm.rs` are both
+// `#![cfg(target_arch = "x86_64")]` at the module level (unlike the other pilot kernels in this
+// file, which stay compiled everywhere `feature = "foreign-inventory"` reaches with an internal
+// stub) -- this registration must match that gate or a foreign-inventory build on another arch
+// fails to resolve the now-nonexistent symbols.
+#[cfg(target_arch = "x86_64")]
+MMMRustKernel!(ndarray_bf16_native_gemm::kernel => ndarray_amx_native_bf16_mmm_f32_16x16<f32>(16, 16)
+    built(cfg!(target_arch = "x86_64")) arch(Some(crate::isa::Arch::X86_64)) isa(X86_64Avx512f)
+    packing[1] = amx_bf16_native => |k| k.with_packing(
+        crate::x86_64::ndarray_amx_native_pack::NdarrayAmxBf16A::new(16),
+        crate::x86_64::ndarray_amx_native_pack::NdarrayAmxBf16B::new(16),
+    );
+    lossy_no_exact_tests(true));
+
 MMMExternKernel!(x86_64; avx512_mmm_f32_32x6 <f32>( 32, 6)@(512,4) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_32x5 <f32>( 32, 5)@(512,4) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_48x4 <f32>( 48, 4)@(512,4) isa(X86_64Avx512f));

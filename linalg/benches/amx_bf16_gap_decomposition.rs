@@ -21,6 +21,19 @@
 // This file adds no new production kernel and touches no packing/plan code -- it is a
 // standalone harness calling `ndarray::simd::*` directly, bypassing `MatMatMulKer` entirely for
 // B1/B2.
+//
+// Two further cases measure the AMX-native packed kernel (`ndarray_bf16_native_gemm.rs` +
+// `ndarray_amx_native_pack.rs`) through the real `MatMatMulKer::run` path, at two different
+// operand-preparation lifetimes -- these are NOT the same measurement and are compared against
+// different B-cases above:
+//   P0 -- A and B both prepared (`prepare_one`) OUTSIDE the timed loop, matching B1's lifetime.
+//         Isolates tract's packed-execution abstraction tax over the raw AMX ceiling, with
+//         neither operand's preparation cost in the timed region. Compare against B1.
+//   P1 -- B prepared ONCE outside the timed loop and reused every iteration (a persistent
+//         weight, as in real inference); A's source stays f32 and is prepared (`prepare_one`)
+//         fresh INSIDE every timed iteration, once per whole matrix (not per tile) -- the same
+//         "runtime activation" lifetime B2 uses. This is the realistic inference-shaped
+//         acceptance metric. Compare against B2.
 use criterion::*;
 use ndarray::simd::{PackedBf16B, bf16_tile_gemm_16x16_packed, f32_to_bf16_batch_rne};
 use std::hint::black_box;
@@ -195,6 +208,75 @@ fn gap_decomposition(c: &mut Criterion) {
                             ],
                         )
                         .unwrap()
+                    });
+                },
+            );
+        }
+
+        // ---- P0: AMX-native packed kernel through MatMatMulKer, A and B both prepared
+        // outside the timed loop -- compare against B1 (raw AMX ceiling, same lifetime). ----
+        {
+            let mmm = tract_linalg::x86_64::mmm::ndarray_amx_native_bf16_mmm_f32_16x16.mmm();
+            group.bench_with_input(
+                BenchmarkId::new("P0_amx_native_prepacked", format!("{m}x{k}x{n}")),
+                &(m, k, n),
+                |be, &(m, k, n)| {
+                    let packing = &mmm.packings()[1];
+                    let a = Tensor::zero::<f32>(&[m, k]).unwrap();
+                    let pa = packing.0.prepare_one(&a, 1, 0).unwrap();
+                    let b = Tensor::zero::<f32>(&[k, n]).unwrap();
+                    let pb = packing.1.prepare_one(&b, 0, 1).unwrap();
+                    let mut cc = Tensor::zero::<f32>(&[n, m]).unwrap();
+                    be.iter(|| unsafe {
+                        mmm.run(
+                            m,
+                            n,
+                            &[
+                                FusedSpec::AddMatMul {
+                                    a: AsInputValue::Borrowed(&*pa),
+                                    b: AsInputValue::Borrowed(&*pb),
+                                    packing: 1,
+                                },
+                                FusedSpec::Store(mmm.c_view(Some(1), Some(0)).wrap(&cc.view_mut())),
+                            ],
+                        )
+                        .unwrap()
+                    });
+                },
+            );
+        }
+
+        // ---- P1: AMX-native packed kernel through MatMatMulKer, B prepared once outside the
+        // timed loop and reused (persistent weight); A re-prepared once per iteration inside
+        // the timed loop, once for the whole matrix (runtime activation) -- compare against B2
+        // (same lifetime split). This is the realistic inference-shaped acceptance metric. ----
+        {
+            let mmm = tract_linalg::x86_64::mmm::ndarray_amx_native_bf16_mmm_f32_16x16.mmm();
+            group.bench_with_input(
+                BenchmarkId::new("P1_amx_native_runtime_a", format!("{m}x{k}x{n}")),
+                &(m, k, n),
+                |be, &(m, k, n)| {
+                    let packing = &mmm.packings()[1];
+                    let a = Tensor::zero::<f32>(&[m, k]).unwrap();
+                    let b = Tensor::zero::<f32>(&[k, n]).unwrap();
+                    let pb = packing.1.prepare_one(&b, 0, 1).unwrap();
+                    let mut cc = Tensor::zero::<f32>(&[n, m]).unwrap();
+                    be.iter(|| unsafe {
+                        let pa = packing.0.prepare_one(&a, 1, 0).unwrap();
+                        mmm.run(
+                            m,
+                            n,
+                            &[
+                                FusedSpec::AddMatMul {
+                                    a: AsInputValue::Borrowed(&*pa),
+                                    b: AsInputValue::Borrowed(&*pb),
+                                    packing: 1,
+                                },
+                                FusedSpec::Store(mmm.c_view(Some(1), Some(0)).wrap(&cc.view_mut())),
+                            ],
+                        )
+                        .unwrap();
+                        black_box(&cc);
                     });
                 },
             );
