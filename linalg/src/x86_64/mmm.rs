@@ -128,6 +128,20 @@ MMMExternKernel!(x86_64; avx512_mmm_f32_16x1 <f32>( 16, 1)@(512,4) isa(X86_64Avx
 MMMExternKernel!(x86_64; avx512_mmm_f32_16x12<f32>( 16,12)@(512,4) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_16x8 <f32>( 16, 8)@(512,4) isa(X86_64Avx512f));
 
+// Pilot: same 16x8 tile geometry as avx512_mmm_f32_16x8 above, so the two are directly
+// comparable, but the AddMatMul accumulation calls into the AdaWorldAPI ndarray fork's
+// `BlasLevel3::blas_gemm` instead of hand-written asm.
+//
+// Deliberately NOT registered through the `(x86_64; ...)` macro sugar, which also
+// `inventory::submit!`s an `MmmRoutine` that `MmmDispatch::native()` (and so
+// `core::ops::einsum::kernel_selection::strategize`'s symbolic-N fallback, which picks the
+// largest-`nr` kernel per packing group and bypasses `preferred`/boost entirely) would
+// discover automatically. Calling the lower-level form directly skips that
+// `inventory::submit!`, so the kernel stays reachable for direct construction (this pilot's
+// own bench/tests) but invisible to automatic dispatch.
+MMMRustKernel!(ndarray_gemm::kernel::<16, 8> => ndarray_avx512_mmm_f32_16x8<f32>(16, 8)
+    built(cfg!(target_arch = "x86_64")) arch(Some(crate::isa::Arch::X86_64)) isa(X86_64Avx512f));
+
 // Pilot v2: 16x16 tile geometry (matching ndarray's fixed bf16_tile_gemm_16x16 shape). The
 // AddMatMul accumulation truncates operands to bf16 and calls the AdaWorldAPI ndarray fork's
 // `simd::bf16_tile_gemm_16x16_packed` (AMX / AVX-512-VNNI-bf16 / FMA-polyfill tiers) instead of
