@@ -1,3 +1,4 @@
+#![cfg(target_arch = "x86_64")]
 #![allow(clippy::needless_range_loop)]
 //! An f32 GEMM `MatMatMulKer` body whose `AddMatMul` step consumes operands already packed
 //! into `ndarray::simd::PackedBf16B` / panel-native bf16 form (`ndarray_amx_native_pack.rs`'s

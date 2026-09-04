@@ -178,6 +178,13 @@ MMMRustKernel!(ndarray_bf16_gemm::kernel => ndarray_avx512_bf16_mmm_f32_16x16<f3
 // `lossy_no_exact_tests(true)` for the same reason as above; packing 1's own
 // `mmm_packed_packed_tests!` (added by the `packing[1]` clause) is this kernel's auto-generated
 // correctness coverage, on top of `ndarray_bf16_native_gemm.rs`'s own `bf16_tolerance` module.
+//
+// `ndarray_amx_native_pack.rs` and `ndarray_bf16_native_gemm.rs` are both
+// `#![cfg(target_arch = "x86_64")]` at the module level (unlike the other pilot kernels in this
+// file, which stay compiled everywhere `feature = "foreign-inventory"` reaches with an internal
+// stub) -- this registration must match that gate or a foreign-inventory build on another arch
+// fails to resolve the now-nonexistent symbols.
+#[cfg(target_arch = "x86_64")]
 MMMRustKernel!(ndarray_bf16_native_gemm::kernel => ndarray_amx_native_bf16_mmm_f32_16x16<f32>(16, 16)
     built(cfg!(target_arch = "x86_64")) arch(Some(crate::isa::Arch::X86_64)) isa(X86_64Avx512f)
     packing[1] = amx_bf16_native => |k| k.with_packing(

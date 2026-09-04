@@ -1,3 +1,4 @@
+#![cfg(target_arch = "x86_64")]
 #![allow(clippy::needless_range_loop)]
 //! Packing formats that hold the ndarray AMX-native bf16 tile representation
 //! built once at `prepare_one`/`prepare_one_view` time, so the kernel body in
