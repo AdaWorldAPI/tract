@@ -5005,6 +5005,7 @@ dependencies = [
  "libc",
  "log",
  "minijinja",
+ "ndarray",
  "nu-ansi-term",
  "num-traits",
  "pastey 0.2.3",

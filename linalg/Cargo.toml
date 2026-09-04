@@ -33,6 +33,13 @@ tract-data.workspace = true
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 libc.workspace = true
 
+# Pilot: one x86_64 GEMM kernel calls the AdaWorldAPI ndarray fork's
+# `hpc::blas_level3::BlasLevel3::blas_gemm` (AVX-512-capable native backend)
+# instead of hand-rolled asm, as an additional candidate alongside the
+# existing hand-tuned AVX-512 asm kernels.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+ndarray.workspace = true
+
 [build-dependencies]
 cc.workspace = true
 half.workspace = true
@@ -79,6 +86,10 @@ harness = false
 
 [[bench]]
 name = "mat_vec"
+harness = false
+
+[[bench]]
+name = "ndarray_gemm"
 harness = false
 
 [[bench]]

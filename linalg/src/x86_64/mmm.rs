@@ -127,6 +127,14 @@ MMMExternKernel!(x86_64; avx512_mmm_f32_128x1<f32>(128, 1)@(512,4) isa(X86_64Avx
 MMMExternKernel!(x86_64; avx512_mmm_f32_16x1 <f32>( 16, 1)@(512,4) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_16x12<f32>( 16,12)@(512,4) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_16x8 <f32>( 16, 8)@(512,4) isa(X86_64Avx512f));
+
+// Pilot: same 16x8 tile geometry as avx512_mmm_f32_16x8 above, so the two are directly
+// comparable, but the AddMatMul accumulation calls into the AdaWorldAPI ndarray fork's
+// `BlasLevel3::blas_gemm` instead of hand-written asm. Purely additive: it carries no
+// boost, so retain_best ties it with the asm kernel on preference, and every x86_64
+// dispatch tier below (amd/intel_avx512_linear) still names avx512_mmm_f32_16x8
+// explicitly and never sees this one.
+MMMRustKernel!(x86_64; ndarray_gemm::kernel::<16, 8> => ndarray_avx512_mmm_f32_16x8<f32>(16, 8) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_32x6 <f32>( 32, 6)@(512,4) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_32x5 <f32>( 32, 5)@(512,4) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_48x4 <f32>( 48, 4)@(512,4) isa(X86_64Avx512f));
