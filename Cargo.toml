@@ -265,3 +265,10 @@ opt-level = 2
 debug = false
 # strip = "debuginfo" does not work on android and ios
 incremental = false
+
+# Pilot v2 (see linalg/src/x86_64/ndarray_bf16_gemm.rs): path-patches the AdaWorldAPI
+# ndarray fork so the bf16 tile GEMM candidate kernel can build locally. Not a permanent
+# dependency change -- this only resolves in a checkout that has ../ndarray alongside
+# tract, matching PR #4's pilot-v1 setup.
+[patch.crates-io]
+ndarray = { path = "../ndarray" }
