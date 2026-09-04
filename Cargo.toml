@@ -269,10 +269,7 @@ incremental = false
 # AdaWorldAPI/ndarray fork: same 0.17.2 API surface as upstream, plus a
 # `simd`/`hpc` module (crate::simd::F32x16 etc.) with a LazyLock-cached
 # AVX-512 -> AVX2 -> NEON -> scalar dispatch tier (src/simd.rs,
-# src/simd_avx512.rs). Patching it in is transparent for every existing
-# ndarray:: call site; it does not by itself accelerate any tract kernel
-# until tract's own linalg ops are rewritten to call crate::simd::* instead
-# of their current SIMD path. Pinned via git (not a sibling path) so this
+# src/simd_avx512.rs). Pinned via git (not a sibling path) so this
 # resolves in any checkout, CI included.
 [patch.crates-io]
 ndarray = { git = "https://github.com/AdaWorldAPI/ndarray", branch = "master" }
