@@ -54,8 +54,6 @@ fn simulate_bf16_precision_loss(mut tensor: Tensor) -> TractResult<Tensor> {
     Ok(tensor)
 }
 
-// ───────────────────────────── A: activation lifetime ──────────────────────
-
 /// Packing format for the AMX-native bf16 kernel's A operand: bf16-converted,
 /// panel-native (row-major `[16, k_padded]` per panel) data, built once per
 /// `prepare_one`/`prepare_one_view` call. Never carries partially-converted
@@ -225,8 +223,6 @@ impl MMMInputValue for NdarrayAmxBf16AValue {
         bail!("no f32 extract")
     }
 }
-
-// ───────────────────────────── B: constant-weight lifetime ─────────────────
 
 /// Packing format for the AMX-native bf16 kernel's B operand: bf16-converted
 /// AND VNNI-packed (`ndarray::simd::PackedBf16B`) once per
