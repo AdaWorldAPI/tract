@@ -35,6 +35,7 @@ deny = [
 # trusted git sources.
 allow-git = [
     "https://github.com/rustformers/llm.git",
+    "https://github.com/AdaWorldAPI/ndarray",
 ]
 
 [licenses]

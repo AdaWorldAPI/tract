@@ -124,7 +124,7 @@ default-members = [
 [workspace.package]
 # MSRV source of truth: CI derives the tested toolchain from this. Keep the
 # README rustc badge in sync when bumping.
-rust-version = "1.91"
+rust-version = "1.97"
 
 [workspace.dependencies]
 anstyle = "1.0.2"
@@ -266,9 +266,10 @@ debug = false
 # strip = "debuginfo" does not work on android and ios
 incremental = false
 
-# Pilot v2 (see linalg/src/x86_64/ndarray_bf16_gemm.rs): path-patches the AdaWorldAPI
-# ndarray fork so the bf16 tile GEMM candidate kernel can build locally. Not a permanent
-# dependency change -- this only resolves in a checkout that has ../ndarray alongside
-# tract, matching PR #4's pilot-v1 setup.
+# AdaWorldAPI/ndarray fork: same 0.17.2 API surface as upstream, plus a
+# `simd`/`hpc` module (crate::simd::F32x16 etc.) with a LazyLock-cached
+# AVX-512 -> AVX2 -> NEON -> scalar dispatch tier (src/simd.rs,
+# src/simd_avx512.rs). Pinned via git (not a sibling path) so this
+# resolves in any checkout, CI included.
 [patch.crates-io]
-ndarray = { path = "../ndarray" }
+ndarray = { git = "https://github.com/AdaWorldAPI/ndarray", branch = "master" }
