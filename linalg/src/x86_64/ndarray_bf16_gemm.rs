@@ -44,6 +44,7 @@
 //! pilot v1's 16x8 -- packed A/B panels are padded up to the next multiple of 32 in K with
 //! zero rows/columns, which contribute nothing to the accumulation.
 
+#[cfg(target_arch = "x86_64")]
 use ndarray::simd::{PackedBf16B, bf16_tile_gemm_16x16_packed, f32_to_bf16_batch_rne};
 
 use crate::frame::mmm::FusedKerSpec;
@@ -96,6 +97,7 @@ const TILE: usize = 16;
 /// at. Unlike pilot v1 this pack is a single VNNI interleave straight into the tile primitive
 /// (no BLAS-level3 entry point re-deriving packing/dispatch from scratch), but it is still
 /// real per-tile allocation and work, not something hoisted above the tile loop.
+#[cfg(target_arch = "x86_64")]
 unsafe fn add_mat_mul_bf16(pa: *const u8, pb: *const u8, k: usize, ab: &mut [[f32; TILE]; TILE]) {
     unsafe {
         if k == 0 {
@@ -135,6 +137,22 @@ unsafe fn add_mat_mul_bf16(pa: *const u8, pb: *const u8, k: usize, ab: &mut [[f3
             }
         }
     }
+}
+
+// `linalg/src/lib.rs` compiles this module tree under `feature = "foreign-inventory"`
+// on any host arch (to enumerate x86_64 kernel names as metadata for cross-compiled
+// builds), but `ndarray` is only a dependency on x86_64 (`linalg/Cargo.toml`). This
+// stub keeps the crate compiling there; `MMMRustKernel!(x86_64; ...)` marks the real
+// kernel `built(cfg!(target_arch = "x86_64"))`, so `MmmDispatch` never selects it and
+// this arm never runs off x86_64.
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn add_mat_mul_bf16(
+    _pa: *const u8,
+    _pb: *const u8,
+    _k: usize,
+    _ab: &mut [[f32; TILE]; TILE],
+) {
+    unreachable!("ndarray_bf16_gemm's kernel is x86_64-only and unbuilt elsewhere")
 }
 
 unsafe fn add_unicast(ab: &mut [[f32; TILE]; TILE], other: &OutputStoreKer) {
@@ -234,7 +252,7 @@ pub(super) unsafe fn kernel(mut pnl: *const FusedKerSpec<f32>) -> isize {
     0
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod dispatch_stays_default {
     use crate::frame::mmm::{MmmDispatch, Query};
     use tract_data::internal::DatumType;
@@ -271,7 +289,7 @@ mod dispatch_stays_default {
 /// naive f32 reference GEMM over inputs deliberately chosen to be exactly bf16-representable
 /// (so this test's own tolerance is measuring accumulation-order/tier drift, not re-measuring
 /// the f32->bf16 truncation the module doc already documents and asserts is real).
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod bf16_tolerance {
     use crate::frame::mmm::FusedSpec;
     use crate::x86_64::mmm::ndarray_avx512_bf16_mmm_f32_16x16;
