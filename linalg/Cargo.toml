@@ -93,6 +93,10 @@ name = "ndarray_bf16_gemm"
 harness = false
 
 [[bench]]
+name = "amx_bf16_gap_decomposition"
+harness = false
+
+[[bench]]
 name = "ndarray_gemm"
 harness = false
 
