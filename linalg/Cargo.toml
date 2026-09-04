@@ -33,6 +33,12 @@ tract-data.workspace = true
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 libc.workspace = true
 
+# Pilot: one x86_64 element-wise kernel (leaky_relu) calls the AdaWorldAPI ndarray
+# fork's `simd::F32x16` polyfill instead of hand-rolled intrinsics/asm, as an
+# additional candidate alongside the existing hand-tuned AVX-512 kernel.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+ndarray.workspace = true
+
 [build-dependencies]
 cc.workspace = true
 half.workspace = true
