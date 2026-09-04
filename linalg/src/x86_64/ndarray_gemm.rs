@@ -208,20 +208,20 @@ mod dispatch_stays_default {
     use crate::frame::mmm::{MmmDispatch, Query};
     use tract_data::internal::DatumType;
 
+    /// This kernel is registered without `inventory::submit!` (see `mmm.rs`'s registration
+    /// comment) so it never reaches `MmmDispatch::native()` -- for both a concrete and a
+    /// symbolic (`None`) N, since the symbolic-N fallback in
+    /// `core::ops::einsum::kernel_selection::strategize` picks the largest-`nr` kernel per
+    /// packing group, bypassing `preferred`/boost entirely.
     #[test]
-    fn adding_the_ndarray_candidate_does_not_change_default_pick() {
+    fn ndarray_candidate_is_not_reachable_through_automatic_dispatch() {
         let dispatch = MmmDispatch::native();
-        let query = Query::plain(DatumType::F32, Some(64), Some(256), Some(32));
-        let suitable = dispatch.suitable(&query);
-        assert!(
-            suitable.iter().any(|(mmm, _, _)| mmm.name() == "ndarray_avx512_mmm_f32_16x8"),
-            "the new candidate should be suitable wherever avx512f is native"
-        );
-        if let Some((picked, _, _)) = dispatch.pick(&query) {
-            assert_ne!(
-                picked.name(),
-                "ndarray_avx512_mmm_f32_16x8",
-                "default dispatch must still prefer the hand-tuned asm kernel"
+        for n in [Some(32), None] {
+            let query = Query::plain(DatumType::F32, Some(64), Some(256), n);
+            let suitable = dispatch.suitable(&query);
+            assert!(
+                suitable.iter().all(|(mmm, _, _)| mmm.name() != "ndarray_avx512_mmm_f32_16x8"),
+                "the ndarray candidate must never appear in automatic dispatch (n={n:?})"
             );
         }
     }
