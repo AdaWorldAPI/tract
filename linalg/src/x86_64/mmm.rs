@@ -145,8 +145,14 @@ MMMExternKernel!(x86_64; avx512_mmm_f32_16x8 <f32>( 16, 8)@(512,4) isa(X86_64Avx
 // form directly skips that `inventory::submit!`, so the kernel stays reachable for direct
 // construction (this pilot's own bench/tests) but invisible to automatic dispatch -- the
 // concrete guarantee "purely additive, no behavior change" actually requires.
+//
+// `lossy_no_exact_tests(true)`: this kernel's accumulate path truncates its f32 operands to
+// bf16 before compute, so it cannot pass `MMMKernel!`'s auto-generated bit-exact test suite
+// (`test_mmm_kernel!`) by construction -- that suite compares against an exact f32 reference.
+// `ndarray_bf16_gemm.rs`'s own `bf16_tolerance` module is this kernel's real correctness test.
 MMMRustKernel!(ndarray_bf16_gemm::kernel => ndarray_avx512_bf16_mmm_f32_16x16<f32>(16, 16)
-    built(cfg!(target_arch = "x86_64")) arch(Some(crate::isa::Arch::X86_64)) isa(X86_64Avx512f));
+    built(cfg!(target_arch = "x86_64")) arch(Some(crate::isa::Arch::X86_64)) isa(X86_64Avx512f)
+    lossy_no_exact_tests(true));
 MMMExternKernel!(x86_64; avx512_mmm_f32_32x6 <f32>( 32, 6)@(512,4) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_32x5 <f32>( 32, 5)@(512,4) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_48x4 <f32>( 48, 4)@(512,4) isa(X86_64Avx512f));

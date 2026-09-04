@@ -79,6 +79,7 @@ macro_rules! MMMRustKernel {
             $(boost($boost:expr))?
             $(store($($store:ty),*))?
             $(row_major_store($rms:expr))?
+            $(lossy_no_exact_tests($lossy_no_exact_tests:literal))?
      ) => {
         paste! {
             mod [<sys_ $id>] {
@@ -101,6 +102,7 @@ macro_rules! MMMRustKernel {
                 $(boost($boost))?
                 $(store($($store),*))?
                 $(row_major_store($rms))?
+                $(lossy_no_exact_tests($lossy_no_exact_tests))?
             );
         }
     }
@@ -120,6 +122,7 @@ macro_rules! MMMKernel {
             $(boost($boost:expr))?
             $(store($($store:ty),*))?
             $(row_major_store($rms:expr))?
+            $(lossy_no_exact_tests($lossy_no_exact_tests:literal))?
      ) => {
         paste! {
             lazy_static::lazy_static! {
@@ -160,8 +163,9 @@ macro_rules! MMMKernel {
 
             #[cfg(test)]
             mod [<test_$id>] {
+                #[allow(unused_imports)]
                 use super::$id;
-                test_mmm_kernel!($ti, &*super::$id);
+                maybe_test_mmm_kernel!($(lossy_no_exact_tests($lossy_no_exact_tests))? ; $ti, &*super::$id);
                 $(mmm_packed_packed_tests!(&*super::$id, $pid : $pnum);)*
                 $($(mmm_store_test!(&*super::$id, $store);)*)?
             }

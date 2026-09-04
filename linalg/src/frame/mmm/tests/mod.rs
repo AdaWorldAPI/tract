@@ -27,6 +27,21 @@ macro_rules! test_mmm_kernel {
     };
 }
 
+/// Gate for `MMMKernel!`'s `lossy_no_exact_tests` flag: a kernel whose accumulate arithmetic
+/// isn't exact against its declared datum type (e.g. an internal bf16 truncation) can't pass
+/// `test_mmm_kernel!`'s bit-exact suite by construction, and needs its own tolerance-based
+/// tests instead of this one.
+#[cfg(test)]
+macro_rules! maybe_test_mmm_kernel {
+    (lossy_no_exact_tests(true) ; $ti:tt, $ker:expr) => {};
+    (lossy_no_exact_tests(false) ; $ti:tt, $ker:expr) => {
+        test_mmm_kernel!($ti, $ker);
+    };
+    (; $ti:tt, $ker:expr) => {
+        test_mmm_kernel!($ti, $ker);
+    };
+}
+
 #[macro_export]
 macro_rules! test_mmm_kernel_f16 {
     ($ker: expr) => {
