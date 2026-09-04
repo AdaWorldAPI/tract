@@ -34,9 +34,9 @@ tract-data.workspace = true
 libc.workspace = true
 
 # Pilot: additional x86_64 kernel candidates call the AdaWorldAPI ndarray fork's
-# `simd::*` surface (F32x16 polyfill for leaky_relu; `BlasLevel3::blas_gemm` for
-# GEMM) instead of hand-rolled intrinsics/asm, alongside the existing hand-tuned
-# AVX-512 kernels.
+# `simd::*` surface (F32x16 polyfill for leaky_relu; `BlasLevel3::blas_gemm` and
+# `hpc::bf16_tile_gemm` tile primitives for GEMM) instead of hand-rolled
+# intrinsics/asm, alongside the existing hand-tuned AVX-512 kernels.
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 ndarray.workspace = true
 
@@ -86,6 +86,14 @@ harness = false
 
 [[bench]]
 name = "mat_vec"
+harness = false
+
+[[bench]]
+name = "ndarray_bf16_gemm"
+harness = false
+
+[[bench]]
+name = "amx_bf16_gap_decomposition"
 harness = false
 
 [[bench]]
