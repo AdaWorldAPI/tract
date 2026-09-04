@@ -1,25 +1,14 @@
 #![allow(clippy::needless_range_loop)]
 //! An f32 GEMM `MatMatMulKer` body whose `AddMatMul` step truncates its operands to bf16 and
 //! calls into the AdaWorldAPI ndarray fork's `simd::bf16_tile_gemm_16x16_packed` tile primitive
-//! (AMX `TDPBF16PS` → AVX-512 `VDPBF16PS` → decode+FMA polyfill, selected at runtime) as a
-//! second additional candidate alongside the hand-tuned AVX-512 asm kernels and pilot v1's
-//! f32-exact `ndarray_avx512_mmm_f32_16x8` (`ndarray_gemm.rs`).
+//! (AMX `TDPBF16PS` → AVX-512 `VDPBF16PS` → decode+FMA polyfill, selected at runtime) as an
+//! additional candidate alongside the hand-tuned AVX-512 asm kernels and the f32-exact
+//! `ndarray_avx512_mmm_f32_16x8` (`ndarray_gemm.rs`).
 //!
-//! **Where this stands relative to pilot v1's structural problem:** `ndarray_gemm.rs`'s
-//! `blas_gemm` call allocates a fresh `Array` and re-packs its B operand on *every tile call*
-//! via a full BLAS-level3 entry point (allocation + a generic path selection on top of the
-//! repack), which was measured 5-10x slower than the hand-tuned asm kernel for exactly that
-//! reason. This kernel's `AddMatMul` step is *also* invoked once per output tile (that is how
-//! `MatMatMulKer`'s fused-op interpreter calls into any kernel body — one call per (MR, NR)
-//! tile, carrying that tile's full K depth), so it still allocates and VNNI-packs its A/B
-//! operands **once per tile call**, not once per whole-matrix GEMM — hoisting the pack any
-//! further up would mean restructuring the packed-panel format `MatMatMulKer` hands the kernel,
-//! which is out of scope for this pilot. What *is* structurally different from pilot v1: the
-//! per-call work here is a single `PackedBf16B::pack` (one VNNI interleave over a `k×16`
-//! buffer) plus a bf16 truncation pass, calling directly into a tile primitive with no
-//! allocation inside — not a generic BLAS-level3 entry point that re-derives packing/path
-//! selection from scratch on every call. The measured benchmark numbers below are the honest
-//! comparison; see them before assuming this claim translates into a win.
+//! Registered outside automatic dispatch (see `mmm.rs`'s registration comment for this kernel):
+//! this kernel's `AddMatMul` step allocates and VNNI-packs its A/B operands once per output-tile
+//! call (that is the granularity `MatMatMulKer`'s fused-op interpreter calls a kernel body at),
+//! reachable only by direct construction, not through `MmmDispatch::native()`.
 //!
 //! **Precision, stated plainly:** the accumulate arithmetic (`C += A·B`) is bit-exact across
 //! all three `bf16_tile_gemm` tiers for bf16-exact-integer operands with accumulation below
@@ -257,25 +246,23 @@ mod dispatch_stays_default {
     use crate::frame::mmm::{MmmDispatch, Query};
     use tract_data::internal::DatumType;
 
+    /// This kernel is registered without `inventory::submit!` (see `mmm.rs`'s registration
+    /// comment) specifically so it never reaches `MmmDispatch::native()` -- for both a concrete
+    /// and a symbolic (`None`) N, since the symbolic-N fallback in
+    /// `core::ops::einsum::kernel_selection::strategize` picks the largest-`nr` kernel per
+    /// packing group, bypassing `preferred`/boost entirely, and this kernel's nr=16 exceeds
+    /// every existing f32 AVX-512 kernel's nr.
     #[test]
-    fn adding_the_bf16_candidate_does_not_change_default_pick() {
+    fn bf16_candidate_is_not_reachable_through_automatic_dispatch() {
         let dispatch = MmmDispatch::native();
-        let query = Query::plain(DatumType::F32, Some(64), Some(256), Some(32));
-        let suitable = dispatch.suitable(&query);
-        assert!(
-            suitable.iter().any(|(mmm, _, _)| mmm.name() == "ndarray_avx512_bf16_mmm_f32_16x16"),
-            "the new candidate should be suitable wherever avx512f is native"
-        );
-        if let Some((picked, _, _)) = dispatch.pick(&query) {
-            assert_ne!(
-                picked.name(),
-                "ndarray_avx512_bf16_mmm_f32_16x16",
-                "default dispatch must still prefer the hand-tuned asm kernel"
-            );
-            assert_ne!(
-                picked.name(),
-                "ndarray_avx512_mmm_f32_16x8",
-                "default dispatch must still prefer the hand-tuned asm kernel"
+        for n in [Some(32), None] {
+            let query = Query::plain(DatumType::F32, Some(64), Some(256), n);
+            let suitable = dispatch.suitable(&query);
+            assert!(
+                suitable
+                    .iter()
+                    .all(|(mmm, _, _)| mmm.name() != "ndarray_avx512_bf16_mmm_f32_16x16"),
+                "the bf16 candidate must never appear in automatic dispatch (n={n:?})"
             );
         }
     }

@@ -133,10 +133,20 @@ MMMExternKernel!(x86_64; avx512_mmm_f32_16x8 <f32>( 16, 8)@(512,4) isa(X86_64Avx
 // `simd::bf16_tile_gemm_16x16_packed` (AMX / AVX-512-VNNI-bf16 / FMA-polyfill tiers) instead of
 // hand-written asm -- see ndarray_bf16_gemm.rs's module doc for the precision tradeoff and the
 // honest read on how this compares structurally and numerically to pilot v1's blas_gemm
-// candidate. Purely additive: it carries no boost, so retain_best ties it with the asm kernels
-// on preference, and every x86_64 dispatch tier below (amd/intel_avx512_linear) still names its
-// own asm kernels explicitly and never sees this one.
-MMMRustKernel!(x86_64; ndarray_bf16_gemm::kernel => ndarray_avx512_bf16_mmm_f32_16x16<f32>(16, 16) isa(X86_64Avx512f));
+// candidate.
+//
+// Deliberately NOT registered through the `(x86_64; ...)` macro sugar, which also
+// `inventory::submit!`s an `MmmRoutine` that `MmmDispatch::native()` (and so
+// `core::ops::einsum::kernel_selection::strategize`) discovers automatically. This kernel's
+// nr=16 is larger than every existing f32 AVX-512 kernel (max nr=12, `avx512_mmm_f32_16x12`),
+// so the symbolic-N grouped fallback in `strategize` -- which picks the largest-`nr` kernel
+// per packing group, bypassing `preferred`/boost entirely -- would silently select this
+// bf16-truncating kernel for real f32 models with a dynamic N dimension. Calling the lower-level
+// form directly skips that `inventory::submit!`, so the kernel stays reachable for direct
+// construction (this pilot's own bench/tests) but invisible to automatic dispatch -- the
+// concrete guarantee "purely additive, no behavior change" actually requires.
+MMMRustKernel!(ndarray_bf16_gemm::kernel => ndarray_avx512_bf16_mmm_f32_16x16<f32>(16, 16)
+    built(cfg!(target_arch = "x86_64")) arch(Some(crate::isa::Arch::X86_64)) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_32x6 <f32>( 32, 6)@(512,4) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_32x5 <f32>( 32, 5)@(512,4) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_48x4 <f32>( 48, 4)@(512,4) isa(X86_64Avx512f));
