@@ -1,5 +1,7 @@
 pub mod mmm;
 
+mod ndarray_gemm;
+
 mod amd_avx512_linear;
 mod amd_fma_linear;
 mod intel_avx512_linear;
