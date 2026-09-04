@@ -1520,7 +1520,7 @@ dependencies = [
 [[package]]
 name = "fractal"
 version = "0.1.0"
-source = "git+https://github.com/AdaWorldAPI/ndarray?branch=master#e55af0e3d10fb0065cbad4de2df48f8567503309"
+source = "git+https://github.com/AdaWorldAPI/ndarray?branch=master#f43338fb53bdbffec68c3a95adebdbbe7c9d4178"
 dependencies = [
  "libm",
 ]
@@ -2507,7 +2507,7 @@ dependencies = [
 [[package]]
 name = "ndarray"
 version = "0.17.2"
-source = "git+https://github.com/AdaWorldAPI/ndarray?branch=master#e55af0e3d10fb0065cbad4de2df48f8567503309"
+source = "git+https://github.com/AdaWorldAPI/ndarray?branch=master#f43338fb53bdbffec68c3a95adebdbbe7c9d4178"
 dependencies = [
  "fractal",
  "matrixmultiply",
@@ -2959,7 +2959,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 [[package]]
 name = "p64"
 version = "0.1.0"
-source = "git+https://github.com/AdaWorldAPI/ndarray?branch=master#e55af0e3d10fb0065cbad4de2df48f8567503309"
+source = "git+https://github.com/AdaWorldAPI/ndarray?branch=master#f43338fb53bdbffec68c3a95adebdbbe7c9d4178"
 dependencies = [
  "fractal",
 ]
