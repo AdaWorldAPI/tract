@@ -85,7 +85,9 @@ fn atom<'i>(symbol_table: &SymbolScope, i: &'i str) -> R<'i, TDim> {
         map(|i| func(symbol_table, "min", i), TDim::Min),
         map(|i| func(symbol_table, "max", i), TDim::Max),
         map(|i| func(symbol_table, "broadcast", i), TDim::Broadcast),
-        map(|i| func(symbol_table, "floor", i), |xs| xs[0].clone()),
+        // No `floor` arm: TDim is integral, so accepting one here reads a
+        // rational ONNX expression as an integer one. Those are parsed in
+        // tract-onnx's `dim_expr`.
         map(|i| identifier(symbol_table, i), TDim::Sym),
         map(pair(recognize(stag("-")), |i| atom(symbol_table, i)), |(_, dim)| dim * -1),
         delimited(stag("("), |i| expr(symbol_table, i), stag(")")),
@@ -103,7 +105,10 @@ fn func<'i>(symbol_table: &SymbolScope, name: &'static str, i: &'i str) -> R<'i,
 
 fn identifier<'i>(symbol_table: &SymbolScope, i: &'i str) -> R<'i, Symbol> {
     map(
-        recognize(pair(alt((alpha1, tag("_"))), many0(alt((alphanumeric1, tag("_"), tag(".")))))),
+        recognize(pair(
+            alt((alpha1, tag("_"))),
+            many0(alt((alphanumeric1, tag("_"), tag("."), recognize(pair(tag("/"), alpha1))))),
+        )),
         |s| symbol_table.sym(s),
     )
     .parse(i)
@@ -216,8 +221,29 @@ mod test {
     }
 
     #[test]
-    fn parse_floors() {
+    fn floor_is_refused_rather_than_silently_dropped() {
         let table = SymbolScope::default();
-        assert_eq!(parse_tdim(&table, "floor(a)").unwrap(), table.sym("a").to_dim());
+        assert!(parse_tdim(&table, "floor(a)").is_err());
+    }
+
+    #[test]
+    fn parse_slash_ids() {
+        let table = SymbolScope::default();
+        assert_eq!(parse_tdim(&table, "foo/bar").unwrap(), table.sym("foo/bar").into());
+        assert_eq!(parse_tdim(&table, "foo/bar/baz").unwrap(), table.sym("foo/bar/baz").into());
+    }
+
+    #[test]
+    fn parse_slash_ids_arith() {
+        let table = SymbolScope::default();
+        assert_eq!(parse_tdim(&table, "foo/bar/2").unwrap(), table.sym("foo/bar").to_dim() / 2);
+    }
+
+    #[test]
+    fn parse_slash_display_roundtrip() {
+        let table = SymbolScope::default();
+        let original: TDim = table.sym("foo/bar").into();
+        let reparsed = parse_tdim(&table, &format!("{original}")).unwrap();
+        assert_eq!(reparsed, original);
     }
 }

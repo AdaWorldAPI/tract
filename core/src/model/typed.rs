@@ -3,7 +3,7 @@ use crate::model::*;
 use crate::ops;
 use crate::ops::konst::Const;
 use crate::optim::OptimizerSession;
-use crate::plan::{FrozenSimpleState, SimplePlan, SimpleState};
+use crate::plan::{SimplePlan, SimpleState};
 use crate::transform::ModelTransform;
 use tract_data::TooEarly;
 use tract_num_traits::Zero;
@@ -20,9 +20,6 @@ pub type TypedSimplePlan = SimplePlan<TypedFact, Box<dyn TypedOp>>;
 pub type TypedRunnableModel = RunnableModel<TypedFact, Box<dyn TypedOp>>;
 /// An execution state for TypedModel.
 pub type TypedSimpleState = SimpleState<TypedFact, Box<dyn TypedOp>>;
-/// An execution state for TypedModel, frozen (and Send).
-pub type TypedFrozenSimpleState = FrozenSimpleState<TypedFact, Box<dyn TypedOp>>;
-
 /// A runnable model with fixed inputs and outputs.
 pub type RunnableModel<F, O> = SimplePlan<F, O>;
 
@@ -73,8 +70,7 @@ impl SpecialOps<TypedFact, Box<dyn TypedOp>> for TypedModel {
                 o.consistent()?;
             }
 
-            if op.is_stateless()
-                && input_facts.len() > 0
+            if input_facts.len() > 0
                 && let Some(tensors) = input_facts
                     .iter()
                     .map(|f| {
@@ -85,8 +81,7 @@ impl SpecialOps<TypedFact, Box<dyn TypedOp>> for TypedModel {
                             .map(|t| t.into_tvalue())
                     })
                     .collect::<Option<TVec<_>>>()
-                && let Ok(outputs) =
-                    op.eval_with_session(usize::MAX, &TurnState::default(), tensors)
+                && let Ok(Some(outputs)) = op.eval_out_of_plan(tensors)
             {
                 return outputs
                     .into_iter()
@@ -147,7 +142,7 @@ impl SpecialOps<TypedFact, Box<dyn TypedOp>> for TypedModel {
             }
         }
         let fact = TypedFact::try_from(v.clone())?;
-        let name = name.into();
+        let name = self.unique_name(name.into()).into_owned();
         let op = if let Some(exotic) = &fact.exotic_fact {
             crate::ops::konst::Const::new_with_exotic_fact(v, exotic.clone())?
         } else {
@@ -256,7 +251,9 @@ impl TypedModel {
         Ok(())
     }
 
-    pub fn substitute_symbols(&self, subs: &HashMap<Symbol, TDim>) -> TractResult<TypedModel> {
+    /// Bind one or more symbols to concrete values or TDim expressions across
+    /// the whole graph.
+    pub fn set_symbols(&self, subs: &HashMap<Symbol, TDim>) -> TractResult<TypedModel> {
         crate::model::translator::Translate::translate_model(subs, self)
     }
 
@@ -282,14 +279,14 @@ impl TypedModel {
         for n in self.eval_order()? {
             let node = self.node(n);
             let (inputs, outputs) = self.node_facts(n)?;
-            if node.op.is_stateless()
-                && inputs.iter().all(|i| i.konst.as_ref().is_some_and(|k| k.is_plain()))
+            if inputs.iter().all(|i| i.konst.as_ref().is_some_and(|k| k.is_plain()))
                 && outputs.iter().any(|o| o.konst.is_none())
             {
                 let inputs_ref =
                     inputs.iter().map(|f| f.konst.clone().unwrap().into_tvalue()).collect();
-                match node.op.eval_with_session(node.id, &TurnState::default(), inputs_ref) {
-                    Ok(res) => {
+                match node.op.eval_out_of_plan(inputs_ref) {
+                    Ok(None) => (),
+                    Ok(Some(res)) => {
                         drop(inputs);
                         drop(outputs);
                         for (ix, output) in res.into_iter().enumerate() {
@@ -320,7 +317,7 @@ impl Translate<TypedFact, Box<dyn TypedOp>, TypedFact, Box<dyn TypedOp>> for Has
         mapping: &HashMap<OutletId, OutletId>,
     ) -> TractResult<TVec<OutletId>> {
         target.check_consistency()?;
-        let outlets = node.op.substitute_symbols(source, node, target, mapping, self)?;
+        let outlets = node.op.set_symbols(source, node, target, mapping, self)?;
         for &outlet in &outlets {
             let fact = &mut target.nodes[outlet.node].outputs[outlet.slot].fact;
             if fact.shape.volume().is_zero()
@@ -343,5 +340,22 @@ mod test {
     fn test() {
         fn is_sync<T: Sync>() {}
         is_sync::<TypedModel>();
+    }
+
+    #[test]
+    fn add_const_does_not_reuse_a_taken_name() {
+        let mut model = TypedModel::default();
+        let first = model.add_const("konst", tensor1(&[0.0f32])).unwrap();
+        let second = model.add_const("konst", tensor1(&[1.0f32])).unwrap();
+        assert_ne!(first.node, second.node);
+        assert_ne!(model.node(first.node).name, model.node(second.node).name);
+    }
+
+    #[test]
+    fn add_const_still_shares_an_identical_value() {
+        let mut model = TypedModel::default();
+        let first = model.add_const("a", tensor1(&[0.0f32])).unwrap();
+        let second = model.add_const("b", tensor1(&[0.0f32])).unwrap();
+        assert_eq!(first.node, second.node);
     }
 }

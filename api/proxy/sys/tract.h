@@ -200,6 +200,28 @@ enum TRACT_RESULT tract_onnx_load_buffer(const struct TractOnnx *onnx,
                                          struct TractInferenceModel **model);
 
 /**
+ * Parse and load an ONNX model as a tract InferenceModel, with loader options.
+ *
+ * `options` is a null-terminated utf-8 JSON object, or null for the defaults.
+ * See `OnnxOptions` in the Rust API for the fields. An unknown field is an error.
+ */
+enum TRACT_RESULT tract_onnx_load_with_options(const struct TractOnnx *onnx,
+                                               const char *path,
+                                               const char *options,
+                                               struct TractInferenceModel **model);
+
+/**
+ * Parse and load an ONNX buffer as a tract InferenceModel, with loader options.
+ *
+ * See `tract_onnx_load_with_options` for `options`.
+ */
+enum TRACT_RESULT tract_onnx_load_buffer_with_options(const struct TractOnnx *onnx,
+                                                      const void *data,
+                                                      uintptr_t len,
+                                                      const char *options,
+                                                      struct TractInferenceModel **model);
+
+/**
  * Query an InferenceModel input counts.
  */
 enum TRACT_RESULT tract_inference_model_input_count(const struct TractInferenceModel *model,

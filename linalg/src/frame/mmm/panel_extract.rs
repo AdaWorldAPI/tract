@@ -13,7 +13,13 @@ pub struct PanelExtractor {
     pub from: Box<dyn MMMInputFormat>,
     pub to: PackedFormat,
     pub kernel: Kernel,
-    pub supported_predicate: fn() -> bool,
+    /// False when this build did not compile the extractor's body, its arch not being the one
+    /// it was written for. The struct still exists, so it stays enumerable, but it is never
+    /// runnable here and calling it bails.
+    pub built: bool,
+    /// What the instruction set must offer for this extractor to run here at all. Runnability
+    /// only: a preference spelled here would also skip the extractor's tests.
+    pub isa: crate::isa::IsaReq,
 }
 
 impl Debug for PanelExtractor {
@@ -36,9 +42,8 @@ impl PartialEq for PanelExtractor {
 impl Eq for PanelExtractor {}
 
 impl PanelExtractor {
-    #[allow(unused_variables)]
-    pub fn is_supported_here(&self) -> bool {
-        (self.supported_predicate)()
+    pub fn runnable(&self) -> bool {
+        self.built && self.isa.satisfied_by(crate::isa::native())
     }
 }
 
@@ -92,10 +97,23 @@ impl Debug for PanelExtractInput {
     }
 }
 
+// A panel extractor whose body is arch asm or intrinsics. The leading ident names the arch it
+// was written for, `built` recording whether this build compiled it; `isa(..)` declares what
+// the instruction set has to offer on top, in the same vocabulary as the mmm kernels.
 #[macro_export]
 macro_rules! panel_extractor {
-    ( $func:path as $id:ident($from:expr, $to: expr)
-            $(where($where:expr))?
+    (arm; $($rest:tt)*) => { panel_extractor!(@ Arm, target_arch = "arm"; $($rest)*); };
+    (aarch64; $($rest:tt)*) => { panel_extractor!(@ Aarch64, target_arch = "aarch64"; $($rest)*); };
+    (x86_64; $($rest:tt)*) => { panel_extractor!(@ X86_64, target_arch = "x86_64"; $($rest)*); };
+    (riscv64; $($rest:tt)*) => { panel_extractor!(@ RiscV64, target_arch = "riscv64"; $($rest)*); };
+    (wasm32; $($rest:tt)*) => {
+        panel_extractor!(@ Wasm32Simd128,
+            all(target_arch = "wasm32", target_feature = "simd128"); $($rest)*);
+    };
+
+    ( @ $arch:ident, $built:meta;
+        $func:path as $id:ident($from:expr, $to: expr)
+            $(isa($($isa:ident),+))?
      ) => {
         paste! {
             lazy_static::lazy_static! {
@@ -103,19 +121,23 @@ macro_rules! panel_extractor {
                     use $crate::mmm::MMMInputFormat;
                     let (from, to) = ($from, $to);
                     assert!(from.r() == to.r());
-                    #[allow(unused_mut)]
-                    let mut it = $crate::mmm::PanelExtractor {
+                    $crate::mmm::PanelExtractor {
                         name: stringify!($id).to_string(),
                         from,
                         to,
                         kernel: $func,
-                        supported_predicate: || true
-                    };
-                    $(
-                        it.supported_predicate = $where;
-                    )?
-                    it
+                        built: cfg!($built),
+                        isa: $crate::isa::IsaReq::ANY
+                            $(.needing(&[$($crate::isa::Isa::$isa),+]))?,
+                    }
                 };
+            }
+
+            inventory::submit! {
+                $crate::mmm_routines::MmmExtractor {
+                    target: $crate::isa::Arch::$arch,
+                    make: || $id.clone(),
+                }
             }
 
             #[cfg(test)]
@@ -159,7 +181,6 @@ macro_rules! panel_extractor {
 pub mod test {
     use crate::frame::block_quant::PackedBlockQuantFormat;
     use crate::mmm::PackedMatrixStorage;
-    use tract_data::internal::*;
     use tract_ndarray::Array2;
 
     use super::*;
@@ -169,7 +190,7 @@ pub mod test {
         blocks: usize,
         panels: usize,
     ) -> TractResult<()> {
-        if !extractor.is_supported_here() {
+        if !extractor.runnable() {
             return Ok(());
         }
         assert!(extractor.from.r() == extractor.to.r());

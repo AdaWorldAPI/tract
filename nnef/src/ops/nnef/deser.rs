@@ -642,7 +642,7 @@ pub fn max_pool_with_index(
     let input_fact = builder.model.outlet_fact(input)?;
     if input_fact.rank() != size.len() {
         bail!(
-            "Max pool input expected as NCHW, and \"size\" paramater must be [ 1, 1, x, y ]. Got {:?}, and {:?}",
+            "Max pool input expected as NCHW, and \"size\" parameter must be [ 1, 1, x, y ]. Got {:?}, and {:?}",
             input_fact,
             size
         );
@@ -672,7 +672,7 @@ pub fn sum_pool(builder: &mut ModelBuilder, invocation: &ResolvedInvocation) -> 
     let input_fact = builder.model.outlet_fact(input)?;
     if input_fact.rank() != size.len() {
         bail!(
-            "Sum pool input expected as NCHW, and \"size\" paramater must be [ 1, 1, x, y ]. Got {:?}, and {:?}",
+            "Sum pool input expected as NCHW, and \"size\" parameter must be [ 1, 1, x, y ]. Got {:?}, and {:?}",
             input_fact,
             size
         );
@@ -687,7 +687,7 @@ pub fn sum_pool(builder: &mut ModelBuilder, invocation: &ResolvedInvocation) -> 
     let pool_spec = pool_spec_for_pools(builder, invocation, &size, channels)?;
     let op = ops::cnn::SumPool {
         pool_spec,
-        count_include_pad: false,
+        count_include_pad: border == "constant",
         normalize: invocation.named_arg_as(builder, "normalize")?,
     };
     builder.wire(op, &[input])

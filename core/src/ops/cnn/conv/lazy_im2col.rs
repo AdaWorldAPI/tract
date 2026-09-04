@@ -51,6 +51,15 @@ impl MMMInputFormat for LazyIm2colParams {
         unimplemented!()
     }
 
+    fn prepare_one_view(
+        &self,
+        _t: &TensorView,
+        _k_axis: usize,
+        _mn_axis: usize,
+    ) -> TractResult<Box<dyn MMMInputValue>> {
+        bail!("Unexpected call to prepare_one_view on LazyIm2Col")
+    }
+
     fn prepare_one(
         &self,
         _t: &Tensor,
@@ -98,14 +107,12 @@ impl Op for LazyIm2Col {
 }
 
 impl EvalOp for LazyIm2Col {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let tensor = args_1!(inputs);
         let dt = tensor.datum_type();
-        let mut values: Vec<Box<dyn MMMInputValue>> = Vec::with_capacity(self.group);
+        let mut values: TVec<Box<dyn MMMInputValue>> = TVec::with_capacity(self.group);
         for g in 0..self.group {
             let group_offset_bytes = g as isize * self.group_stride_bytes;
             values.push(Box::new(LazyIm2colInput {

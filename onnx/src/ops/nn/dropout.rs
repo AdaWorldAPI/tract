@@ -23,11 +23,9 @@ impl Op for Dropout {
 }
 
 impl EvalOp for Dropout {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         if self.output_mask {
             let input = args_1!(inputs);
             let mask = tract_ndarray::ArrayD::from_elem(input.shape(), true);

@@ -1,6 +1,5 @@
 use std::ops::Range;
 use tract_nnef::internal::*;
-use tract_nnef::tract_core::trivial_op_state_freeze;
 
 /// Concat with pulse along concat axis
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -21,15 +20,9 @@ impl Op for PulsedSameAxisConcat {
 }
 
 impl EvalOp for PulsedSameAxisConcat {
-    fn is_stateless(&self) -> bool {
-        false
-    }
+    not_out_of_plan!();
 
-    fn state(
-        &self,
-        _session: &TurnState,
-        _node_id: usize,
-    ) -> TractResult<Option<Box<dyn OpState>>> {
+    fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(Some(Box::<PulsedSameAxisConcatState>::default()))
     }
 }
@@ -38,7 +31,16 @@ impl TypedOp for PulsedSameAxisConcat {
     as_op!();
 
     fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
-        Ok(tvec!(inputs[0].clone()))
+        // Inputs are (pre_prefix, stream, post_suffix); the streaming output
+        // has the same shape as `stream` (input 1).  The pulsed-op version
+        // builds its PulsedFact from the same input.  Previously this
+        // returned `inputs[0]` — the small constant pre-buffer — which broke
+        // any pass that re-derived the typed shape post-pulsification (e.g.
+        // CUDA/Metal translation walking the pulsified preprocessor: every
+        // downstream op saw the pre-buffer shape instead of the pulse-axis
+        // size and produced collapsed outputs).
+        ensure!(inputs.len() == 3, "Expect 3 inputs");
+        Ok(tvec!(inputs[1].clone()))
     }
 }
 
@@ -46,12 +48,11 @@ impl TypedOp for PulsedSameAxisConcat {
 pub struct PulsedSameAxisConcatState {
     current_pos: usize,
 }
-trivial_op_state_freeze!(PulsedSameAxisConcatState);
 
 impl OpState for PulsedSameAxisConcatState {
     fn eval(
         &mut self,
-        session: &mut TurnState,
+        ctx: &EvalContext,
         op: &dyn Op,
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>> {
@@ -67,12 +68,16 @@ impl OpState for PulsedSameAxisConcatState {
         let pre_length = pre.shape()[op.axis];
         let pre_offset = op.input_delay - pre_length;
         overwrite_part_of_pulse(op.axis, &mut data, current_pos, &pre, pre_offset)?;
-        if let Ok(l) = op.input_len.eval(&session.resolved_symbols).to_usize() {
-            let post_offset = op.input_delay + l;
+        if let Some(l) = op.input_len.maybe_eval_to_i64(ctx.symbols) {
+            let post_offset = op.input_delay + l as usize;
             overwrite_part_of_pulse(op.axis, &mut data, current_pos, &post, post_offset)?;
         }
 
         Ok(tvec!(data.into_tvalue()))
+    }
+
+    fn reset_lanes(&mut self, _lanes: &[LaneId]) -> TractResult<()> {
+        bail!("PulsedSameAxisConcat is not lane-aware: current_pos has no lane axis")
     }
 }
 

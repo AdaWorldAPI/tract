@@ -19,16 +19,9 @@ impl Op for CudaFlashAttention {
 }
 
 impl EvalOp for CudaFlashAttention {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         crate::with_cuda_stream(|stream| {
             ensure!(inputs.len() >= 3, "flash-attn expects [q, k, v, (mask)]");
 
@@ -36,9 +29,8 @@ impl EvalOp for CudaFlashAttention {
             let k = inputs[1].to_device_tensor()?;
             let v = inputs[2].to_device_tensor()?;
             let mask = inputs.get(3).map(|m| m.to_device_tensor()).transpose()?;
-            let output = tract_gpu::session_handler::make_tensor_for_node(
-                session,
-                node_id,
+            let output = tract_gpu::turn_handler::make_tensor_for_node(
+                ctx,
                 q.datum_type(),
                 &CudaFlashAttn.output_shape(q.shape(), k.shape(), v.shape())?,
             )?;

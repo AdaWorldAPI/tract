@@ -15,8 +15,8 @@ infra = { path = "../infra" }
 tract-core.workspace = true
 suite-onnx = { path = "../suite-onnx" }
 suite-unit = { path = "../suite-unit" }
+suite-pulse = { path = "../suite-pulse" }
 tract-onnx-opl.workspace = true
-tract-metal.workspace = true
 pastey.workspace = true
 
 [dev-dependencies]
@@ -31,4 +31,5 @@ tract-onnx-opl.workspace = true
 infra = { path = "../infra" }
 suite-onnx = { path = "../suite-onnx" }
 suite-unit = { path = "../suite-unit" }
+suite-pulse = { path = "../suite-pulse" }
 pastey.workspace = true

@@ -1,12 +1,8 @@
-use crate::num_traits::Zero;
-
-reduce_impl_wrap!(
+routine_reduce_rust!(aarch64;
     f32,
     arm64simd_sum_f32_16n,
     16,
     4,
-    (),
-    f32::zero(),
     #[inline(never)]
     fn run(buf: &[f32], _: ()) -> f32 {
         assert!(buf.len() % 16 == 0);
@@ -46,14 +42,5 @@ reduce_impl_wrap!(
         }
         unsafe { run(buf) }
     },
-    #[inline(never)]
-    fn reduce_two(a: f32, b: f32) -> f32 {
-        a + b
-    }
+    op(Sum)
 );
-
-#[cfg(test)]
-mod test_arm64simd_sum_f32_16n {
-    use super::*;
-    crate::sum_frame_tests!(true, f32, arm64simd_sum_f32_16n);
-}

@@ -2,7 +2,7 @@ use std::fmt::Debug;
 
 use tract_downcast_rs::Downcast;
 
-use crate::{internal::*, ops::OpStateFreeze};
+use crate::internal::*;
 
 #[derive(Debug, Clone)]
 pub struct SubmodelOp {
@@ -46,12 +46,10 @@ impl Op for SubmodelOp {
 }
 
 impl EvalOp for SubmodelOp {
-    fn is_stateless(&self) -> bool {
-        false
-    }
+    not_out_of_plan!();
 
-    fn state(&self, session: &TurnState, node_id: usize) -> TractResult<Option<Box<dyn OpState>>> {
-        self.model.state(session, node_id)
+    fn state(&self, ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
+        self.model.state(ctx)
     }
 }
 
@@ -97,10 +95,9 @@ impl TypedOp for SubmodelOp {
 pub trait InnerModel: Debug + dyn_clone::DynClone + Downcast + Sync + Send + 'static {
     #[allow(unused_variables)]
     fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>>;
-    fn is_stateless(&self) -> bool;
 
     #[allow(unused_variables)]
-    fn state(&self, session: &TurnState, node_id: usize) -> TractResult<Option<Box<dyn OpState>>> {
+    fn state(&self, ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(None)
     }
 
@@ -124,12 +121,8 @@ impl InnerModel for TypedModel {
             .collect::<TractResult<TVec<_>>>()?;
         Ok(facts)
     }
-    fn is_stateless(&self) -> bool {
-        false
-    }
-
     #[allow(unused_variables)]
-    fn state(&self, session: &TurnState, node_id: usize) -> TractResult<Option<Box<dyn OpState>>> {
+    fn state(&self, ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         let plan = self.clone().into_runnable()?;
         let state = plan.spawn()?;
         Ok(Some(Box::new(state)))
@@ -154,25 +147,15 @@ pub type TypedModelOpState = TypedSimpleState;
 impl OpState for TypedModelOpState {
     fn eval(
         &mut self,
-        _session: &mut TurnState,
+        _ctx: &EvalContext,
         _op: &dyn Op,
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>> {
         let inference_out = self.run(inputs)?;
         Ok(inference_out)
     }
-}
 
-pub type FrozenSubmodelOpState = TypedFrozenSimpleState;
-
-impl FrozenOpState for FrozenSubmodelOpState {
-    fn unfreeze(&self) -> Box<dyn OpState> {
-        Box::new(self.unfreeze())
-    }
-}
-
-impl OpStateFreeze for TypedModelOpState {
-    fn freeze(&self) -> Box<dyn FrozenOpState> {
-        Box::new(self.freeze())
+    fn reset_lanes(&mut self, _lanes: &[LaneId]) -> TractResult<()> {
+        bail!("Submodel is not lane-aware: its body is a nested state")
     }
 }

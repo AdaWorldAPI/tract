@@ -14,13 +14,30 @@ register_simple_model_transform!(
     SdpaFuseKvCacheBroadcastTransform
 );
 register_simple_model_transform!("unfold_kv_cache", UnfoldKeyValueCacheTransform);
+register_simple_model_transform!(
+    "fuse_inplace_kv_sdpa",
+    ops::inplace_kv_cache::InPlaceKvSdpaTransform
+);
 register_simple_model_transform!("transformers_detect_all", TransformersTransform);
+register_simple_model_transform!(
+    "quantize_kv_storage",
+    ops::quant_dyn_kv_cache::QuantizeKvStorageTransform { bits: 8 }
+);
+register_simple_model_transform!(
+    "quantize_kv_storage_int4",
+    ops::quant_dyn_kv_cache::QuantizeKvStorageTransform { bits: 4 }
+);
 
 pub fn register(registry: &mut Registry) {
+    ops::causal_conv1d_update::register(registry);
     ops::apply_rope::register(registry);
     ops::scaled_masked_softmax::register(registry);
     ops::sdpa::register(registry);
     ops::dyn_kv_cache::register(registry);
+    ops::window_kv_cache::register(registry);
+    ops::kv_quant::register(registry);
+    ops::quant_dyn_kv_cache::register(registry);
+    ops::gdn_recurrent::register(registry);
 }
 
 pub trait WithTractTransformers {
@@ -68,11 +85,12 @@ pub fn figure_out_causal_llm_b_s_p(
         model.input_fact(kv_input)?.shape.volume().symbols()
     } else {
         // Look for KVCache Op
-        let dummy_session_state = TurnState::default();
         let mut symbols = HashSet::new();
         for node in &model.nodes {
-            if let Some((_, fact)) =
-                node.op.state(&dummy_session_state, 0)?.and_then(|state| state.init_tensor_fact())
+            if let Some((_, fact)) = node
+                .op
+                .state(&EvalContext::out_of_plan())?
+                .and_then(|state| state.init_tensor_fact())
             {
                 symbols = fact.shape.volume().symbols();
                 break;

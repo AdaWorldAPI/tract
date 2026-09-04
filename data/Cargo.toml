@@ -1,6 +1,6 @@
 [package]
 name = "tract-data"
-version = "0.23.0-pre"
+version = "0.23.7-pre"
 license = "MIT OR Apache-2.0"
 authors = ["Mathieu Poumeyrol <kali@zoy.org>"]
 description = "Tiny, no-nonsense, self contained, TensorFlow and ONNX inference"
@@ -21,6 +21,7 @@ dyn-clone.workspace = true
 dyn-eq.workspace = true
 dyn-hash.workspace = true
 half.workspace = true
+inventory.workspace = true
 itertools.workspace = true
 libm.workspace = true
 maplit.workspace = true

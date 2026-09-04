@@ -28,11 +28,9 @@ impl Op for SpaceToBatchUnary {
 }
 
 impl EvalOp for SpaceToBatchUnary {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs);
         let mut paddings = Array2::zeros((self.block_shape.len(), 2));
         for (ax, &strat) in self.pad.iter().enumerate() {
@@ -116,11 +114,9 @@ impl Op for BatchToSpaceUnary {
 }
 
 impl EvalOp for BatchToSpaceUnary {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs);
         let mut paddings = Array2::zeros((self.block_shape.len(), 2));
         for (ax, &strat) in self.pad.iter().enumerate() {

@@ -72,8 +72,30 @@ pub trait Runnable: Any + Downcast + Debug + Send + Sync + 'static {
 }
 impl_downcast!(Runnable);
 
-pub trait State: Any + Downcast + Debug + 'static {
+pub trait State: Any + Downcast + Debug + Send + DynClone + 'static {
     fn run(&mut self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>>;
+
+    /// Pin a symbol for the coming turn. A pulsed plan needs the stream length
+    /// on the turn carrying the last, partial pulse: the input tensor is padded
+    /// to a full pulse, so its shape can not carry it.
+    fn resolve_symbol(&mut self, symbol: &Symbol, value: i64) -> TractResult<()> {
+        let _ = (symbol, value);
+        bail!("{self:?} can not resolve a symbol")
+    }
+
+    /// Seat the lanes carrying the coming turn's streams, one lane per row of
+    /// axis 0 of its tensors. A turn seating more than one lane needs axis 0 of
+    /// every stateful node to be the model's batch axis.
+    fn seat(&mut self, seating: Seating) -> TractResult<()> {
+        let _ = seating;
+        bail!("{self:?} can not seat lanes")
+    }
+
+    /// Drop the session state `lanes` hold, handing them to new streams.
+    fn reset_lanes(&mut self, lanes: &[LaneId]) -> TractResult<()> {
+        let _ = lanes;
+        bail!("{self:?} can not reset lanes")
+    }
 
     fn runnable(&self) -> &dyn Runnable;
 
@@ -84,28 +106,16 @@ pub trait State: Any + Downcast + Debug + 'static {
     fn output_count(&self) -> usize {
         self.runnable().output_count()
     }
-
-    fn freeze(&self) -> Box<dyn FrozenState>;
-    /// Consuming freeze: moves data instead of cloning.
-    fn freeze_into(self: Box<Self>) -> Box<dyn FrozenState> {
-        self.freeze()
-    }
 }
 impl_downcast!(State);
-
-pub trait FrozenState: Any + Debug + DynClone + Send {
-    fn unfreeze(&self) -> Box<dyn State>;
-    fn input_count(&self) -> usize;
-    fn output_count(&self) -> usize;
-}
-dyn_clone::clone_trait_object!(FrozenState);
+dyn_clone::clone_trait_object!(State);
 
 #[derive(Debug)]
 pub struct DefaultRuntime;
 
 impl Runtime for DefaultRuntime {
     fn name(&self) -> StaticName {
-        Cow::Borrowed("default")
+        Cow::Borrowed("cpu")
     }
 
     fn prepare_with_options(
@@ -156,30 +166,22 @@ impl State for TypedSimpleState {
         self.run(inputs)
     }
 
+    fn resolve_symbol(&mut self, symbol: &Symbol, value: i64) -> TractResult<()> {
+        self.turn_state.resolved_symbols.set(symbol, value);
+        Ok(())
+    }
+
+    fn seat(&mut self, seating: Seating) -> TractResult<()> {
+        self.seat(seating);
+        Ok(())
+    }
+
+    fn reset_lanes(&mut self, lanes: &[LaneId]) -> TractResult<()> {
+        self.reset_lanes(lanes)
+    }
+
     fn runnable(&self) -> &dyn Runnable {
         &self.plan
-    }
-
-    fn freeze(&self) -> Box<dyn FrozenState> {
-        Box::new(TypedSimpleState::freeze(self))
-    }
-
-    fn freeze_into(self: Box<Self>) -> Box<dyn FrozenState> {
-        Box::new(TypedSimpleState::freeze_into(*self))
-    }
-}
-
-impl FrozenState for TypedFrozenSimpleState {
-    fn unfreeze(&self) -> Box<dyn State> {
-        Box::new(TypedFrozenSimpleState::unfreeze(self))
-    }
-
-    fn input_count(&self) -> usize {
-        self.plan().model().input_outlets().unwrap().len()
-    }
-
-    fn output_count(&self) -> usize {
-        self.plan().model().output_outlets().unwrap().len()
     }
 }
 
@@ -215,7 +217,34 @@ pub fn runtimes() -> impl Iterator<Item = &'static dyn Runtime> {
     inventory::iter::<InventorizedRuntime>().filter(|rt| rt.check().is_ok()).map(|ir| ir.0)
 }
 
+/// Known GPU backends, tried in order when resolving the virtual `gpu`
+/// (strict) / `gpu-or-cpu` (best-effort) names.
+const GPU_RUNTIME_NAMES: &[&str] = &["metal", "cuda"];
+
 pub fn runtime_for_name(s: &str) -> TractResult<Option<&'static dyn Runtime>> {
+    // Back-compat: `default` was the original name for the CPU runtime
+    // before it was renamed.  Keep it working as a plain alias.
+    let s = if s == "default" { "cpu" } else { s };
+    if s == "gpu" || s == "gpu-or-cpu" {
+        let mut last_check_err: Option<TractError> = None;
+        for name in GPU_RUNTIME_NAMES {
+            let Some(rt) = inventory::iter::<InventorizedRuntime>().find(|rt| rt.name() == *name)
+            else {
+                continue;
+            };
+            match rt.check() {
+                Ok(()) => return Ok(Some(rt.0)),
+                Err(e) => last_check_err = Some(e),
+            }
+        }
+        if s == "gpu" {
+            let detail =
+                last_check_err.map(|e| format!(" (last backend error: {e:#})")).unwrap_or_default();
+            bail!("Runtime `gpu` requested but no GPU backend is available{detail}");
+        }
+        // gpu-or-cpu: fall through to the cpu runtime.
+        return runtime_for_name("cpu");
+    }
     rule_if_some!(rt = inventory::iter::<InventorizedRuntime>().find(|rt| rt.name() == s));
     rt.check()?;
     Ok(Some(rt.0))

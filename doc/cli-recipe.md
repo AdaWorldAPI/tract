@@ -63,7 +63,7 @@ The displayed form is `tract-opl` intermediate representation. It is *decluttere
 training artefacts, in a form meant to be simple to reason about and as stripped down as
 possible.
 
-This is not the "optimised" form: `tract-opl` form is meant to be platform independant, can
+This is not the "optimised" form: `tract-opl` form is meant to be platform independent, can
 be serialized to nnef. The optimised form is just meant to be as fast as possible on a given
 CPU.
 
@@ -154,6 +154,41 @@ times to compare a fused rewrite against the unfused original
 systematically over-credits the fused side. Use `bench` wall-clock for
 between-graph comparisons.
 
+## Hardware and kernel benchmarking
+
+`bench` and `profile` measure a *model*. To measure the *machine* — and the
+matmul micro-kernels tract dispatches on it — use `hwbench`:
+
+```
+tract hwbench                       # cores, cache/memory bandwidth, default matmul battery
+tract hwbench 512,512,120           # one shape, both f32 and f16
+tract hwbench 512,512,120,f16 64,27,22201,f32   # several shapes, explicit dtype
+tract --no-cache --no-memory --json 512,512,120,f16   # matmul only, machine-readable
+```
+
+A shape is `M,K,N` (benches both f32 and f16) or `M,K,N,dt` (`dt` = `f32`|`f16`);
+pass as many as you like. With none it runs a default battery. For each shape it
+lists every candidate kernel with its measured flop/s, sorted fastest-first, and
+marks the one the dispatcher actually picks with `<--`. If the `<--` is not near
+the top, the picker is mis-selecting for that shape — reproduce a suspicious pick
+from a real model by reading its shape off `dump --audit-json` (an `OptMatMul`'s
+`m:… k:… n:…`).
+
+`--json` emits the whole report (cache, memory, matmul) for scripting.
+`--assert` exits nonzero if any picked kernel is more than `--tolerance` percent
+(default 5) slower than the fastest measured kernel — the hook for a CI that
+guards kernel selection. `--no-cache` / `--no-memory` / `--no-matmul` skip
+sections; the cores/cpuinfo header always prints (except under `--json`).
+
+Note the default `N=512` is a power of two, which divides evenly only into
+power-of-two `nr` kernels; for a fair cross-kernel throughput comparison pick an
+`N` divisible by every `nr` (e.g. `120`).
+
+To compare the whole *model* battery between two commits on a machine CI does not bench
+(the local equivalent of the CI bench comment), use `.travis/bench-compare.sh <ref-a>
+<ref-b>` — it builds and runs `bench-suite` at each ref and prints the per-metric evaltime
+delta via `tract bench-diff`. See `doc/cost-model.md` "Validating the picks".
+
 ## Common timing pitfalls
 
 - **Thermal bias on sustained workloads.** Apple Silicon throttles after
@@ -167,27 +202,42 @@ between-graph comparisons.
   hot code with TurboFan. First-pass numbers can be 2-4× off steady state;
   warm generously and read steady-state.
 
-## Environment variables
+## Configuration knobs
 
-A small set of `TRACT_*` env vars override defaults that are normally fine
-out of the box. Most are codegen or CPU-detection knobs you only reach for
-when chasing a perf regression or working around an exotic platform; they
-apply equally to the library and the CLI.
+A small set of runtime *knobs* override defaults that are normally fine out of
+the box — codegen and CPU-detection settings you only reach for when chasing a
+perf regression or working around an exotic platform. Each resolves, in
+priority order, from a programmatic override (`tract_data::knobs`, e.g. on wasm
+where the environment is unavailable), a `TRACT_*` environment variable, then a
+compiled-in default; they apply equally to the library and the CLI.
+
+```bash
+tract list-knobs
+```
+
+lists every knob with its resolved value, default, type, and description — the
+authoritative, always-current source (including the platform-specific ones,
+which appear everywhere and are inert off their architecture). The table below
+highlights a few worth knowing; `list-knobs` is the complete set.
 
 | Variable | Effect |
 |---|---|
 | `TRACT_LOG` | `env_logger` filter (e.g. `tract=debug`, `cli=info,tract=warn`). The CLI also derives a default level from `-v` / `-vv`. |
 | `TRACT_LAZY_IM2COL_MIN_KERNEL` | Minimum convolution kernel volume before lazy im2col is preferred over eager. Default: 6. Lower it to experiment on memory-constrained targets. |
 | `TRACT_LAZY_IM2COL_MAX_EAGER_BYTES` | Scratch-buffer ceiling above which `Conv` switches from eager to lazy im2col. Per-family default (~1 MiB on WASM, ~4 MiB on native). Key knob for the canary-model regression gate. |
+| `TRACT_AVGPOOL_SEPARABLE` | Use the separable running-sum average-pool kernel (stride-1 NCHW or NHWC), O(1) per output vs O(k²). Default: off. **Not bit-identical** — it reassociates the float sums (allowed by `SumPool`'s `Validation::Rounding`). Multiplies the avg-pool node throughput; pool-heavy nets (Inception) see it E2E. |
 | `TRACT_CPU_AARCH64_KIND` | Force aarch64 CPU family detection (`a53`, `a55`, `a72`, `applem`, `generic`, …). Useful for QEMU runs that misreport. |
 | `TRACT_CPU_AARCH64_OVERRIDE_CPU_PART` | Force the raw CPU part hex (`0xd03`, …) before the kind-lookup table runs. Lower-level escape hatch when `TRACT_CPU_AARCH64_KIND` doesn't cover the target. |
 | `TRACT_CPU_ARM32_NEON` | Force armv7 NEON detection on/off (`true`/`1` or `false`/`0`). |
 | `TRACT_CPU_EXPECT_ARM32_NEON` | Used by the test suite to assert the detection result matches what the platform should expose. CI-only. |
 
-The two `LAZY_IM2COL_*` knobs are documented inline next to the constants in
-`core/src/ops/cnn/conv/conv.rs`; the CPU-detect knobs in `linalg/src/arm32.rs`
-and `linalg/src/arm64.rs`. See [`kernel-notes.md`](kernel-notes.md) for
-context on the kernel selection that `LAZY_IM2COL_*` is steering.
+Knobs are declared with `declare_knob!`: the arch-detection ones in
+`linalg/src/knobs.rs`, the conv crossovers in `core/src/ops/cnn/conv/conv.rs`
+and the avg-pool kernel toggle in `core/src/ops/cnn/sumpool.rs`, each next to
+the code it steers. `TRACT_LOG` (an `env_logger` filter) and the
+CI-only `TRACT_CPU_EXPECT_ARM32_NEON` are conventions, not registry knobs, so
+they do not appear in `list-knobs`. See [`kernel-notes.md`](kernel-notes.md)
+for context on the kernel selection that `LAZY_IM2COL_*` is steering.
 
 ## Pulsified networks
 

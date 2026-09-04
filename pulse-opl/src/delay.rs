@@ -1,5 +1,6 @@
 use tract_nnef::internal::*;
-use tract_nnef::tract_core::ops::OpStateFreeze;
+
+use crate::lane::lane_runs;
 
 pub fn register(registry: &mut Registry) {
     registry.register_primitive(
@@ -25,78 +26,146 @@ fn de_delay(builder: &mut ModelBuilder, invocation: &ResolvedInvocation) -> Trac
     builder.wire(op, &[wire])
 }
 
-#[derive(Debug, Clone)]
+/// The streaming context preceding the current pulse. `lanes` is the extent of
+/// the buffer's lane axis, 1 when the state serves a single stream and the
+/// buffer has no lane axis at all.
+#[derive(Debug, Clone, Default)]
 pub struct DelayState {
     pub buffer: Option<Tensor>,
+    lanes: usize,
 }
 
 impl DelayState {
-    /// Apply delay op on input and store the result in the output tensor
-    /// This method doesn't use allocation.
-    ///
-    /// # Safety
-    ///
-    /// Input and Ouput tensors shape must be compatible with this operator, otherwise it could lead
-    /// to an undefined behaviour.
-    pub unsafe fn apply_delay_unchecked(
+    /// One seat's delay: `seat` indexes the batch axis of `input` and `output`,
+    /// `lane` the lane axis of the buffer. Both are absent when the state serves
+    /// a single stream.
+    fn delay_seat(
         &mut self,
         op: &Delay,
         input: &Tensor,
         output: &mut Tensor,
-    ) {
-        unsafe {
-            let buffered = op.delay + op.overlap;
-            let input_pulse = input.shape()[op.axis];
-            let output_pulse = input_pulse + op.overlap;
-            let buffer = self.buffer.as_mut().unwrap();
-
-            let from_input = input_pulse.saturating_sub(op.delay);
-            let from_buffer = output_pulse.saturating_sub(from_input);
-            output.assign_slice_unchecked(..from_buffer, buffer, ..from_buffer, op.axis);
-            output.assign_slice_unchecked(from_buffer.., input, ..from_input, op.axis);
-
-            // maintain buffer
-            if buffered < input_pulse {
-                buffer.assign_slice_unchecked(.., input, (input_pulse - buffered).., op.axis);
-            } else {
-                let stride =
-                    buffer.strides()[op.axis] as usize * input.datum_type().size_of() * input_pulse;
-                std::slice::from_raw_parts_mut(
-                    buffer.as_ptr_mut_unchecked::<u8>(),
-                    buffer.len() * input.datum_type().size_of(),
-                )
-                .rotate_left(stride);
-                buffer.assign_slice_unchecked((buffered - input_pulse).., input, .., op.axis);
+        seat: Option<usize>,
+        lane: Option<usize>,
+    ) -> TractResult<()> {
+        let axis = op.axis;
+        let buffered = op.delay + op.overlap;
+        let input_pulse = input.shape()[axis];
+        let output_pulse = input_pulse + op.overlap;
+        let from_input = input_pulse.saturating_sub(op.delay);
+        let from_buffer = output_pulse.saturating_sub(from_input);
+        let buffer = self.buffer.as_mut().unwrap();
+        output.assign_slice_at_prefix(
+            seat.as_slice(),
+            0..from_buffer,
+            buffer,
+            lane.as_slice(),
+            0..from_buffer,
+            axis,
+        )?;
+        output.assign_slice_at_prefix(
+            seat.as_slice(),
+            from_buffer..output_pulse,
+            input,
+            seat.as_slice(),
+            0..from_input,
+            axis,
+        )?;
+        if buffered < input_pulse {
+            let tail = input_pulse - buffered;
+            buffer.assign_slice_at_prefix(
+                lane.as_slice(),
+                0..buffered,
+                input,
+                seat.as_slice(),
+                tail..input_pulse,
+                axis,
+            )?;
+        } else {
+            let keep = buffered - input_pulse;
+            // The kept context moves down inside the buffer, so source and
+            // destination are the same tensor and no assign can name both.
+            let dt_size = buffer.datum_type().size_of();
+            let bshape: TVec<usize> = buffer.shape().into();
+            let source = lane_runs(&bshape, dt_size, axis, lane, input_pulse..buffered);
+            let buf = buffer.as_bytes_mut();
+            for (to, from) in lane_runs(&bshape, dt_size, axis, lane, 0..keep).zip(source) {
+                buf.copy_within(from, to.start);
             }
+            buffer.assign_slice_at_prefix(
+                lane.as_slice(),
+                keep..buffered,
+                input,
+                seat.as_slice(),
+                0..input_pulse,
+                axis,
+            )?;
         }
+        Ok(())
     }
 }
 
 impl OpState for DelayState {
     fn eval(
         &mut self,
-        _state: &mut TurnState,
+        ctx: &EvalContext,
         op: &dyn Op,
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs);
         let op = op.downcast_ref::<Delay>().ok_or_else(|| format_err!("Wrong Op type"))?;
-        let buffered = op.delay + op.overlap;
-        let input_pulse = input.shape()[op.axis];
-        let output_pulse = input_pulse + op.overlap;
+        let dt = input.datum_type();
+        ensure!(dt.is_copy(), "Delay buffers {dt:?}, which is not copy");
+        let max_lanes = ctx.seating.max_lanes();
         let mut output_shape: TVec<usize> = input.shape().into();
-        output_shape[op.axis] = output_pulse;
-        // build output
-        unsafe {
-            if self.buffer.is_none() {
-                let mut shape = input.shape().to_owned();
-                shape[op.axis] = buffered;
-                self.buffer = Some(Tensor::uninitialized_dt(input.datum_type(), &shape)?);
-            };
-            let mut output = Tensor::uninitialized_dt(input.datum_type(), &output_shape)?;
-            self.apply_delay_unchecked(op, &input, &mut output);
-            Ok(tvec!(output.into()))
+        output_shape[op.axis] = input.shape()[op.axis] + op.overlap;
+        if self.buffer.is_none() {
+            let mut shape: TVec<usize> = input.shape().into();
+            shape[op.axis] = op.delay + op.overlap;
+            if max_lanes > 1 {
+                ensure!(op.axis > 0, "Delay on axis 0 leaves no axis 0 for the lanes");
+                shape[0] = max_lanes;
+            }
+            // Zero-init: the buffer holds the streaming context preceding the
+            // first pulse, and silence (zero) is the only sensible default.
+            // Uninitialized memory leaks into the first `delay` output frames
+            // and diverges from the GPU op (which zero-inits), making any
+            // per-node comparison meaningless on the warmup region.
+            self.buffer = Some(Tensor::zero_dt(dt, &shape)?);
+            self.lanes = max_lanes;
         }
+        ensure!(
+            self.lanes == max_lanes,
+            "Delay buffer holds {} lanes, this turn seats {max_lanes} of them",
+            self.lanes
+        );
+        let mut output = unsafe { Tensor::uninitialized_dt(dt, &output_shape)? };
+        if max_lanes > 1 {
+            ensure!(
+                input.shape()[0] == ctx.seating.occupancy(),
+                "Delay input carries {} streams, this turn seats {}",
+                input.shape()[0],
+                ctx.seating.occupancy()
+            );
+        }
+        for ix in 0..ctx.seating.occupancy() {
+            let (seat, lane) = ctx.seating.address(ix);
+            self.delay_seat(op, &input, &mut output, seat, lane)?;
+        }
+        Ok(tvec!(output.into()))
+    }
+
+    fn reset_lanes(&mut self, lanes: &[LaneId]) -> TractResult<()> {
+        let Some(buffer) = self.buffer.as_mut() else { return Ok(()) };
+        ensure!(
+            lanes.iter().all(|l| l.0 < self.lanes),
+            "Delay buffer holds {} lanes, asked to reset {lanes:?}",
+            self.lanes
+        );
+        let stride = buffer.as_bytes().len() / self.lanes;
+        for lane in lanes {
+            buffer.as_bytes_mut()[lane.0 * stride..][..stride].fill(0);
+        }
+        Ok(())
     }
 }
 
@@ -132,16 +201,10 @@ impl Op for Delay {
 }
 
 impl EvalOp for Delay {
-    fn is_stateless(&self) -> bool {
-        false
-    }
+    not_out_of_plan!();
 
-    fn state(
-        &self,
-        _session: &TurnState,
-        _node_id: usize,
-    ) -> TractResult<Option<Box<dyn OpState>>> {
-        Ok(Some(Box::new(DelayState { buffer: None })))
+    fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
+        Ok(Some(Box::new(DelayState::default())))
     }
 }
 
@@ -187,28 +250,5 @@ impl TypedOp for Delay {
         } else {
             Ok(None)
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-struct FrozenDelayState {
-    buffer: Option<Arc<Tensor>>,
-}
-
-impl OpStateFreeze for DelayState {
-    fn freeze(&self) -> Box<dyn FrozenOpState> {
-        Box::new(FrozenDelayState {
-            buffer: self.buffer.as_ref().map(|t| t.clone().into_arc_tensor()),
-        })
-    }
-
-    fn freeze_into(self: Box<Self>) -> Box<dyn FrozenOpState> {
-        Box::new(FrozenDelayState { buffer: self.buffer.map(|t| t.into_arc_tensor()) })
-    }
-}
-
-impl FrozenOpState for FrozenDelayState {
-    fn unfreeze(&self) -> Box<dyn OpState> {
-        Box::new(DelayState { buffer: self.buffer.as_ref().map(|t| t.clone().into_tensor()) })
     }
 }

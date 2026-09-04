@@ -14,13 +14,15 @@ use tract_core::ops::cnn::conv::rewrite_kernel_conv_in_oihw;
 use tract_core::ops::cnn::{Conv, rewrite_conv_with_n_axis};
 use tract_core::ops::einsum::prefix_matmul::{PrefixMatMul, rewrite_einsum_to_prefix_matmul};
 use tract_core::ops::konst::Const;
+use tract_core::ops::nn::Reduce;
 use tract_core::tract_linalg::block_quant::Q4_0;
 use tract_core::transform::ModelTransform;
 use tract_gpu::fact::{DeviceFact, DeviceTypedFactExt};
-use tract_gpu::rewrite_rules::rewire_sdpa::rewire_sdpa;
 use tract_gpu::rewrite_rules::rewire_syncs::rewire_syncs;
 use tract_gpu::rewrite_rules::rms_norm::remove_rms_norm_cast;
-use tract_gpu::sync::{DeviceSyncKind, sync_inputs_if_required, sync_model_outputs_if_required};
+use tract_gpu::sync::{
+    DeviceSync, DeviceSyncKind, sync_inputs_if_required, sync_model_outputs_if_required,
+};
 use tract_gpu::tensor::{DeviceTensor, IntoDevice};
 use tract_gpu::utils::as_quant_fact;
 
@@ -28,6 +30,7 @@ use crate::rewrite_rules;
 
 /// A registered translator that can convert a core op into a Metal GPU op.
 /// Each kernel module submits one (or more) of these via [`register_metal_op!`].
+#[allow(clippy::type_complexity)]
 pub struct MetalOpTranslator {
     pub type_id: TypeId,
     pub try_make: fn(&TypedModel, &TypedNode) -> TractResult<Option<Box<dyn TypedOp>>>,
@@ -53,6 +56,65 @@ macro_rules! register_metal_op {
             }
         }
     };
+}
+
+/// Metal-local SDPA flattening: explode only the `Sdpa` nodes neither fused
+/// kernel can take (MLX port first, vendored MFA metallib second), leaving
+/// fusable ones for the chooser translator in `kernels::matmul::mlx_sdpa`.
+/// (The shared `tract_gpu` `rewire_sdpa` explodes all of them; cuda still
+/// uses it.)
+fn flatten_unfused_sdpa(
+    _ctx: &(),
+    model: &TypedModel,
+    node: &TypedNode,
+    _name: &str,
+    op: &tract_transformers::ops::sdpa::Sdpa,
+) -> TractResult<Option<TypedModelPatch>> {
+    let in_facts = model.node_input_facts(node.id)?;
+    if crate::kernels::matmul::mlx_sdpa::mlx_sdpa_supported(op, &in_facts)
+        || crate::kernels::matmul::mfa::mfa_sdpa_supported(op, &in_facts)
+    {
+        Ok(None) // leave intact for the fused-Sdpa translator
+    } else {
+        op.patch_sdpa(model, node) // explode (same as the shared rewire_sdpa)
+    }
+}
+
+/// An exported causal LLM feeds `Sdpa` an f32 mask next to f16 activations, but
+/// the fused kernels template the mask on the activation type. Cast it to the
+/// query dtype so the constant folds and the node stays fusable.
+fn cast_sdpa_mask_to_query_dt(
+    _ctx: &(),
+    model: &TypedModel,
+    node: &TypedNode,
+    name: &str,
+    _op: &tract_transformers::ops::sdpa::Sdpa,
+) -> TractResult<Option<TypedModelPatch>> {
+    let in_facts = model.node_input_facts(node.id)?;
+    if in_facts.len() != 4 {
+        return Ok(None);
+    }
+    let (q_dt, mask_dt) = (in_facts[0].datum_type, in_facts[3].datum_type);
+    if mask_dt == q_dt || !q_dt.is_float() || !mask_dt.is_float() {
+        return Ok(None);
+    }
+    let mut patch = TypedModelPatch::default();
+    let mut inputs = patch.taps(model, &node.inputs)?;
+    inputs[3] = patch.wire_node(
+        format!("{name}.mask_cast"),
+        tract_core::ops::cast::cast(q_dt),
+        &[inputs[3]],
+    )?[0];
+    let out = patch.wire_node(&node.name, node.op.clone(), &inputs)?;
+    patch.shunt_outside(model, node.id.into(), out[0])?;
+    Ok(Some(patch))
+}
+
+fn rewire_sdpa_metal(model: &mut TypedModel) -> TractResult<()> {
+    Rewriter::default()
+        .with_rule_for("cast-sdpa-mask-to-query-dt", cast_sdpa_mask_to_query_dt)
+        .with_rule_for("flatten-unfused-sdpa", flatten_unfused_sdpa)
+        .rewrite(&(), model)
 }
 
 impl MetalGemmImplKind {
@@ -84,6 +146,11 @@ impl ModelTransform for MetalTransform {
     }
 
     fn transform(&self, model: &mut TypedModel) -> TractResult<()> {
+        // The pool translators live in `ops::pool`, which nothing else calls
+        // into; without a reference the linker drops the module and with it the
+        // inventory registrations.
+        crate::ops::pool::link_translators();
+
         self.transform_up_to_phase(model, usize::MAX)
     }
 }
@@ -111,7 +178,7 @@ impl MetalTransform {
         // Init Metal Context if not done previously
         metal_context();
 
-        rewire_sdpa(model)?;
+        rewire_sdpa_metal(model)?;
         rewrite_einsum_to_prefix_matmul(model, false)?;
         if stop_at_phase == 0 {
             return Ok(());
@@ -126,6 +193,8 @@ impl MetalTransform {
             .with_rule_for("rewrite_kernel_conv_in_oihw", rewrite_kernel_conv_in_oihw)
             .with_rule_for("rewrite_conv_with_n_axis", rewrite_conv_with_n_axis)
             .with_rule_for("remove_rms_norm_cast", remove_rms_norm_cast)
+            .with_rule_for("split_multi_axis_reduce", split_multi_axis_reduce)
+            .with_rule_for("fold_gdn_beta_sigmoid", rewrite_rules::fold_gdn_beta_sigmoid)
             .rewrite(&(), model)?;
 
         if stop_at_phase == 1 {
@@ -210,30 +279,72 @@ impl Translate<TypedFact, Box<dyn TypedOp>, TypedFact, Box<dyn TypedOp>> for Met
                 return sync_model_outputs_if_required(source, node, target, outlet_ids);
             }
         }
-        if let Some(conv) = node.op_as::<Conv>() {
-            if input_facts.iter().all(|f| DeviceTensor::is_supported_dt(f.datum_type))
-                && matches!(input_facts[0].datum_type, DatumType::F16 | DatumType::F32)
-            {
-                let device_inputs =
-                    sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToDevice)?;
-                let outlet_ids =
-                    ops::conv::wire_metal_conv(source, node, target, &device_inputs, conv)?;
-                return sync_model_outputs_if_required(source, node, target, outlet_ids);
+        if let Some(conv) = node.op_as::<Conv>()
+            && input_facts.iter().all(|f| DeviceTensor::is_supported_dt(f.datum_type))
+            && matches!(input_facts[0].datum_type, DatumType::F16 | DatumType::F32)
+        {
+            let device_inputs =
+                sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToDevice)?;
+            let outlet_ids =
+                ops::conv::wire_metal_conv(source, node, target, &device_inputs, conv)?;
+            return sync_model_outputs_if_required(source, node, target, outlet_ids);
+        }
+        // Resize bakes its plan, so it keeps only the data input: the scales /
+        // sizes input it drops is a TDim const with no device equivalent.
+        if let Some(gpu_op) = crate::kernels::array::metal_resize(source, node)? {
+            let mut input = mapping[&node.inputs[0]];
+            if target.outlet_fact(input)?.as_device_fact().is_none() {
+                input = target.wire_node(
+                    format!("{}.to-device-0", node.name),
+                    DeviceSync::new(DeviceSyncKind::ToDevice),
+                    &[input],
+                )?[0];
             }
+            let outlet_ids = target.wire_node(node.name.clone(), gpu_op, &[input])?;
+            return sync_model_outputs_if_required(source, node, target, outlet_ids);
         }
         // Const: inline conversion, not a GPU op
-        if let Some(op) = node.op_as::<Const>() {
-            if DeviceTensor::is_supported_dt(op.val().datum_type()) {
-                let device_inputs =
-                    sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToDevice)?;
-                let outlet_ids =
-                    target.wire_node(node.name.clone(), convert_const(op)?, &device_inputs)?;
-                return sync_model_outputs_if_required(source, node, target, outlet_ids);
-            }
+        if let Some(op) = node.op_as::<Const>()
+            && DeviceTensor::is_supported_dt(op.val().datum_type())
+        {
+            let device_inputs =
+                sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToDevice)?;
+            let outlet_ids =
+                target.wire_node(node.name.clone(), convert_const(op)?, &device_inputs)?;
+            return sync_model_outputs_if_required(source, node, target, outlet_ids);
         }
 
-        // Single-op translation
-        if let Some(gpu_op) = try_make_metal_op(source, node)? {
+        // Single-op translation.  See the matching CUDA path for rationale:
+        // pre-check the gpu_op's output_facts against the already-translated
+        // target-side input shapes before wiring, so a stale Reshape (e.g.
+        // after pulsification has changed an upstream axis size) falls back
+        // to CPU rather than aborting the whole Metal transform.
+        let target_inputs: TVec<TypedFact> = node
+            .inputs
+            .iter()
+            .map(|i| target.outlet_fact(mapping[i]).cloned())
+            .collect::<TractResult<_>>()?;
+        // Mirror sync_inputs_if_required(ToDevice): wrap non-device facts as
+        // device facts so the GPU op's `output_facts` sees uniform device
+        // inputs, matching what it'll receive after sync nodes are wired.
+        // Mixed inputs (e.g. host kv-cache + device current activation) make
+        // `output_facts` bail with "Inconsistent facts", wrongly tripping CPU
+        // fallback.
+        let target_inputs_post_sync: TVec<TypedFact> = target_inputs
+            .iter()
+            .map(|f| -> TractResult<TypedFact> {
+                if f.as_device_fact().is_some() {
+                    Ok(f.clone())
+                } else {
+                    Ok(tract_gpu::fact::DeviceFact::from_host(f.clone())?.into_exotic_fact())
+                }
+            })
+            .collect::<TractResult<_>>()?;
+        let target_input_post_sync_refs: TVec<&TypedFact> =
+            target_inputs_post_sync.iter().collect();
+        if let Some(gpu_op) = try_make_metal_op(source, node)?
+            && gpu_op.output_facts(&target_input_post_sync_refs).is_ok()
+        {
             let device_inputs =
                 sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToDevice)?;
             let outlet_ids = target.wire_node(node.name.clone(), gpu_op, &device_inputs)?;
@@ -308,7 +419,27 @@ fn convert_matmul_to_metal(
     op: &PrefixMatMul,
     gemm_impl: Option<MetalGemmImplKind>,
 ) -> TractResult<TVec<OutletId>> {
-    let mut input_facts = model.node_input_facts(node.id)?;
+    let mut owned_facts: TVec<TypedFact> =
+        model.node_input_facts(node.id)?.iter().map(|f| (*f).clone()).collect();
+
+    // The metal GEMMs accumulate in their input dtype, so a matmul asking for a wider
+    // `operating_dt` than its inputs must have them cast up: an SDPA scores matmul is
+    // wired f32 precisely because its f16 products can leave f16 range, and a f16 GEMM
+    // would saturate them to inf.
+    if let Some(acc) = op.operating_dt {
+        for i in 0..2 {
+            let dt = owned_facts[i].datum_type;
+            if dt.is_float() && acc.is_float() && dt.size_of() < acc.size_of() {
+                inputs[i] = target.wire_node(
+                    format!("{}.cast_acc_{i}", node.name),
+                    metal_cast_new(acc).with_context(|| format!("No metal cast to {acc:?}"))?,
+                    &[inputs[i]],
+                )?[0];
+                owned_facts[i].datum_type = acc;
+            }
+        }
+    }
+    let mut input_facts: TVec<&TypedFact> = owned_facts.iter().collect();
 
     let resolved_gemm_impl = resolve_gemm_impl(gemm_impl, input_facts.clone())?;
     if matches!(resolved_gemm_impl, MetalGemmImplKind::Mlx | MetalGemmImplKind::Mfa)
@@ -364,11 +495,9 @@ fn convert_matmul_to_metal(
                 inputs[a_pos] = target.wire_node(perm_a_name, perm_a_op, &[inputs[a_pos]])?[0];
             }
 
-            if input_facts[0].datum_type == DatumType::F16 {
-                let in_cast_op = metal_cast_new(DatumType::F32).unwrap();
-                inputs[0] =
-                    target.wire_node(node.name.clone() + ".in_cast", in_cast_op, &[inputs[0]])?[0];
-            }
+            // The GGML kernels now consume f16 activations directly (and emit
+            // f16 output via output_dt), so no f16->f32 activation upcast is
+            // inserted here anymore.
 
             if !op.transpose_b {
                 ensure!(
@@ -432,4 +561,29 @@ fn convert_const(op: &Const) -> TractResult<Const> {
 
     let metal_const = op.val().clone().into_device()?.into_tensor().into_arc_tensor();
     Const::new_with_exotic_fact(metal_const, Box::new(metal_fact))
+}
+
+/// Rewrites a `Reduce` over several axes into a chain of single-axis reduces, which is
+/// what `GpuReduce` accepts. Only reducers that compose associatively per axis qualify:
+/// `MeanOfSquares` over a chain is not the multi-axis result.
+fn split_multi_axis_reduce(
+    _ctx: &(),
+    model: &TypedModel,
+    node: &TypedNode,
+    node_name: &str,
+    op: &Reduce,
+) -> TractResult<Option<TypedModelPatch>> {
+    rule_if!(op.axes.len() > 1);
+    use tract_core::ops::nn::Reducer::*;
+    rule_if!(matches!(op.reducer, Sum | Prod | Min | Max | Any | All));
+    let mut patch = TypedModelPatch::default();
+    let mut wire = patch.tap_model(model, node.inputs[0])?;
+    let mut axes = op.axes.clone();
+    axes.sort();
+    for (i, &axis) in axes.iter().rev().enumerate() {
+        let single = Reduce { axes: tvec![axis], reducer: op.reducer };
+        wire = patch.wire_node(format!("{node_name}.axis_{i}"), single, &[wire])?[0];
+    }
+    patch.shunt_outside(model, node.id.into(), wire)?;
+    Ok(Some(patch))
 }

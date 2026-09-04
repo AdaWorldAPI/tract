@@ -14,17 +14,21 @@ mod dropout;
 mod gelu;
 mod gelu_contrib;
 mod group_norm;
+mod group_query_attention;
 mod instance_norm;
 mod layer_norm;
 mod lp_norm;
 mod lrn;
 mod mat_mul_nbits;
 mod mish;
+mod multi_head_attention;
 mod mvn;
 mod reduce;
 mod rms_norm;
 mod rms_norm_contrib;
 mod rotary_embedding;
+mod simplified_layer_norm;
+mod skip_layer_norm;
 
 pub fn arg_max_min(
     _ctx: &ParsingContext,
@@ -91,15 +95,18 @@ pub fn register_all_ops(reg: &mut OnnxOpRegister) {
     reg.insert("BiasGelu", gelu_contrib::bias_gelu);
     reg.insert("FastGelu", gelu_contrib::fast_gelu);
     reg.insert("QuickGelu", gelu_contrib::quick_gelu);
+    reg.insert("GroupQueryAttention", group_query_attention::group_query_attention);
     reg.insert("HardSwish", |_, _| Ok((ops::nn::hard_swish().into_hir(), vec![])));
     reg.insert("Mish", |_, _| Ok((expand(mish::Mish), vec![])));
+    reg.insert("MultiHeadAttention", multi_head_attention::multi_head_attention);
     reg.insert("RMSNormalization", rms_norm::rms_normalization);
     reg.insert("RotaryEmbedding", rotary_embedding::rotary_embedding);
-    reg.insert("SimplifiedLayerNormalization", rms_norm::rms_normalization);
+    reg.insert("SimplifiedLayerNormalization", simplified_layer_norm::simplified_layer_norm);
     reg.insert(
         "SkipSimplifiedLayerNormalization",
         rms_norm_contrib::skip_simplified_layer_normalization,
     );
+    reg.insert("SkipLayerNormalization", skip_layer_norm::skip_layer_normalization);
     reg.insert("Softmax", layer_soft_max);
     reg.insert("Swish", |_, _| Ok((tract_core::ops::nn::silu::silu().into_hir(), vec![])));
     reg.insert("Softplus", |_, _| Ok((expand(ops::activations::Softplus), vec![])));

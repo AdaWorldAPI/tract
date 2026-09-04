@@ -25,30 +25,23 @@ impl Op for DynSlice {
 }
 
 impl EvalOp for DynSlice {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        _node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let start = inputs[1]
             .cast_to::<TDim>()?
             .try_as_plain()?
             .to_scalar::<TDim>()?
-            .eval(&session.resolved_symbols)
+            .eval(ctx.symbols)
             .to_usize()?;
         let end = inputs[2]
             .cast_to::<TDim>()?
             .try_as_plain()?
             .to_scalar::<TDim>()?
-            .eval(&session.resolved_symbols)
+            .eval(ctx.symbols)
             .to_usize()?;
         ensure!(start <= end);
-        if let Ok(len) = self.len.eval(&session.resolved_symbols).to_usize() {
+        if let Ok(len) = self.len.eval(ctx.symbols).to_usize() {
             ensure!(start + len == end);
         }
         let slice = inputs[0].slice(self.axis, start, end)?;
@@ -112,6 +105,19 @@ impl TypedOp for DynSlice {
             &[node.inputs[0]],
             crate::ops::array::Slice { axis: self.axis, start, end },
         )?))
+    }
+
+    fn set_symbols(
+        &self,
+        _source: &TypedModel,
+        node: &TypedNode,
+        target: &mut TypedModel,
+        mapping: &HashMap<OutletId, OutletId>,
+        subs: &HashMap<Symbol, TDim>,
+    ) -> TractResult<TVec<OutletId>> {
+        let op = DynSlice { axis: self.axis, len: self.len.substitute_all(subs)? };
+        let inputs = node.inputs.iter().map(|i| mapping[i]).collect::<TVec<_>>();
+        target.wire_node(&node.name, op, &inputs)
     }
 
     as_op!();

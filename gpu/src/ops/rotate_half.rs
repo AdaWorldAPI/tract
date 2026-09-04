@@ -39,24 +39,13 @@ impl Op for GpuRotateHalf {
 }
 
 impl EvalOp for GpuRotateHalf {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input_value = args_1!(inputs);
         let input = input_value.to_device_tensor()?;
-        let output = crate::session_handler::make_tensor_for_node(
-            session,
-            node_id,
-            input.datum_type(),
-            input.shape(),
-        )?;
+        let output =
+            crate::turn_handler::make_tensor_for_node(ctx, input.datum_type(), input.shape())?;
         (self.dispatch)(input, &output)?;
         Ok(tvec!(output.into_tensor().into_tvalue()))
     }

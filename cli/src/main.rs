@@ -24,8 +24,19 @@ use fs_err as fs;
 use readings_probe::*;
 
 mod bench;
+#[cfg(feature = "bench-suite")]
+mod bench_append;
+#[cfg(feature = "bench-suite")]
+mod bench_common;
+#[cfg(feature = "bench-suite")]
+mod bench_expectations;
+#[cfg(feature = "bench-suite")]
+mod bench_report;
+#[cfg(feature = "bench-suite")]
+mod bench_suite;
 mod compare;
 mod cost;
+mod cost_model;
 mod dump;
 mod hwbench;
 #[cfg(feature = "transformers")]
@@ -33,7 +44,9 @@ mod llm;
 mod memory_arena;
 mod params;
 mod plan_options;
+mod routines;
 mod run;
+mod selection;
 mod tensor;
 mod utils;
 
@@ -43,8 +56,6 @@ use tract_linalg::block_quant::Q4_0;
 use tract_linalg::mmm::MatMatMul;
 
 readings_probe::instrumented_allocator!();
-
-pub const QUALITY_COLORS: [nu_ansi_term::Color; 5] = [LightGreen, Green, White, Yellow, LightRed];
 
 fn info_usage(stage: &str, probe: Option<&Probe>) {
     if let Some(mon) = probe {
@@ -165,18 +176,37 @@ fn main() -> TractResult<()> {
 
 
         .arg(arg!(--"threads" [THREADS] "Setup a thread pool for computing. 0 will guess the number of physical cores"))
+        .arg(arg!(--"threading-threshold" [ELEMENTS] "Element-count below which row-parallel ops (softmax, norm, elementwise) run inline. 0 always threads"))
 
         .arg(arg!(-O --optimize "Optimize before running"))
         .arg(arg!(--"assert-maximal-mm-quality-cost" [MAX] "Maximum value for quality category (0=assembly, 4=dreadful rust code)"))
         .arg(arg!(--pulse [PULSE] "Translate to pulse network"))
 
         .arg(arg!(--"machine-friendly" "Machine friendly output"))
+        .arg(arg!(--"emit-jsonl" "Emit one JSON object per metric on stdout (bench-suite child contract)"))
         .arg(arg!(--"timeout" [SECONDS] "Kill the process after this many seconds"))
 
         .subcommand(Command::new("list-ops").about("List ops in TF/ONNX frameworks"))
         .subcommand(Command::new("list-runtimes").about("List runtimes"))
-        .subcommand(Command::new("kernels").about("Print kernels for the current plaform"))
-        .subcommand(Command::new("hwbench").about("Print current hardware key metrics"));
+        .subcommand(Command::new("kernels").about("Print kernels for the current platform"))
+        .subcommand(
+            Command::new("routines")
+                .about("Print the single-winner kernel matrix: every function by every machine")
+                .arg(
+                    Arg::new("isa")
+                        .long("isa")
+                        .num_args(1)
+                        .help("List the kernels of this machine instead of the host's"),
+                ),
+        )
+        .subcommand(Command::new("selection").about(
+            "Dump what mmm selection answers for every machine, as one diffable sweep",
+        ))
+        .subcommand(hwbench::command())
+        .subcommand(cost_model::command())
+        .subcommand(
+            Command::new("list-knobs").about("List runtime configuration knobs and their values"),
+        );
 
     let compare = clap::Command::new("compare")
         .long_about("Compares the output of tract and tensorflow on randomly generated input.")
@@ -185,9 +215,6 @@ fn main() -> TractResult<()> {
                 .long("stage")
                 .value_parser(clap::builder::PossibleValuesParser::new(STAGES))
                 .help("Loading pipeline stage to compare with"),
-        )
-        .arg(
-            Arg::new("tf").long("tf").action(ArgAction::SetTrue).help("Compare against tensorflow"),
         )
         .arg(
             Arg::new("twice")
@@ -210,7 +237,7 @@ fn main() -> TractResult<()> {
         )
         .group(
             ArgGroup::new("reference")
-                .args(&["npz", "pbdir", "stage", "tf", "twice", "stream"])
+                .args(["npz", "pbdir", "stage", "twice", "stream"])
                 .required(true),
         )
         .arg(
@@ -237,10 +264,55 @@ fn main() -> TractResult<()> {
     let bench = assertions_options(bench);
     app = app.subcommand(bench);
 
-    let criterion = clap::Command::new("criterion")
-        .long_about("Benchmarks tract on randomly generated input using criterion.");
-    let criterion = run_options(criterion);
-    app = app.subcommand(criterion);
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let criterion = clap::Command::new("criterion")
+            .long_about("Benchmarks tract on randomly generated input using criterion.");
+        let criterion = run_options(criterion);
+        app = app.subcommand(criterion);
+    }
+
+    #[cfg(feature = "bench-suite")]
+    {
+        app = app.subcommand(bench_suite::command());
+        app = app.subcommand(
+            clap::Command::new("bench-expectations")
+                .long_about("Emit per-metric expectations for one (triple, device) from bench-data history.")
+                .arg(arg!(--"bench-data" <DIR> "bench-data checkout root"))
+                .arg(arg!(--thresholds <PATH> "Threshold config TOML"))
+                .arg(arg!(--triple <TRIPLE> "Target triple"))
+                .arg(arg!(--device <DEVICE> "Device key"))
+                .arg(arg!(--out <PATH> "Output expectations file")),
+        );
+        app = app.subcommand(
+            clap::Command::new("bench-append")
+                .long_about("Append one nightly run to the columnar bench-data branch.")
+                .arg(arg!(--metrics <PATH> "Metrics file produced by bench-suite"))
+                .arg(arg!(--out <DIR> "bench-data checkout root"))
+                .arg(arg!(--triple <TRIPLE> "Target triple"))
+                .arg(arg!(--device <DEVICE> "Device key"))
+                .arg(arg!(--day [DATE] "Run day YYYY-MM-DD (default: today)")),
+        );
+        app = app.subcommand(bench_suite::diff_command());
+        app = app.subcommand(
+            clap::Command::new("bench-report")
+                .long_about("Render the PR-vs-main bench comparison comment + job summary.")
+                .arg(arg!(--results <DIR> "Dir of per-device result subdirs (meta.json + metrics)"))
+                .arg(arg!(--"bench-data" <DIR> "bench-data checkout root (the nightly reference)"))
+                .arg(arg!(--thresholds <PATH> "Threshold config TOML"))
+                .arg(arg!(--"pr-sha" <SHA> "PR commit sha"))
+                .arg(arg!(--out <PATH> "PR comment markdown output path"))
+                .arg(arg!(--templates [DIR] "Template dir (default: .travis)"))
+                .arg(arg!(--today [DATE] "Override today's date YYYY-MM-DD (for reproducible output)")),
+        );
+        app = app.subcommand(
+            clap::Command::new("bench-mt-report")
+                .long_about("Render the thread-scaling (mt-ladder) table; no bench-data reference.")
+                .arg(arg!(--results <DIR> "Dir of per-device result subdirs (meta.json + metrics)"))
+                .arg(arg!(--"pr-sha" <SHA> "PR commit sha"))
+                .arg(arg!(--out <PATH> "PR comment markdown output path")),
+        );
+    }
 
     app = app.subcommand(dump_subcommand());
 
@@ -339,6 +411,7 @@ fn main() -> TractResult<()> {
     env_logger::Builder::from_env(env).format_timestamp_nanos().init();
     info_usage("init", probe.as_ref());
 
+    #[cfg(not(target_family = "wasm"))]
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install ring provider");
@@ -522,7 +595,7 @@ fn assertions_options(command: clap::Command) -> clap::Command {
             Arg::new("assert-op-count")
             .value_parser(clap::builder::NonEmptyStringValueParser::new())
             .number_of_values(2)
-            .value_names(&["operator", "count"])
+            .value_names(["operator", "count"])
             .action(clap::ArgAction::Append)
             .long("assert-op-count")
             .help("Specified operator must appear exactly the specified number of times. This argument can appear multiple times."),
@@ -559,7 +632,8 @@ fn run_options(command: clap::Command) -> clap::Command {
                 .long("set")
                 .action(clap::ArgAction::Append)
                 .number_of_values(1)
-                .help("Set a symbol value before running the model (--set S=12)"),
+                .help("Bind a symbol before running the model.  RHS is a TDim expression \
+                       reduced to i64 against symbols set so far (--set S=12, --set T=2*S)."),
         )
         .arg(
             Arg::new("input-from-nnef").long("input-from-nnef").num_args(1).help(
@@ -726,6 +800,19 @@ fn handle(matches: clap::ArgMatches, probe: Option<&Probe>) -> TractResult<()> {
             });
             return Ok(());
         }
+        Some(("list-knobs", _)) => {
+            let name_style = White.bold();
+            let shown = |s: String| if s.is_empty() { "(unset)".to_string() } else { s };
+            for k in tract_core::knobs::all() {
+                let current = shown((k.current)());
+                let default = shown((k.default)());
+                let suffix =
+                    if current != default { format!(", default {default}") } else { String::new() };
+                println!("{} = {current}  [{}{suffix}]", name_style.paint(k.name), k.type_name);
+                println!("    {}\n", k.doc);
+            }
+            return Ok(());
+        }
         Some(("list-ops", _)) => {
             #[cfg(feature = "onnx")]
             {
@@ -745,14 +832,38 @@ fn handle(matches: clap::ArgMatches, probe: Option<&Probe>) -> TractResult<()> {
             }
             return Ok(());
         }
-        Some(("hwbench", _)) => return hwbench::handle(),
+        Some(("hwbench", m)) => return hwbench::handle(m),
+        Some(("cost-model", m)) => return cost_model::handle(m),
+        #[cfg(feature = "bench-suite")]
+        Some(("bench-suite", m)) => return bench_suite::handle(m),
+        #[cfg(feature = "bench-suite")]
+        Some(("bench-append", m)) => return bench_append::handle(m),
+        #[cfg(feature = "bench-suite")]
+        Some(("bench-expectations", m)) => return bench_expectations::handle(m),
+        #[cfg(feature = "bench-suite")]
+        Some(("bench-diff", m)) => return bench_suite::diff(m),
+        #[cfg(feature = "bench-suite")]
+        Some(("bench-report", m)) => return bench_report::handle(m),
+        #[cfg(feature = "bench-suite")]
+        Some(("bench-mt-report", m)) => return bench_report::handle_mt(m),
+        Some(("routines", m)) => {
+            return routines::dump(m.get_one::<String>("isa").map(String::as_str));
+        }
+        Some(("selection", _)) => return selection::dump(),
         Some(("kernels", _)) => {
             println!();
             fn colored_name(m: &dyn MatMatMul) -> String {
+                let color = if m.emulated() {
+                    LightRed
+                } else if m.arch().is_some() {
+                    Green
+                } else {
+                    White
+                };
                 format!(
                     "{} {}",
-                    QUALITY_COLORS[m.quality().cost()].paint(m.name()),
-                    match m.dynamic_boost().signum() {
+                    color.paint(m.name()),
+                    match m.boost().signum() {
                         1 => Green.paint("●"),
                         -1 => Red.paint("●"),
                         _ => "-".to_string().into(),
@@ -761,8 +872,15 @@ fn handle(matches: clap::ArgMatches, probe: Option<&Probe>) -> TractResult<()> {
             }
             println!("{}", White.bold().paint("# By implementation"));
             println!();
-            for m in tract_linalg::ops().mmm_impls() {
-                println!("{} -> {:?}", colored_name(&**m), m.stores());
+            for m in tract_linalg::MmmDispatch::native().runnable() {
+                println!(
+                    "{} · {:?} level {} boost {} -> {:?}",
+                    colored_name(&**m),
+                    m.isa(),
+                    m.isa().level(),
+                    m.boost(),
+                    m.stores()
+                );
                 for packings in m.packings() {
                     println!("   - {:?} • {:?}", packings.0, packings.1);
                 }
@@ -778,13 +896,13 @@ fn handle(matches: clap::ArgMatches, probe: Option<&Probe>) -> TractResult<()> {
                 WeightType::from(Q4_0),
             ] {
                 println!("{}", White.bold().paint(format!("{w:?}")));
-                for packing in tract_linalg::ops()
+                for packing in tract_linalg::MmmDispatch::native()
                     .all_possible_packing(w)
                     .sorted_by_key(|f| format!("{f:?}"))
                     .dedup()
                 {
                     println!("  * {packing:?}");
-                    for mmm in tract_linalg::ops().mmm_impls() {
+                    for mmm in tract_linalg::MmmDispatch::native().runnable() {
                         for (ix, p) in mmm.packings().iter().enumerate() {
                             if p.0.dyn_eq(packing) {
                                 println!(
@@ -793,7 +911,7 @@ fn handle(matches: clap::ArgMatches, probe: Option<&Probe>) -> TractResult<()> {
                                     p.0,
                                     p.1
                                 );
-                            } else if let Some(pe) = tract_linalg::ops()
+                            } else if let Some(pe) = tract_linalg::MmmDispatch::native()
                                 .panel_extractors()
                                 .iter()
                                 .find(|pe| pe.from.dyn_eq(packing) && p.0.dyn_eq(&pe.to))
@@ -862,6 +980,10 @@ fn handle(matches: clap::ArgMatches, probe: Option<&Probe>) -> TractResult<()> {
     if matches.get_one::<String>("threads").is_some() {
         bail!("tract is compiled without multithread support")
     }
+    #[cfg(feature = "multithread-mm")]
+    if let Some(threshold) = matches.get_one::<String>("threading-threshold") {
+        multithread::set_threading_element_threshold(threshold.parse()?);
+    }
 
     match matches.subcommand() {
         Some(("bench", m)) => {
@@ -869,6 +991,7 @@ fn handle(matches: clap::ArgMatches, probe: Option<&Probe>) -> TractResult<()> {
             bench::handle(&params, m, &params::bench_limits_from_clap(m)?)
         }
 
+        #[cfg(not(target_family = "wasm"))]
         Some(("criterion", m)) => {
             need_optimisations = true;
             bench::criterion(&params, &matches, m)

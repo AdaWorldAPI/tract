@@ -1,5 +1,4 @@
 use tract_nnef::internal::*;
-use tract_nnef::tract_core::trivial_op_state_freeze;
 use tract_pulse::PulsedOp;
 use tract_pulse::model::PulsedModel;
 use tract_pulse::ops::OpPulsifier;
@@ -97,7 +96,6 @@ pub struct ExpUnitNormState {
     hidden: Option<Tensor>,
     index: usize,
 }
-trivial_op_state_freeze!(ExpUnitNormState);
 
 impl Op for ExpUnitNorm {
     fn name(&self) -> StaticName {
@@ -108,19 +106,19 @@ impl Op for ExpUnitNorm {
 }
 
 impl EvalOp for ExpUnitNorm {
-    fn is_stateless(&self) -> bool {
-        self.stateless
+    fn eval_out_of_plan(&self, inputs: TVec<TValue>) -> TractResult<Option<TVec<TValue>>> {
+        if self.stateless {
+            Ok(Some(self.eval(&EvalContext::out_of_plan(), inputs)?))
+        } else {
+            Ok(None)
+        }
     }
 
-    fn state(
-        &self,
-        _session: &TurnState,
-        _node_id: usize,
-    ) -> TractResult<Option<Box<dyn OpState>>> {
+    fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(Some(Box::<ExpUnitNormState>::default()))
     }
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         ExpUnitNormState::default().eval(self, inputs)
     }
 }
@@ -178,12 +176,16 @@ impl ExpUnitNormState {
 impl OpState for ExpUnitNormState {
     fn eval(
         &mut self,
-        _session: &mut TurnState,
+        _ctx: &EvalContext,
         op: &dyn Op,
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>> {
         let op = op.downcast_ref::<ExpUnitNorm>().context("Wrong op")?;
         Self::eval(self, op, inputs)
+    }
+
+    fn reset_lanes(&mut self, _lanes: &[LaneId]) -> TractResult<()> {
+        bail!("ExpUnitNorm is not lane-aware: hidden has no lane axis")
     }
 }
 

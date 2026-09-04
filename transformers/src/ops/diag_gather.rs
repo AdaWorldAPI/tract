@@ -39,22 +39,15 @@ impl Op for DiagGather {
 }
 
 impl EvalOp for DiagGather {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        _node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs);
         let rank = input.rank();
         let t = input.shape()[rank - 2];
         let r = input.shape()[rank - 1];
-        let offset = self.offset.eval(&session.resolved_symbols).to_i64()? as isize;
-        let out_len = self.out_len.eval(&session.resolved_symbols).to_usize()?;
+        let offset = self.offset.eval(ctx.symbols).to_i64()? as isize;
+        let out_len = self.out_len.eval(ctx.symbols).to_usize()?;
 
         let mut out_shape: TVec<usize> = input.shape().into();
         out_shape[rank - 1] = out_len;
@@ -142,7 +135,7 @@ impl TypedOp for DiagGather {
         Ok(Some(tvec![Some(input_roi)]))
     }
 
-    fn substitute_symbols(
+    fn set_symbols(
         &self,
         _source: &TypedModel,
         node: &TypedNode,
@@ -426,7 +419,7 @@ mod tests {
 
         // Build a model with the skew trick chain.
         let mut model = TypedModel::default();
-        let input = model.add_source("pos_raw", f32::fact(&[1, t, r]))?;
+        let input = model.add_source("pos_raw", f32::fact([1, t, r]))?;
 
         // Pad axis 2, pre=1
         let mut pads = vec![(0, 0); 3];
@@ -517,7 +510,7 @@ mod tests {
         let r = 2 * t - 1; // 7
 
         let mut model = TypedModel::default();
-        let src = model.add_source("src", f32::fact(&[1, t, r]))?;
+        let src = model.add_source("src", f32::fact([1, t, r]))?;
         let dg = model.wire_node(
             "dg",
             DiagGather { offset: (t as i64 - 1).to_dim(), out_len: t.to_dim() },

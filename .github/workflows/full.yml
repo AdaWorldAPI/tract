@@ -12,6 +12,9 @@ on:
 
 env:
   CARGO_INCREMENTAL: false
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_MULTIPLEXING: false
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE20: true
 
 permissions:
@@ -20,15 +23,22 @@ permissions:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
     outputs:
       test_ref: ${{ steps.set.outputs.test_ref }}
+      pr_number: ${{ steps.set.outputs.pr_number }}
     steps:
       - id: set
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          STATUS_CONTEXT: "CI / full"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
           script: |
             const prInput = context.payload.inputs?.pr_number;
-            core.info(`Fetching PR ${prInput}`);
+            core.setOutput('pr_number', prInput ? String(prInput) : '');
             if (!prInput) {
               // Use the ref the workflow was triggered on (branch/tag/SHA in base repo)
               core.setOutput('test_ref', process.env.GITHUB_SHA);
@@ -39,8 +49,17 @@ jobs:
               repo: context.repo.repo,
               pull_number: Number(prInput),
             });
-            core.info(pr.data.head.sha);
-            core.setOutput('test_ref', pr.data.head.sha);
+            const sha = pr.data.head.sha;
+            core.setOutput('test_ref', sha);
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha,
+              state: 'pending',
+              context: process.env.STATUS_CONTEXT,
+              target_url: process.env.RUN_URL,
+              description: 'Running',
+            });
 
   old-harness:
     runs-on: ubuntu-latest
@@ -51,18 +70,15 @@ jobs:
       contents: read
     needs: prepare
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
         persist-credentials: false
 
-    - name: Configure AWS Credentials
-      continue-on-error: true
-      uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
-        role-to-assume: arn:aws:iam::567805100031:role/github-runner-tract-ci
-        aws-region: us-east-2
+        save-if: false # restore-only: schedule/dispatch job, never save (would evict the per-PR caches under the 10 GB cap)
 
     - name: Full test
       run: .travis/test-harness.sh
@@ -72,15 +88,45 @@ jobs:
     needs: prepare
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
         persist-credentials: false
-    - name: Full test 
-      env:
-        AWS_EC2_METADATA_DISABLED: true
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        save-if: false # restore-only: schedule/dispatch job, never save (would evict the per-PR caches under the 10 GB cap)
+    - name: Full test
       run: .travis/cli-tests.sh
+
+  cli-tests-cuda:
+    name: Device-capable CLI cases on cuda
+    runs-on: cuda-lovelace
+    needs: prepare
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ needs.prepare.outputs.test_ref }}
+        fetch-depth: 0
+        persist-credentials: false
+
+    # A case's device steps are the ones naming TRACT_RUNTIMES, so the list
+    # maintains itself. ci-system-setup.sh spots the GPU and puts --cuda in
+    # TRACT_RUNTIMES; cli-tests.sh reads the executable path back with jq, which
+    # this runner has not got, hence the fixed profile path here.
+    - name: Device-capable nnef-test-cases
+      run: |
+        export ROOT=.
+        . ./.travis/ci-system-setup.sh
+        cargo build -p tract-cli --profile opt-no-lto --no-default-features --features pulse,pulse-opl,cuda-13000
+        export TRACT_RUN=$PWD/target/opt-no-lto/tract
+        for t in $(grep -rl TRACT_RUNTIMES --include=runme.sh harness)
+        do
+            echo $t
+            $t
+        done
 
   onnx-tests:
     runs-on: ubuntu-latest
@@ -90,11 +136,15 @@ jobs:
         opset: [1_4_1, 1_5_0, 1_6_0, 1_7_0, 1_8_1, 1_9_0, 1_10_2, 1_11_0, 1_12_0, 1_13_0, 1_14_1, 1_15_0, 1_16_2, 1_17_0, 1_18_0, 1_19_1]
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
         persist-credentials: false
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        save-if: false # restore-only: schedule/dispatch job, never save (would evict the per-PR caches under the 10 GB cap)
     - name: Full test
       run: .travis/onnx-tests.sh ${{ matrix.opset }}
 
@@ -103,11 +153,15 @@ jobs:
     needs: prepare
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
         persist-credentials: false
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        save-if: false # restore-only: schedule/dispatch job, never save (would evict the per-PR caches under the 10 GB cap)
     - name: Full test
       run: .travis/tflite.sh
 
@@ -116,27 +170,35 @@ jobs:
     needs: prepare
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
         persist-credentials: false
 
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        save-if: false # restore-only: schedule/dispatch job, never save (would evict the per-PR caches under the 10 GB cap)
+
     - name: With assertions
       run: |
         rustup update
-        cargo test --features tract-core/paranoid_assertions -p test-onnx-core -p test-unit-core
+        cargo test -q --features tract-core/paranoid_assertions -p test-onnx-core -p test-unit-core
 
   without-default-features:
     runs-on: ubuntu-latest
     needs: prepare
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
         persist-credentials: false
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        save-if: false # restore-only: schedule/dispatch job, never save (would evict the per-PR caches under the 10 GB cap)
     - name: Without default features
       run: |
         rustup update
@@ -147,11 +209,15 @@ jobs:
     needs: prepare
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
         persist-credentials: false
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        save-if: false # restore-only: schedule/dispatch job, never save (would evict the per-PR caches under the 10 GB cap)
     - name: With complexes
       run: |
         rustup update
@@ -162,11 +228,15 @@ jobs:
     needs: prepare
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
         persist-credentials: false
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        save-if: false # restore-only: schedule/dispatch job, never save (would evict the per-PR caches under the 10 GB cap)
     - name: Check all targets
       run: |
         ROOT=$(pwd) ./.travis/ci-system-setup.sh
@@ -177,11 +247,15 @@ jobs:
     needs: prepare
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
         persist-credentials: false
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        save-if: false # restore-only: schedule/dispatch job, never save (would evict the per-PR caches under the 10 GB cap)
     - name: C smoke tests
       run: |
         cd api/c
@@ -193,18 +267,22 @@ jobs:
     needs: prepare
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
         persist-credentials: false
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        save-if: false # restore-only: schedule/dispatch job, never save (would evict the per-PR caches under the 10 GB cap)
     - name: Setup Python
-      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
       with:
         python-version: "3.13"
 
     - name: Install uv
-      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
     - name: Pytest bindings
       timeout-minutes: 60
@@ -214,3 +292,55 @@ jobs:
         source .venv/bin/activate
         uv pip install -e ".[dev]"
         pytest .
+
+  report:
+    name: Report result to PR
+    needs: [ prepare, old-harness, cli-tests, cli-tests-cuda, onnx-tests, tflite, some-tests-with-paranoid-asserts, without-default-features, complexes, check-all-targets, C, python ]
+    if: ${{ always() && needs.prepare.outputs.pr_number != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.prepare.outputs.test_ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STATUS_CONTEXT: "CI / full"
+        with:
+          script: |
+            const needs = JSON.parse(process.env.NEEDS);
+            const prNumber = Number(process.env.PR_NUMBER);
+            const sha = process.env.HEAD_SHA;
+            const runUrl = process.env.RUN_URL;
+            const statusContext = process.env.STATUS_CONTEXT;
+            const icon = r => r === 'success' ? '✅' : r === 'skipped' ? '⏭️' : '❌';
+            const jobs = Object.entries(needs).filter(([k]) => k !== 'prepare');
+            const failed = jobs.filter(([, v]) => v.result !== 'success' && v.result !== 'skipped');
+            const state = failed.length ? 'failure' : 'success';
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner, repo: context.repo.repo, sha, state,
+              context: statusContext, target_url: runUrl,
+              description: failed.length ? `${failed.length} job(s) failed` : 'All jobs passed',
+            });
+            const marker = `<!-- ${statusContext} -->`;
+            const body = [
+              marker,
+              `### ${icon(state)} ${statusContext}: ${state}`,
+              '',
+              ...jobs.map(([k, v]) => `- ${icon(v.result)} \`${k}\`: ${v.result}`),
+              '',
+              `[View workflow run](${runUrl})`,
+            ].join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100,
+            });
+            const prev = comments.find(c => c.body?.includes(marker));
+            if (prev) {
+              await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: prev.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, body });
+            }

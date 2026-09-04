@@ -1,0 +1,97 @@
+name: CI slash command
+
+# Lets maintainers trigger heavy CI on a PR by commenting:
+#   /ci full           -> Full test harness        (full.yml)
+#   /ci large-models   -> Large models             (large_models.yml)
+#   /ci large          -> alias of large-models
+#   /ci llm            -> alias of large-models
+#   /ci wheels         -> Python wheels            (wheels.yml)
+#   /ci python         -> alias of wheels
+#   /ci py             -> alias of wheels
+#   /ci examples       -> Examples                 (examples.yml)
+#   /ci ex             -> alias of examples
+#   /ci bench          -> Bench                    (bench.yml)
+#   /ci benches        -> alias of bench
+#   /ci bench-mt-ladder [ladder] -> thread-scaling run (bench.yml); ladder defaults to 2,4,0
+# Only commenters with write access can trigger (enforced by slash-command-dispatch).
+
+on:
+  issue_comment:
+    types: [created]
+  repository_dispatch:
+    types: [ci-command]
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch /ci comment
+    if: ${{ github.event_name == 'issue_comment' && github.event.issue.pull_request }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Slash command dispatch
+        uses: peter-evans/slash-command-dispatch@9bdcd7914ec1b75590b790b844aa3b8eee7c683a # v5.0.2
+        with:
+          token: ${{ secrets.CI_DISPATCH_TOKEN }}
+          commands: ci
+          permission: write
+          issue-type: pull-request
+
+  route:
+    name: Route /ci target
+    if: ${{ github.event_name == 'repository_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Route /ci target to its workflow
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ secrets.CI_DISPATCH_TOKEN }}
+          script: |
+            const cp = context.payload.client_payload;
+            const target = (cp.slash_command.args.unnamed.arg1 || '').toLowerCase();
+            const pr = cp.pull_request.number;
+            const map = {
+              'full': 'full.yml',
+              'large-models': 'large_models.yml',
+              'large': 'large_models.yml',
+              'llm': 'large_models.yml',
+              'wheels': 'wheels.yml',
+              'python': 'wheels.yml',
+              'py': 'wheels.yml',
+              'examples': 'examples.yml',
+              'ex': 'examples.yml',
+              'bench': 'bench.yml',
+              'benches': 'bench.yml',
+              'bench-mt-ladder': 'bench.yml',
+            };
+            const workflow = map[target];
+            if (!workflow) {
+              const usage = [
+                `Unknown \`/ci\` target: \`${target || '(none)'}\`.`,
+                '',
+                'Usage: `/ci full`, `/ci large-models` (aliases: `large`, `llm`), `/ci wheels` (aliases: `python`, `py`), `/ci examples` (alias: `ex`), `/ci bench` (alias: `benches`), or `/ci bench-mt-ladder [ladder]` (default ladder `2,4,0`).',
+              ].join('\n');
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr,
+                body: usage,
+              });
+              core.setFailed(usage);
+              return;
+            }
+            const inputs = { pr_number: String(pr) };
+            // `/ci bench-mt-ladder [ladder]`: pass the optional ladder (default 2,4,0) so
+            // bench.yml runs the thread scaling sweep + scaling report instead of vs-main.
+            if (target === 'bench-mt-ladder') {
+              inputs.mt_ladder = cp.slash_command.args.unnamed.arg2 || '2,4,0';
+            }
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: workflow,
+              ref: context.payload.repository.default_branch,
+              inputs,
+            });
+            core.info(`Dispatched ${workflow} for PR #${pr}`);

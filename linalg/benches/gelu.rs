@@ -1,3 +1,5 @@
+#![allow(clippy::excessive_precision)]
+
 use criterion::*;
 use tract_data::prelude::*;
 
@@ -12,6 +14,9 @@ fn gelu_f32(c: &mut Criterion) {
         *x = (i as f32 / 10.0).sin() * 5.0;
     }
     group.bench_function("rust_scalar", |b| b.iter(|| rust_scalar(input)));
+    group.bench_function("generic", |b| {
+        b.iter(|| tract_linalg::generic::gelu::generic_gelu_f32_4n::run(input, ()))
+    });
     group.bench_function("linalg", |b| b.iter(|| linalg(input)));
     #[cfg(target_arch = "aarch64")]
     group.bench_function("linalg-asm-compose", |b| {
@@ -37,7 +42,7 @@ fn rust_scalar(input: &mut [f32]) {
 
 #[inline(never)]
 fn linalg(input: &mut [f32]) {
-    (tract_linalg::ops().gelu_f32)().run(input).unwrap();
+    tract_linalg::routines::Func::Gelu.ew_f32().unwrap().run(input).unwrap();
 }
 
 criterion_group!(benches, gelu_f32);

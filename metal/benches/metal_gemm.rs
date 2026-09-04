@@ -1,53 +1,12 @@
 use crate::matmul::{BasicMatMul, GemmImpl, GemmKernel, MfaGemm, MlxGemm};
 use criterion::measurement::WallTime;
 use criterion::*;
-use ggml::Context;
 use tract_core::internal::*;
 use tract_gpu::tensor::IntoDevice;
 use tract_linalg::mmm::AsInputValue;
 use tract_metal::MetalStream;
 use tract_metal::kernels::matmul::GgmlGemm;
 use tract_metal::kernels::{LibraryName, matmul};
-
-pub fn ggml_matmul(
-    crit: &mut BenchmarkGroup<WallTime>,
-    m: usize,
-    k: usize,
-    n: usize,
-    dt: DatumType,
-) {
-    let ggml_dt = match dt {
-        DatumType::F32 => ggml::Type::F32,
-        DatumType::F16 => ggml::Type::F16,
-        _ => unimplemented!(),
-    };
-
-    let ctxt = Context::new_with_allocate(500_000_000);
-
-    let mut t = ctxt.new_tensor_3d(ggml_dt, 1, 2, 3);
-    t.zero_data();
-
-    let mut a = ctxt.new_tensor_2d(ggml_dt, k, m);
-    a.zero_data();
-    let mut b = ctxt.new_tensor_2d(ggml_dt, k, n); // intern transposition
-    b.zero_data();
-
-    crit.bench_function(&format!("ggml_{:?}", dt), |be| {
-        be.iter(|| {
-            let ctxt = Context::new_with_allocate(500_000_000);
-            let mut a = ctxt.new_tensor_2d(ggml_dt, k, m);
-            a.zero_data();
-            let mut b = ctxt.new_tensor_2d(ggml_dt, k, n); // intern transposition
-            b.zero_data();
-            let c = ctxt.op_mul_mat(&a, &b);
-            let mut graph = ctxt.create_compute_graph();
-            graph.build_forward_expand(&c);
-
-            let mut execution_plan = ggml::GraphExecutionPlan::new(&mut graph, 1);
-            execution_plan.execute(&ctxt);
-        });
-    });
-}
 
 pub fn tract_with_packing(
     crit: &mut BenchmarkGroup<WallTime>,
@@ -64,7 +23,7 @@ pub fn tract_with_packing(
 
     // mk,kn -> mn
     unsafe {
-        let mmm = tract_linalg::ops().mmm(dt, Some(m), Some(k), Some(n)).unwrap();
+        let mmm = tract_linalg::MmmDispatch::native().mmm(dt, Some(m), Some(k), Some(n)).unwrap();
 
         let c_storage = mmm.c_view(Some(0), Some(1));
 
@@ -72,7 +31,7 @@ pub fn tract_with_packing(
 
         let (packer_a, packer_b) = &mmm.packings()[0];
 
-        crit.bench_function(&format!("tract_with_packing_{:?}", dt), |be| {
+        crit.bench_function(format!("tract_with_packing_{:?}", dt), |be| {
             let packed_a = packer_a.prepare_one(&a, 1, 0).unwrap();
             let packed_b = packer_b.prepare_one(&b, 0, 1).unwrap();
 
@@ -87,7 +46,7 @@ pub fn tract_with_packing(
                             a: AsInputValue::Borrowed(&(*packed_a)),
                             b: AsInputValue::Borrowed(&(*packed_b)),
                         },
-                        FusedSpec::Store(c_storage.wrap(&mut c.view_mut())),
+                        FusedSpec::Store(c_storage.wrap(&c.view_mut())),
                     ],
                 )
                 .unwrap()
@@ -120,7 +79,7 @@ pub fn metal_gemm<K: GemmKernel>(
     // Warmup
     let _ = GemmImpl::<MfaGemm>::default().eval(&stream, &metal_a, &metal_b).unwrap();
 
-    crit.bench_function(&format!("tract_metal_gemm_{}_{:?}", K::name(), dt), |be| {
+    crit.bench_function(format!("tract_metal_gemm_{}_{:?}", K::name(), dt), |be| {
         be.iter(|| {
             let _ = GemmImpl::<K>::new(false, is_ggml).eval(&stream, &metal_a, &metal_b).unwrap();
         });
@@ -130,7 +89,6 @@ pub fn metal_gemm<K: GemmKernel>(
 fn matmul(c: &mut Criterion, b: usize, m: usize, k: usize, n: usize) {
     let mut c = c.benchmark_group(format!("{}x{}x{}x{}", b, m, k, n));
     c.throughput(Throughput::Elements((m * k * n) as _));
-    // ggml_matmul(&mut c, m, k, n, f32::datum_type());
 
     for dt in [f32::datum_type(), f16::datum_type()] {
         metal_gemm::<BasicMatMul>(&mut c, b, m, k, n, dt, false);
@@ -138,7 +96,6 @@ fn matmul(c: &mut Criterion, b: usize, m: usize, k: usize, n: usize) {
         metal_gemm::<MfaGemm>(&mut c, b, m, k, n, dt, false);
         metal_gemm::<GgmlGemm>(&mut c, b, m, k, n, dt, true);
     }
-    // ggml_matmul(&mut c, m, k, n, f16::datum_type());
     // tract_with_packing(&mut c, b, m, k, n, f32::datum_type());
     //tract_with_packing(&mut c, b, m, k, n, f16::datum_type());
     c.finish();

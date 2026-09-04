@@ -1,27 +1,5 @@
 use crate::internal::*;
 
-#[derive(Debug, Clone, new)]
-pub struct SourceState(pub usize);
-trivial_op_state_freeze!(SourceState);
-
-impl OpState for SourceState {
-    fn eval(
-        &mut self,
-        session: &mut TurnState,
-        _op: &dyn Op,
-        _inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
-        Ok(tvec!(
-            session
-                .values
-                .get(self.0)
-                .and_then(|v| v.as_ref())
-                .and_then(|vs| vs.first().cloned())
-                .with_context(|| format!("Input for node {} is missing", self.0))?
-        ))
-    }
-}
-
 #[derive(Debug, Clone, new, Hash, PartialEq, Eq)]
 pub struct TypedSource {
     pub fact: TypedFact,
@@ -35,12 +13,11 @@ impl Op for TypedSource {
 }
 
 impl EvalOp for TypedSource {
-    fn is_stateless(&self) -> bool {
-        false
-    }
+    not_out_of_plan!();
 
-    fn state(&self, _session: &TurnState, node_id: usize) -> TractResult<Option<Box<dyn OpState>>> {
-        Ok(Some(Box::new(SourceState(node_id))))
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        ensure!(!inputs.is_empty(), "Input for node {} is missing", ctx.node_id);
+        Ok(inputs)
     }
 }
 
@@ -66,7 +43,7 @@ impl TypedOp for TypedSource {
         )))
     }
 
-    fn substitute_symbols(
+    fn set_symbols(
         &self,
         _source: &TypedModel,
         node: &TypedNode,

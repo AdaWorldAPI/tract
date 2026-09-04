@@ -3,7 +3,6 @@ use std::str::FromStr;
 use tract_nnef::internal::*;
 use tract_nnef::prelude::tract_itertools::Itertools;
 use tract_nnef::ser::{datum_type, tdims};
-use tract_nnef::tract_core::ops::OpStateFreeze;
 use tract_nnef::tract_core::ops::array::TypedConcat;
 use tract_nnef::tract_core::ops::source::TypedSource;
 
@@ -146,6 +145,10 @@ impl OpState for DynKeyValueCacheState {
         Some((self.name.clone(), self.past_sequence_fact.clone()))
     }
 
+    fn has_init_tensor_fact(&self) -> bool {
+        true
+    }
+
     fn resolve_symbols(&mut self, state: &mut TurnState) -> TractResult<()> {
         let shape = self.kv_cache.as_ref().map(|kv_cache| kv_cache.shape());
         Self::resolve_symbols(state, self.past_sequence_fact.clone(), shape)
@@ -153,20 +156,26 @@ impl OpState for DynKeyValueCacheState {
 
     fn eval(
         &mut self,
-        _state: &mut TurnState,
+        _ctx: &EvalContext,
         _op: &dyn Op,
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs);
         // build output
         let output = if let Some(curr) = self.kv_cache.take() {
-            TypedConcat { axis: self.axis }.eval(tvec![curr, input])?.remove(0)
+            TypedConcat { axis: self.axis }
+                .eval(&EvalContext::out_of_plan(), tvec![curr, input])?
+                .remove(0)
         } else {
             input
         };
         self.kv_cache = Some(output.clone());
 
         Ok(tvec!(output))
+    }
+
+    fn reset_lanes(&mut self, _lanes: &[LaneId]) -> TractResult<()> {
+        bail!("DynKeyValueCache is not lane-aware: the cache has no lane axis")
     }
 }
 
@@ -187,15 +196,9 @@ impl Op for DynKeyValueCache {
 }
 
 impl EvalOp for DynKeyValueCache {
-    fn is_stateless(&self) -> bool {
-        false
-    }
+    not_out_of_plan!();
 
-    fn state(
-        &self,
-        _session: &TurnState,
-        _node_id: usize,
-    ) -> TractResult<Option<Box<dyn OpState>>> {
+    fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(Some(Box::new(DynKeyValueCacheState {
             name: self.name.clone(),
             axis: self.axis,
@@ -232,45 +235,6 @@ impl TypedOp for DynKeyValueCache {
     }
 
     as_op!();
-}
-
-#[derive(Debug, Clone)]
-pub struct FrozenDynKeyValueCacheState {
-    name: String,
-    axis: usize,
-    past_sequence_fact: TypedFact,
-    kv_cache: Option<Tensor>,
-}
-
-impl OpStateFreeze for DynKeyValueCacheState {
-    fn freeze(&self) -> Box<dyn FrozenOpState> {
-        Box::new(FrozenDynKeyValueCacheState {
-            name: self.name.clone(),
-            axis: self.axis,
-            past_sequence_fact: self.past_sequence_fact.clone(),
-            kv_cache: self.kv_cache.clone().map(|t| t.into_tensor()),
-        })
-    }
-
-    fn freeze_into(self: Box<Self>) -> Box<dyn FrozenOpState> {
-        Box::new(FrozenDynKeyValueCacheState {
-            name: self.name,
-            axis: self.axis,
-            past_sequence_fact: self.past_sequence_fact,
-            kv_cache: self.kv_cache.map(|t| t.into_tensor()),
-        })
-    }
-}
-
-impl FrozenOpState for FrozenDynKeyValueCacheState {
-    fn unfreeze(&self) -> Box<dyn OpState> {
-        Box::new(DynKeyValueCacheState {
-            axis: self.axis,
-            name: self.name.clone(),
-            past_sequence_fact: self.past_sequence_fact.clone(),
-            kv_cache: self.kv_cache.clone().map(|t| t.into_tvalue()),
-        })
-    }
 }
 
 /// Reverse of `replace_kv_cache`: replaces a DynKeyValueCache node with Source + Concat,
@@ -459,8 +423,8 @@ mod tests {
             axis,
         };
 
-        let mut session_state = TurnState::default();
-        let mut state = op.state(&mut session_state, 0)?.unwrap();
+        let mut turn = TurnState::default();
+        let mut state = op.state(&EvalContext::out_of_plan())?.unwrap();
 
         let mut inputs = tvec![];
 
@@ -472,13 +436,13 @@ mod tests {
 
         let mut state_initializers = vec![input.into()].into_iter();
 
-        state.load_from(&mut session_state, &mut state_initializers)?;
+        state.load_from(&mut turn, &mut state_initializers)?;
 
         for shape in input_shapes {
             let len = shape.iter().product::<usize>();
-            let input = Tensor::from_shape(&shape, &(0..len).map(|f| f.as_()).collect::<Vec<F>>())?;
+            let input = Tensor::from_shape(shape, &(0..len).map(|f| f.as_()).collect::<Vec<F>>())?;
             inputs.push(input.clone().into_tvalue());
-            state.eval(&mut session_state, &op, tvec!(input.clone().into()))?[0]
+            state.eval(&EvalContext::out_of_plan(), &op, tvec!(input.clone().into()))?[0]
                 .clone()
                 .into_tensor();
         }
@@ -487,7 +451,7 @@ mod tests {
         state.save_to(&mut curr_states)?;
         let output = curr_states.remove(0);
 
-        let reference = &TypedConcat { axis }.eval(inputs)?[0];
+        let reference = &TypedConcat { axis }.eval(&EvalContext::out_of_plan(), inputs)?[0];
         output.close_enough(&reference.clone().into_tensor(), Approximation::Close)?;
         Ok(())
     }
@@ -497,6 +461,28 @@ mod tests {
         run_test_case::<f32>(&[vec![2, 2]], 0)?;
         run_test_case::<f32>(&[vec![2, 2], vec![4, 2]], 0)?;
         run_test_case::<f32>(&[vec![2, 2], vec![2, 1], vec![2, 3]], 1)?;
+        Ok(())
+    }
+
+    // Guards against `has_init_tensor_fact` (the allocation-free predicate used
+    // on the per-run symbol-resolution hot path) drifting out of sync with
+    // `init_tensor_fact`. If they disagree, `resolve_symbols` would silently stop
+    // running for this op.
+    #[test]
+    fn has_init_tensor_fact_matches_init_tensor_fact() -> TractResult<()> {
+        let model = TypedModel::default();
+        let past: TVec<TDim> = tvec![1.to_dim(), model.sym("P").into(), 64.to_dim()];
+        let input: TVec<TDim> = tvec![1.to_dim(), model.sym("S").into(), 64.to_dim()];
+        let op = DynKeyValueCache {
+            name: "kv_cache_0".to_string(),
+            axis: 1,
+            past_sequence_fact: f32::fact(&past),
+            input_sequence_fact: f32::fact(&input),
+        };
+        let _turn = TurnState::default();
+        let state = op.state(&EvalContext::out_of_plan())?.unwrap();
+        assert!(state.has_init_tensor_fact());
+        assert_eq!(state.has_init_tensor_fact(), state.init_tensor_fact().is_some());
         Ok(())
     }
 

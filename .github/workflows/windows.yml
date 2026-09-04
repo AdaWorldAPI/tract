@@ -9,6 +9,9 @@ on:
 
 env:
   CARGO_INCREMENTAL: false
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_MULTIPLEXING: false
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE20: true
 
 permissions:
@@ -25,10 +28,10 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
-    - uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4
+    - uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
       name: Install Rustup using win.rustup.rs
       with:
         timeout_minutes: 10
@@ -39,7 +42,7 @@ jobs:
             $ProgressPreference = "SilentlyContinue"
             Invoke-WebRequest https://win.rustup.rs/ -OutFile rustup-init.exe
             .\rustup-init.exe -y --default-host=x86_64-pc-windows-msvc --profile=minimal
-    - uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4
+    - uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
       name: Install the target
       with:
         timeout_minutes: 10
@@ -48,8 +51,12 @@ jobs:
         command: |
             rustup toolchain add stable-x86_64-pc-windows-${{matrix.toolchain}}
             rustup default stable-x86_64-pc-windows-${{matrix.toolchain}}
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        key: ${{ matrix.toolchain }}
+        save-if: ${{ github.ref == 'refs/heads/main' }} # PR runs restore but don't save
     - name: Install LLVM and Clang
-      uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2
+      uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
       with:
         version: "11.0"
     - name: debug
@@ -63,9 +70,9 @@ jobs:
       env:
         LIBCLANG_PATH: "C:\\Program Files\\LLVM\\bin"
     - name: data / linalg / core / nnef / onnx / onnx-opl
-      run: cargo test -p tract-data -p tract-linalg -p tract-core -p tract-nnef -p tract-onnx -p tract-onnx-opl
+      run: cargo test -q -p tract-data -p tract-linalg -p tract-core -p tract-nnef -p tract-onnx -p tract-onnx-opl
     - name: Onnx test suite
       run: |
-          cargo test --release -p test-onnx-core -p test-unit-core
+          cargo test -q --release -p test-onnx-core -p test-unit-core
       env:
         TRACT_LOG: info

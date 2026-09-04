@@ -9,7 +9,7 @@ use crate::ops::cast::cast;
 use crate::ops::math::add;
 use crate::ops::matmul::ModePicker;
 use crate::ops::matmul::optimized::{
-    AddMatMulGeometry, MapOutputAxisToInput, OptMatMul, ProtoFusedSpec,
+    AddMatMulGeometry, MapOutputAxisToInput, MatMulOperand, OptMatMul, ProtoFusedSpec,
 };
 use crate::ops::matmul::pack::{OptMatMulPack, OptSimpleMatMulPack};
 use crate::ops::matmul::quant::{
@@ -20,6 +20,7 @@ use crate::ops::nn::{Reduce, Reducer};
 pub fn merge_consecutive_same_role_axes(model: &mut TypedModel) -> TractResult<()> {
     Rewriter::default()
         .with_rule_for("merge-same-role-axes", merge_same_role_axes_rule)
+        .with_rule_for("push-reshape-below-binop", push_reshape_below_binop_rule)
         .rewrite(&(), model)
 }
 
@@ -64,7 +65,7 @@ fn merge_same_role_axes_rule(
             .position(|x| x == c)
             .map(|p| &input_shapes[0][p])
             .or_else(|| b_order.iter().position(|x| x == c).map(|p| &input_shapes[1][p]));
-        dim.map_or(true, |d| d.as_i64() != Some(1))
+        dim.is_none_or(|d| d.as_i64() != Some(1))
     };
 
     // Find first group of 2+ same-role axes that are consecutive in all inputs.
@@ -111,7 +112,7 @@ fn merge_same_role_axes_rule(
                 group.push(candidate);
                 j += 1;
             }
-            if group.len() >= 2 && best_group.as_ref().map_or(true, |bg| group.len() > bg.len()) {
+            if group.len() >= 2 && best_group.as_ref().is_none_or(|bg| group.len() > bg.len()) {
                 best_group = Some(group);
             }
             i = j;
@@ -234,8 +235,8 @@ fn merge_same_role_axes_rule(
                 }
             }
             // Find what moves are needed to get from unmerged_adj to c_order
-            for target_pos in 0..c_order.len() {
-                let cur_pos = unmerged_adj.iter().position(|&c| c == c_order[target_pos]).unwrap();
+            for (target_pos, &c_target) in c_order.iter().enumerate() {
+                let cur_pos = unmerged_adj.iter().position(|&c| c == c_target).unwrap();
                 if cur_pos != target_pos {
                     result[0] = patch.wire_node(
                         format!("{node_name}.restore_out_{target_pos}"),
@@ -368,6 +369,68 @@ fn merge_same_role_axes_rule(
     Ok(None)
 }
 
+/// Slides a `Reshape` past a following binary so a matmul's epilogue — the
+/// summed partial products of a concat-split matmul, the per-channel BatchNorm
+/// affine, the Relu — sits directly on the matmul output and can be fused.
+/// `merge-same-role-axes` folds spatial axes into the matmul M axis and splits
+/// them back with an `unmerge_out` reshape; that split touches only the merged
+/// axis. Two operand shapes ride through it:
+/// - a per-channel constant, which broadcasts over the merged axis (extent 1),
+///   re-shaped through the split — trivial, since those extents are 1;
+/// - the identically-reshaped output of a sibling matmul, where
+///   `reshape(a) ∘ reshape(b) == reshape(a ∘ b)` lets the reshape hoist below
+///   the binary and the accumulation happen in merged space.
+fn push_reshape_below_binop_rule(
+    _ctx: &(),
+    model: &TypedModel,
+    node: &TypedNode,
+    node_name: &str,
+    op: &AxisOp,
+) -> TractResult<Option<TypedModelPatch>> {
+    let AxisOp::Reshape(at, from_dims, to_dims) = op else { return Ok(None) };
+    rule_if!(node.outputs.len() == 1);
+    rule_if!(node.outputs[0].successors.len() == 1);
+    rule_if!(!model.output_outlets()?.contains(&node.id.into()));
+
+    let inlet = node.outputs[0].successors[0];
+    let succ = model.node(inlet.node);
+    rule_if!(succ.inputs.len() == 2);
+    rule_if_some!(binop = succ.op_as::<crate::ops::binary::TypedBinOp>());
+    rule_if!(binop.0.as_linalg_binop().is_some());
+    let other = succ.inputs[1 - inlet.slot];
+
+    let mut patch = TypedModelPatch::new(format!("push {node} below {succ}"));
+    let act = patch.tap_model(model, node.inputs[0])?;
+
+    let sibling = if let Some(k) = model.outlet_fact(other)?.konst.clone() {
+        let at = *at;
+        let (from_len, to_len) = (from_dims.len(), to_dims.len());
+        let kshape = k.shape();
+        rule_if!(at + to_len <= kshape.len());
+        rule_if!(kshape[at..at + to_len].iter().all(|&d| d == 1));
+        let mut new_shape: TVec<usize> = kshape[..at].iter().copied().collect();
+        new_shape.extend(std::iter::repeat_n(1, from_len));
+        new_shape.extend(kshape[at + to_len..].iter().copied());
+        let k = k.as_ref().clone().into_shape(&new_shape)?;
+        patch.add_const(format!("{}.through_reshape", model.node(other.node).name), k)?
+    } else {
+        let other_node = model.node(other.node);
+        rule_if!(other_node.op_as::<AxisOp>() == Some(op));
+        patch.tap_model(model, other_node.inputs[0])?
+    };
+
+    let operands = if inlet.slot == 0 { [act, sibling] } else { [sibling, act] };
+    let applied = crate::ops::change_axes::wire_with_rank_broadcast(
+        format!("{}.prefused", succ.name),
+        &mut patch,
+        binop.clone(),
+        &operands,
+    )?;
+    let reshaped = patch.wire_node(format!("{node_name}.pushed"), op.clone(), &applied)?;
+    patch.shunt_outside(model, inlet.node.into(), reshaped[0])?;
+    Ok(Some(patch))
+}
+
 pub fn detect_all(model: &mut TypedModel) -> TractResult<()> {
     Rewriter::default().with_rule_for("detect-matmul-einsum", detect_rule).rewrite(&(), model)
 }
@@ -462,16 +525,9 @@ impl Op for EinSumMatMul {
 }
 
 impl EvalOp for EinSumMatMul {
-    fn is_stateless(&self) -> bool {
-        true
-    }
-    fn eval_with_session(
-        &self,
-        node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
-        self.op.eval_with_session(node_id, session, inputs)
+    op_out_of_plan!();
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        self.op.eval(ctx, inputs)
     }
 }
 
@@ -691,7 +747,7 @@ pub(super) fn regroup_k_axes(
                 AxesMapping::from_strs(&[&exprs[slot]], &[&after])?.translate_to_axis_ops()?;
             for (ix, op) in transpose.into_iter().enumerate() {
                 wires[slot] = patch.wire_node(
-                    format!("{}.transpose_input_{}.{}", &node.name, slot, ix),
+                    format!("{}.transpose_input_{}.{}", node.name, slot, ix),
                     op,
                     &[wires[slot]],
                 )?[0];
@@ -700,7 +756,7 @@ pub(super) fn regroup_k_axes(
         }
         let pos = exprs[slot].chars().position(|c| k_axes[0].repr == c).unwrap();
         wires[slot] = patch.wire_node(
-            format!("{}.fold_k_in_input_{}", &node.name, slot),
+            format!("{}.fold_k_in_input_{}", node.name, slot),
             AxisOp::Reshape(pos, k_dims.clone(), tvec!(k.clone())),
             &[wires[slot]],
         )?[0];
@@ -950,8 +1006,8 @@ fn optimized_mat_mul(
         vec![
             ProtoFusedSpec::AddMatMul {
                 geo,
-                a: 0,
-                b: 1,
+                a: MatMulOperand::Input(0),
+                b: MatMulOperand::Input(1),
                 packings: izip!(packings, extractor).collect_vec(),
             },
             ProtoFusedSpec::Store(outputs),

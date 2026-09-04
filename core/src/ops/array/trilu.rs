@@ -14,11 +14,9 @@ impl Op for Trilu {
 }
 
 impl EvalOp for Trilu {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (input, k) = args_2!(inputs);
         let mut input = input.into_tensor();
         let k = *k.try_as_plain()?.to_scalar::<i64>()?;

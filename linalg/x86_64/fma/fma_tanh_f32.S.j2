@@ -274,9 +274,9 @@ fma_tanh_f32_{{suffix}} proc
 {% set float %}{% if msvc %} real4 {%else%} .float {%endif%}{% endset %}
 
 {{L}}coeffs_num_low:
-    {{float}} -8.9
+    {{float}} -7.5
 {{L}}coeffs_num_high:
-    {{float}} 8.9
+    {{float}} 7.5
 
 {{L}}coeffs_num_alpha_13:
     {{float}} -8.488492677e-14
@@ -301,8 +301,6 @@ fma_tanh_f32_{{suffix}} proc
     {{float}} 0.4641733162
 {{L}}coeffs_num_beta_0:
     {{float}} 1.0
-
-
 
 {% if msvc %}
 fma_tanh_f32_{{suffix}} endp

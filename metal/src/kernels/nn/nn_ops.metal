@@ -25,10 +25,19 @@ METAL_FUNC uint indices_to_idx_4(uint3 indices, constant const size_t shape[4],
     return idx;
 }
 
+// simd_reduce applies any normalization and must run exactly once, on the final accumulator.
+// A multi-simdgroup reduction folds its per-simdgroup accumulators with simd_accumulate and
+// combine, which merge already-accumulated values and never normalize.
 template <typename U> struct MeanOfSquares {
+    typedef float acc_t;
+
     float simd_reduce(float val, size_t reduce_dim) {
         return simd_sum(val) / static_cast<float>(reduce_dim);
     }
+
+    float simd_accumulate(float val) { return simd_sum(val); }
+
+    float combine(float a, float b) { return a + b; }
 
     static constexpr constant float init = 0.0;
 
@@ -40,7 +49,13 @@ template <typename U> struct MeanOfSquares {
 };
 
 template <typename U> struct Sum {
+    typedef U acc_t;
+
     U simd_reduce(U val, size_t reduce_dim) { return simd_sum(val); }
+
+    U simd_accumulate(U val) { return simd_sum(val); }
+
+    U combine(U a, U b) { return a + b; }
 
     static constexpr constant U init = U(0);
 
@@ -49,9 +64,15 @@ template <typename U> struct Sum {
 };
 
 template <typename U> struct Min {
+    typedef U acc_t;
+
     template <typename T> T simd_reduce(T val, size_t reduce_dim) {
         return simd_min(val);
     }
+
+    U simd_accumulate(U val) { return simd_min(val); }
+
+    U combine(U a, U b) { return a < b ? a : b; }
 
     static constexpr constant U init = metal::numeric_limits<U>::infinity();
 
@@ -60,9 +81,15 @@ template <typename U> struct Min {
 };
 
 template <typename U> struct Max {
+    typedef U acc_t;
+
     template <typename T> T simd_reduce(T val, size_t reduce_dim) {
         return simd_max(val);
     }
+
+    U simd_accumulate(U val) { return simd_max(val); }
+
+    U combine(U a, U b) { return a > b ? a : b; }
 
     static constexpr constant U init = -metal::numeric_limits<U>::infinity();
 
@@ -71,7 +98,13 @@ template <typename U> struct Max {
 };
 
 template <typename U> struct Prod {
+    typedef U acc_t;
+
     U simd_reduce(U val, size_t reduce_dim) { return simd_product(val); }
+
+    U simd_accumulate(U val) { return simd_product(val); }
+
+    U combine(U a, U b) { return a * b; }
 
     static constexpr constant U init = U(1);
 
@@ -80,7 +113,13 @@ template <typename U> struct Prod {
 };
 
 template <typename U> struct All {
+    typedef U acc_t;
+
     U simd_reduce(U val, size_t reduce_dim) { return simd_all(val); }
+
+    U simd_accumulate(U val) { return simd_all(val); }
+
+    U combine(U a, U b) { return a && b; }
 
     static constexpr constant U init = U(1);
 
@@ -89,7 +128,13 @@ template <typename U> struct All {
 };
 
 template <typename U> struct Any {
+    typedef U acc_t;
+
     U simd_reduce(U val, size_t reduce_dim) { return simd_any(val); }
+
+    U simd_accumulate(U val) { return simd_any(val); }
+
+    U combine(U a, U b) { return a || b; }
 
     static constexpr constant U init = U(0);
 
@@ -97,46 +142,94 @@ template <typename U> struct Any {
     U operator()(U acc, U a) { return acc || a; }
 };
 
-template <typename F, typename Op>
+// IdxT is uint unless the tensor holds more than u32::MAX elements; the host picks the matching
+// instantiation. Apple GPUs emulate 64-bit integer arithmetic, so the narrow form matters for
+// reductions short enough that address computation dominates.
+template <typename F, typename Op, typename IdxT>
 [[kernel]] void reduce_nd3(device const void *input_b, device void *output_b,
                            constant const size_t input_shape[3],
                            constant const size_t input_strides[3],
                            constant const size_t output_strides[3],
                            uint3 tgpig [[threadgroup_position_in_grid]],
                            uint tiisg [[thread_index_in_simdgroup]],
-                           uint tpsg [[threads_per_simdgroup]]) {
+                           uint tpsg [[threads_per_simdgroup]],
+                           uint sgitg [[simdgroup_index_in_threadgroup]],
+                           uint3 ntg [[threads_per_threadgroup]]) {
 
     device const F *input = (device const F *)input_b;
     device F *output = (device F *)output_b;
 
     Op op = Op();
 
-    size_t reduce_dim = input_shape[1];
+    IdxT reduce_dim = input_shape[1];
+    IdxT stride = input_strides[1];
 
-    size_t out_idx = tgpig.x * output_strides[2] + tgpig.y * output_strides[1] +
-                     tgpig.z * output_strides[0];
+    IdxT out_idx = IdxT(tgpig.x) * IdxT(output_strides[2]) +
+                   IdxT(tgpig.y) * IdxT(output_strides[1]) +
+                   IdxT(tgpig.z) * IdxT(output_strides[0]);
 
-    size_t base_in_idx =
-        tgpig.x * input_strides[2] + tgpig.z * input_strides[0];
+    device const F *row = input + IdxT(tgpig.x) * IdxT(input_strides[2]) +
+                          IdxT(tgpig.z) * IdxT(input_strides[0]);
+
+    IdxT nthreads = ntg.x;
+    IdxT tid = sgitg * tpsg + tiisg;
 
     auto partial_acc = Op::init;
-    for (size_t i = tiisg; i < reduce_dim; i += tpsg) {
-        F el = input[base_in_idx + i * input_strides[1]];
-        partial_acc = op(partial_acc, el);
+    if (stride == 1 && reduce_dim >= 256) {
+        IdxT blocks = reduce_dim / 4;
+        for (IdxT b = tid; b < blocks; b += nthreads) {
+            IdxT o = b * 4;
+            partial_acc = op(partial_acc, row[o]);
+            partial_acc = op(partial_acc, row[o + 1]);
+            partial_acc = op(partial_acc, row[o + 2]);
+            partial_acc = op(partial_acc, row[o + 3]);
+        }
+        for (IdxT i = blocks * 4 + tid; i < reduce_dim; i += nthreads) {
+            partial_acc = op(partial_acc, row[i]);
+        }
+    } else {
+        for (IdxT i = tid; i < reduce_dim; i += nthreads) {
+            partial_acc = op(partial_acc, row[i * stride]);
+        }
     }
-    auto acc = op.simd_reduce(partial_acc, reduce_dim);
 
+    if (nthreads <= tpsg) {
+        auto acc = op.simd_reduce(partial_acc, reduce_dim);
+        if (tiisg == 0) {
+            output[out_idx] = acc;
+        }
+        return;
+    }
+
+    // A threadgroup holds at most 1024 threads, so at most 32 simdgroups.
+    threadgroup typename Op::acc_t partials[32];
+    auto sg_acc = op.simd_accumulate(partial_acc);
     if (tiisg == 0) {
-        output[out_idx] = acc;
+        partials[sgitg] = sg_acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        uint nsg = (ntg.x + tpsg - 1) / tpsg;
+        auto acc = Op::init;
+        for (uint i = tiisg; i < nsg; i += tpsg) {
+            acc = op.combine(acc, partials[i]);
+        }
+        auto total = op.simd_reduce(acc, reduce_dim);
+        if (tiisg == 0) {
+            output[out_idx] = total;
+        }
     }
 }
 
-typedef decltype(reduce_nd3<float, Prod<float>>) reduce_nd3_t;
+typedef decltype(reduce_nd3<float, Prod<float>, uint>) reduce_nd3_t;
 
 #define INSTANTIATE_REDUCE(name, op, tname, type)                              \
-    template [[host_name(                                                      \
-        "nn_ops::reduce_" #name                                                \
-        "_nd3_" #tname)]] [[kernel]] reduce_nd3_t reduce_nd3<type, op<type>>;
+    template [[host_name("nn_ops::reduce_" #name "_nd3_" #tname)]] [[kernel]]   \
+    reduce_nd3_t reduce_nd3<type, op<type>, uint>;                             \
+    template [[host_name("nn_ops::reduce_" #name "_nd3_" #tname                 \
+                         "_large")]] [[kernel]] reduce_nd3_t                   \
+    reduce_nd3<type, op<type>, size_t>;
 
 INSTANTIATE_REDUCE(mean_of_squares, MeanOfSquares, f32, float)
 INSTANTIATE_REDUCE(mean_of_squares, MeanOfSquares, f16, half)
@@ -367,6 +460,57 @@ template [[host_name(
 template [[host_name(
     "nn_ops::softmax_nd3_f16")]] [[kernel]] softmax_nd3_t softmax_nd3<half>;
 
+// Fast path for softmax_nd3 restricted to a contiguous softmax axis
+// (strides[1]==1) whose length is a multiple of 4; the caller guarantees both
+// so the F4 loads stay in bounds and 16-byte aligned. F4 is F's 4-wide vector.
+template <typename F, typename F4>
+[[kernel]] void softmax_nd3_contig(device const void *input_b, device void *output_b,
+                                   constant const size_t shape[3],
+                                   constant const size_t strides[3],
+                                   uint3 tgpig [[threadgroup_position_in_grid]],
+                                   uint tiisg  [[thread_index_in_simdgroup]],
+                                   uint tpsg   [[threads_per_simdgroup]]) {
+    device const F *input = (device const F *)input_b;
+    device F *output = (device F *)output_b;
+    size_t dim = shape[1];
+    size_t base = tgpig.x * strides[2] + tgpig.z * strides[0];
+    device const F4 *in4 = (device const F4 *)(input + base);
+    device F4 *out4 = (device F4 *)(output + base);
+    uint vec_dim = (uint)dim >> 2;
+
+    float pmax = -INFINITY;
+    float psum = 0.0f;
+    for (uint v = tiisg; v < vec_dim; v += tpsg) {
+        float4 x = float4(in4[v]);
+        float vmax = max(max(x[0], x[1]), max(x[2], x[3]));
+        if (vmax > pmax) { psum *= fast::exp(pmax - vmax); pmax = vmax; }
+        psum += dot(fast::exp(x - pmax), float4(1.0f));
+    }
+    for (uint i = vec_dim * 4 + tiisg; i < (uint)dim; i += tpsg) {
+        float x = float(input[base + i]);
+        if (x > pmax) { psum *= fast::exp(pmax - x); pmax = x; }
+        psum += fast::exp(x - pmax);
+    }
+
+    float amax = simd_max(pmax);
+    float inv = 1.0f / simd_sum(psum * fast::exp(pmax - amax));
+
+    for (uint v = tiisg; v < vec_dim; v += tpsg) {
+        float4 x = float4(in4[v]);
+        out4[v] = F4(fast::exp(x - amax) * inv);
+    }
+    for (uint i = vec_dim * 4 + tiisg; i < (uint)dim; i += tpsg) {
+        output[base + i] = F(fast::exp(float(input[base + i]) - amax) * inv);
+    }
+}
+
+typedef decltype(softmax_nd3_contig<float, float4>) softmax_nd3_contig_f32_t;
+template [[host_name("nn_ops::softmax_nd3_contig_f32")]] [[kernel]]
+softmax_nd3_contig_f32_t softmax_nd3_contig<float, float4>;
+typedef decltype(softmax_nd3_contig<half, half4>) softmax_nd3_contig_f16_t;
+template [[host_name("nn_ops::softmax_nd3_contig_f16")]] [[kernel]]
+softmax_nd3_contig_f16_t softmax_nd3_contig<half, half4>;
+
 template <typename F>
 [[kernel]] void scaled_masked_softmax_nd5(
     device const void *input_b, device const void *mask_b,
@@ -456,7 +600,7 @@ template <typename F>
     // 2) exp(vals - max) and sum
     float sum = 0.0f;
     for (size_t col = (size_t)tid; col < cols; col += (size_t)tg_sz) {
-        float e = exp(vals[col] - max_val);
+        float e = fast::exp(vals[col] - max_val);
         vals[col] = e;
         sum += e;
     }
@@ -494,6 +638,126 @@ template [[host_name("nn_ops::scaled_masked_softmax_nd5_"
 template [[host_name("nn_ops::scaled_masked_softmax_nd5_"
                      "f16")]] [[kernel]] scaled_masked_softmax_nd5_t
     scaled_masked_softmax_nd5<half>;
+
+// Bool-mask variant: mask is uchar (0/1).  Masked positions are substituted
+// with -inf before softmax (so exp(-inf)=0 naturally zeroes them in the
+// output).  When post_mask is non-zero, fully-masked rows — whose softmax
+// would otherwise be NaN — are written as 0 instead.
+template <typename F>
+[[kernel]] void scaled_bool_masked_softmax_nd5(
+    device const void *input_b, device const void *mask_b,
+    constant float *scale_b, device void *output_b,
+    constant uint *post_mask_b, constant const size_t shape[5],
+    constant const size_t strides[5],
+    constant const size_t mask_strides[5],
+    constant const size_t out_strides[5],
+
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint tpsg [[threads_per_simdgroup]],
+    uint3 tptg [[thread_position_in_threadgroup]],
+    uint3 tptgN [[threads_per_threadgroup]],
+
+    threadgroup float *tgmem [[threadgroup(0)]]) {
+
+    const uint tid = tptg.x;
+    const uint tg_sz = tptgN.x;
+    const uint sg_id = tid / tpsg;
+    const uint lane = tiisg;
+
+    const size_t row = (size_t)tgpig.x;
+    const size_t h = (size_t)tgpig.y;
+    const size_t z = (size_t)tgpig.z;
+    const size_t z0 = z / shape[1];
+    const size_t z1 = z % shape[1];
+
+    device const F *x = (device const F *)input_b;
+    device const uchar *mask = (device const uchar *)mask_b;
+    device F *out = (device F *)output_b;
+
+    const float scale = *scale_b;
+    const bool post_mask = *post_mask_b != 0;
+
+    x += row * strides[3] + h * strides[2] + z1 * strides[1] + z0 * strides[0];
+    mask += row * mask_strides[3] + h * mask_strides[2] +
+            z1 * mask_strides[1] + z0 * mask_strides[0];
+    out += row * out_strides[3] + h * out_strides[2] + z1 * out_strides[1] +
+           z0 * out_strides[0];
+
+    threadgroup float *buf_iw = tgmem;
+    threadgroup float *vals = tgmem + 32;
+
+    const uint simd_size = tpsg;
+    const uint num_sg = (tg_sz + simd_size - 1u) / simd_size;
+    const size_t cols = shape[4];
+
+    // 1) Substitute -inf at masked positions, then take row max
+    float max_val = -INFINITY;
+    for (size_t col = (size_t)tid; col < cols; col += (size_t)tg_sz) {
+        const bool m = mask[col * mask_strides[4]] != 0;
+        const float xv = (float)x[col * strides[4]] * scale;
+        const float v = m ? xv : -INFINITY;
+        vals[col] = v;
+        max_val = metal::max(max_val, v);
+    }
+
+    float sg_max = simd_max(max_val);
+    if (lane == 0) {
+        buf_iw[sg_id] = sg_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_id == 0) {
+        float x0 = (lane < num_sg) ? buf_iw[lane] : -INFINITY;
+        float block_max = simd_max(x0);
+        if (lane == 0)
+            buf_iw[0] = block_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    max_val = buf_iw[0];
+
+    // 2) exp(vals - max) and row sum
+    float sum = 0.0f;
+    for (size_t col = (size_t)tid; col < cols; col += (size_t)tg_sz) {
+        float e = fast::exp(vals[col] - max_val);
+        vals[col] = e;
+        sum += e;
+    }
+
+    float sg_sum = simd_sum(sum);
+    if (lane == 0) {
+        buf_iw[sg_id] = sg_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_id == 0) {
+        float x0 = (lane < num_sg) ? buf_iw[lane] : 0.0f;
+        float block_sum = simd_sum(x0);
+        if (lane == 0)
+            buf_iw[0] = block_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum = buf_iw[0];
+
+    // Row-uniform: sum <= 0 (or NaN) iff every position was masked.  With
+    // post_mask we write 0 in that case to scrub the NaN; otherwise we let
+    // 1/sum propagate.
+    const bool zero_row = post_mask && !(sum > 0.0f);
+    const float inv_sum = 1.0f / sum;
+
+    for (size_t col = (size_t)tid; col < cols; col += (size_t)tg_sz) {
+        float y = zero_row ? 0.0f : vals[col] * inv_sum;
+        out[col * out_strides[4]] = (F)y;
+    }
+}
+
+typedef decltype(scaled_bool_masked_softmax_nd5<float>)
+    scaled_bool_masked_softmax_nd5_t;
+
+template [[host_name("nn_ops::scaled_bool_masked_softmax_nd5_"
+                     "f32")]] [[kernel]] scaled_bool_masked_softmax_nd5_t
+    scaled_bool_masked_softmax_nd5<float>;
+template [[host_name("nn_ops::scaled_bool_masked_softmax_nd5_"
+                     "f16")]] [[kernel]] scaled_bool_masked_softmax_nd5_t
+    scaled_bool_masked_softmax_nd5<half>;
 
 constant float GELU_COEF_A = 0.044715f;
 constant float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;

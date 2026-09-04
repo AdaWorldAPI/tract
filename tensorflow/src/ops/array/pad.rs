@@ -56,11 +56,9 @@ impl Op for Pad {
 }
 
 impl EvalOp for Pad {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (input, paddings) = args_2!(inputs);
         let paddings = paddings.to_plain_array_view::<i32>()?.into_dimensionality()?;
         Ok(tvec![dispatch_copy!(Self::compute_t(input.datum_type())(&input, paddings, None))?])
@@ -120,6 +118,6 @@ mod tests {
             .into()
         );
 
-        assert_eq!(Pad::new().eval(inputs).unwrap(), expected);
+        assert_eq!(Pad::new().eval(&EvalContext::out_of_plan(), inputs).unwrap(), expected);
     }
 }

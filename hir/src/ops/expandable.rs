@@ -54,7 +54,9 @@ pub trait Expansion:
         outputs: &'p [TensorProxy],
     ) -> InferenceResult;
 
-    fn is_stateless(&self) -> bool {
+    /// Whether this expansion's ad-hoc model can be evaluated with no plan around
+    /// it. Consulted by `EvalOp for Box<dyn Expansion>` before it builds one.
+    fn runs_out_of_plan(&self) -> bool {
         true
     }
 }
@@ -85,11 +87,15 @@ impl Op for Box<dyn Expansion> {
 }
 
 impl EvalOp for Box<dyn Expansion> {
-    fn is_stateless(&self) -> bool {
-        self.as_ref().is_stateless()
+    fn eval_out_of_plan(&self, inputs: TVec<TValue>) -> TractResult<Option<TVec<TValue>>> {
+        if self.as_ref().runs_out_of_plan() {
+            Ok(Some(self.eval(&EvalContext::out_of_plan(), inputs)?))
+        } else {
+            Ok(None)
+        }
     }
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let mut adhoc = TypedModel::default();
         let wires = inputs
             .iter()

@@ -2,8 +2,8 @@ target
 **/*.rs.bk
 *.rustfmt
 *.back
-Cargo.lock
 examples/data
+/*.tar.gz
 .idea
 .cached/**
 flamegraph.svg

@@ -90,7 +90,7 @@ impl Gather {
         launch_args.push::<i32>(post as i32);
         launch_args.push::<i32>(n_indices as i32);
 
-        let block_x = post.min(MAX_THREADS).max(32);
+        let block_x = post.clamp(32, MAX_THREADS);
         let grid_x = post.div_ceil(block_x);
         let cfg = LaunchConfig {
             grid_dim: (grid_x as _, n_indices as _, pre as _),
@@ -150,7 +150,10 @@ mod tests {
             let cuda_indices = indices.clone().into_device()?;
 
             let cpu_op = CpuGather::new(axis);
-            let cpu_out = cpu_op.eval(tvec![data.into_tvalue(), indices.into_tvalue()])?[0]
+            let cpu_out = cpu_op.eval(
+                &EvalContext::out_of_plan(),
+                tvec![data.into_tvalue(), indices.into_tvalue()],
+            )?[0]
                 .clone()
                 .into_tensor();
             let cuda_out = Gather.eval(stream, &cuda_data, &cuda_indices, axis)?;

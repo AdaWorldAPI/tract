@@ -20,15 +20,15 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        uses: dtolnay/rust-toolchain@stable # zizmor: ignore[unpinned-uses]
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -85,13 +85,16 @@ jobs:
               json.dump(versions, f, indent=2)
           "
 
-          # commit and push
+          # commit and push. actions/checkout ran with persist-credentials:
+          # false, so no auth is wired into .git/config — push via an
+          # explicit token URL instead.
           git add -A
           git commit -m "Update Python docs ($version)" || true
-          git push origin gh-pages
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
 
           # clean up worktree
           cd -
           git worktree remove "$workdir"
         env:
           STEPS_VERSION_OUTPUTS_VALUE: ${{ steps.version.outputs.value }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

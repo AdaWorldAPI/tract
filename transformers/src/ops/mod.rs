@@ -1,10 +1,19 @@
 pub mod apply_rope;
+mod cast_f32;
+pub mod causal_conv1d_update;
 pub mod diag_gather;
 pub mod dyn_kv_cache;
 pub mod flash_sdpa;
+pub mod gdn_recurrent;
+pub mod inplace_kv_cache;
+pub mod kv_quant;
+pub mod quant_dyn_kv_cache;
 pub mod scaled_masked_softmax;
 pub mod sdpa;
 pub mod streamed_sdpa;
+#[cfg(test)]
+mod test_utils;
+pub mod window_kv_cache;
 
 // Re-export ops that moved to core
 pub mod rms_norm {

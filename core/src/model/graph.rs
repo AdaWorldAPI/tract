@@ -172,6 +172,24 @@ where
         Ok(self)
     }
 
+    /// Set model inputs by node name — mirror of [`Self::select_outputs_by_name`].
+    /// Removed inputs become dangling Source nodes; declutter prunes them.
+    pub fn select_inputs_by_name(
+        &mut self,
+        inputs: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> TractResult<()> {
+        self.set_input_names(inputs)
+    }
+
+    /// Set model inputs by node name and return `self`.
+    pub fn with_inputs_by_name(
+        mut self,
+        inputs: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> TractResult<Self> {
+        self.select_inputs_by_name(inputs)?;
+        Ok(self)
+    }
+
     /// Get the `ix`-th input tensor type information.
     pub fn input_fact(&self, ix: usize) -> TractResult<&F> {
         let input = self.input_outlets()?[ix];
@@ -241,7 +259,7 @@ where
             self.outlet_labels.iter().map(|(o, s)| (Cow::Owned((*s).to_string()), *o)).collect();
         for n in self.nodes() {
             for ix in 0..n.outputs.len() {
-                labels.insert(Cow::Owned(format!("{}:{}", &n.name, ix)), OutletId::new(n.id, ix));
+                labels.insert(Cow::Owned(format!("{}:{}", n.name, ix)), OutletId::new(n.id, ix));
             }
         }
         let ids: Vec<OutletId> = outputs
@@ -382,7 +400,7 @@ where
 
     /// Get multiple mutable tensor information for outlets.
     pub fn outlets_fact_mut(&mut self, outlets: &[OutletId]) -> TractResult<TVec<&mut F>> {
-        assert!(outlets.iter().tuple_combinations().all(|(a, b)| a != b));
+        assert!(outlets.iter().array_combinations().all(|[a, b]| a != b));
         unsafe {
             outlets
                 .iter()

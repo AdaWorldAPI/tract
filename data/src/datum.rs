@@ -168,14 +168,14 @@ impl DatumType {
         i: impl IntoIterator<Item = impl std::borrow::Borrow<DatumType>>,
     ) -> Option<DatumType> {
         let mut iter = i.into_iter();
-        let mut current = match iter.next() {
-            None => return None,
-            Some(it) => *it.borrow(),
+        let mut current = {
+            let it = iter.next()?;
+            *it.borrow()
         };
         for n in iter {
-            match current.common_super_type(*n.borrow()) {
-                None => return None,
-                Some(it) => current = it,
+            {
+                let it = current.common_super_type(*n.borrow())?;
+                current = it
             }
         }
         Some(current)
@@ -283,7 +283,7 @@ impl DatumType {
     pub fn with_qparams(&self, qparams: QParams) -> DatumType {
         match self {
             DatumType::QI8(_) => DatumType::QI8(qparams),
-            DatumType::QU8(_) => DatumType::QI8(qparams),
+            DatumType::QU8(_) => DatumType::QU8(qparams),
             DatumType::QI32(_) => DatumType::QI32(qparams),
             _ => *self,
         }

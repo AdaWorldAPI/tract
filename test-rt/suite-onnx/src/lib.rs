@@ -21,6 +21,23 @@ const MANIFEST_SIMPLE: &str = include_str!("../simple.txt");
 const MANIFEST_PYTORCH_CONVERTED: &str = include_str!("../pytorch-converted.txt");
 const MANIFEST_PYTORCH_OPERATOR: &str = include_str!("../pytorch-operator.txt");
 
+/// `TRACT_ULP=<n>` swaps the suite's tolerance-based comparison for an integer ULP
+/// bound of `n`, measured in each output's own float type.
+///
+/// The tolerance the suite ships with is deliberately loose, because it has to
+/// cover every op and every runtime at once. When the question is "did this kernel
+/// change alter the numbers at all?", running the same suite under `TRACT_ULP=0`
+/// gives a bit-exactness check, and a small bound gives a sharp regression signal
+/// that a shared atol cannot express.
+fn ulp_override() -> Option<Approximation> {
+    let raw = std::env::var("TRACT_ULP").ok()?;
+    let bound = raw
+        .trim()
+        .parse::<u64>()
+        .unwrap_or_else(|e| panic!("TRACT_ULP must be a non-negative integer, got {raw:?}: {e}"));
+    Some(Approximation::Ulp(bound))
+}
+
 #[derive(Clone, Debug)]
 struct OnnxTestCase {
     path: PathBuf,
@@ -37,6 +54,7 @@ impl Test for OnnxTestCase {
         approx: Approximation,
     ) -> TractResult<()> {
         setup_test_logger();
+        let approx = ulp_override().unwrap_or(approx);
         let model_file = self.path.join("model.onnx");
         info!("Loading {model_file:?}");
         let mut onnx = tract_onnx::onnx();
@@ -148,7 +166,9 @@ fn versions() -> Vec<(&'static str, usize)> {
 }
 
 pub fn dir() -> PathBuf {
-    let cache = ::std::env::var("CACHEDIR").unwrap_or_else(|_| "../../.cached".to_string());
+    let cache = ::std::env::var("CACHEDIR").unwrap_or_else(|_| {
+        format!("{}/.cache/tract-test-assets", std::env::var("HOME").unwrap_or_default())
+    });
     std::fs::create_dir_all(&cache).unwrap();
     PathBuf::from(cache).join("onnx")
 }
@@ -165,8 +185,6 @@ pub fn ensure_onnx_git_checkout() {
         for (v, _) in versions() {
             let wanted = dir().join(format!("onnx-{}", v.replace('.', "_")));
             if !wanted.join("onnx/backend/test/data").exists() {
-                //let df = std::process::Command::new("df").arg("-h").output().unwrap();
-                //dbg!(df);
                 let tmp = wanted.with_extension("tmp");
                 let _ = std::fs::remove_dir_all(&wanted);
                 let _ = std::fs::remove_dir_all(&tmp);
@@ -300,8 +318,6 @@ fn run_model(
         );
     }
     for (ix, (a, b)) in computed.iter().zip(expected.iter()).enumerate() {
-        //                println!("computed: {:?}", computed[ix].dump(true));
-        //                println!("expected: {:?}", expected[ix].dump(true));
         if let Err(e) = a.close_enough(b, approx) {
             bail!(
                 "For {:?}, different ({approx:?}) result for output #{}:\ngot:\n{:?}\nexpected:\n{:?} \n{}",
@@ -309,7 +325,7 @@ fn run_model(
                 ix,
                 a.cast_to::<f32>().unwrap().to_plain_array_view::<f32>().unwrap(),
                 b.cast_to::<f32>().unwrap().to_plain_array_view::<f32>().unwrap(),
-                e //                e.display_chain()
+                e
             );
         }
     }

@@ -53,7 +53,7 @@ impl RotateHalf {
 
         let shape_nd2 = utils::reshape_to_rank_2(input.shape(), input.rank() - 1);
         ensure!(
-            shape_nd2[1] % 2 == 0,
+            shape_nd2[1].is_multiple_of(2),
             "Rotate half required most inner dimension to be a multiple of 2: {:?}",
             input.shape()
         );
@@ -115,8 +115,10 @@ mod tests {
 
             let metal_a = a.clone().into_device()?;
 
-            let cpu_output =
-                apply_rope::RotateHalf.eval(tvec![a.clone().into()])?[0].clone().into_tensor();
+            let cpu_output = apply_rope::RotateHalf
+                .eval(&EvalContext::out_of_plan(), tvec![a.clone().into()])?[0]
+                .clone()
+                .into_tensor();
             let metal_output = RotateHalf.eval(stream, &metal_a)?;
 
             cpu_output

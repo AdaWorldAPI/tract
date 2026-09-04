@@ -1,9 +1,14 @@
 use super::Factoid;
 use crate::infer::*;
 use std::fmt;
+use tract_core::optim::CONST_FOLD_MEM_BUDGET;
 use tract_data::TooEarly;
 
 tract_core::dyn_clone::clone_trait_object!(InferenceOp);
+
+fn tensor_mem(t: &Tensor) -> u64 {
+    (t.volume() * t.datum_type().size_of()) as u64
+}
 
 /// An operation with tensor type inference
 pub trait InferenceOp: Op {
@@ -17,6 +22,11 @@ pub trait InferenceOp: Op {
     /// also try to eval() the op if its a EvalOp and if the inputs are
     /// fully determined.
     ///
+    /// Facts carry no graph, so that eager eval cannot count a constant's
+    /// consumers: on top of holding the output within
+    /// [`CONST_FOLD_MEM_BUDGET`], it requires every input to be plain and
+    /// itself under the allowance.
+    ///
     /// Returns Err in case of an unrecoverable error during the inference,
     /// and the refined properties about the inputs and outputs otherwise.
     fn infer(
@@ -28,18 +38,29 @@ pub trait InferenceOp: Op {
         let (infered_inputs, infered_outputs, observed) =
             self.infer_facts(inputs, outputs, observed).context("Infering facts")?;
 
-        if self.is_stateless() && infered_inputs.iter().all(|i| i.value.is_concrete()) {
-            let input_values = infered_inputs
+        if infered_inputs.len() > 0
+            && let Some(input_values) = infered_inputs
                 .iter()
-                .map(|i| i.value.concretize().unwrap().into_tvalue())
-                .collect(); // checked
-            match self.eval(input_values) {
-                Ok(values) => {
-                    let output_values = values
-                        .into_iter()
-                        .map(|t| t.into_arc_tensor().try_into())
-                        .collect::<TractResult<TVec<_>>>()?;
-                    return Ok((infered_inputs, output_values, observed));
+                .map(|i| {
+                    i.value
+                        .concretize()
+                        .filter(|t| t.is_plain() && tensor_mem(t) <= CONST_FOLD_MEM_BUDGET)
+                        .map(|t| t.into_tvalue())
+                })
+                .collect::<Option<TVec<_>>>()
+        {
+            let input_mem: u64 = input_values.iter().map(|t| tensor_mem(t)).sum();
+            match self.eval_out_of_plan(input_values) {
+                Ok(None) => (),
+                Ok(Some(values)) => {
+                    let output_mem: u64 = values.iter().map(|t| tensor_mem(t)).sum();
+                    if output_mem <= input_mem.max(CONST_FOLD_MEM_BUDGET) {
+                        let output_values = values
+                            .into_iter()
+                            .map(|t| t.into_arc_tensor().try_into())
+                            .collect::<TractResult<TVec<_>>>()?;
+                        return Ok((infered_inputs, output_values, observed));
+                    }
                 }
                 Err(e) if e.root_cause().downcast_ref::<TooEarly>().is_some() => (),
                 Err(e) => return Err(e).context("Eager eval during inference"),
@@ -76,7 +97,7 @@ pub trait InferenceOp: Op {
     /// manifest with temporaries nodes that can run some form of inference but
     /// require refactoring the network before it can be evaluated.
     ///
-    /// Called after succesful analyse, but before translating to typed model.
+    /// Called after successful analyse, but before translating to typed model.
     #[allow(unused_variables)]
     fn incorporate(
         &self,

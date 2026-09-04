@@ -1,126 +1,13 @@
 use tract_nnef::internal::*;
+use tract_nnef::tract_core::ops::nn::resize::{
+    self, AxisPlan, CoordTransformer, Interpolator, cubic_weights, is_pixel_replication,
+    linear_weights, lower_nearest_integer_upsample, plan_axis, probe_length, resample_axis,
+    window_size,
+};
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub enum CoordTransformer {
-    HalfPixel,
-    AlignCorners,
-    Asymmetric,
-    PytorchHalfPixel,
-}
-
-impl CoordTransformer {
-    pub fn transform(&self, x_out: usize, scale: f32, len_in: usize, len_out: usize) -> f32 {
-        match self {
-            CoordTransformer::HalfPixel => (x_out as f32 + 0.5) / scale - 0.5,
-            CoordTransformer::AlignCorners => {
-                let output_width = scale * len_in as f32;
-                if output_width == 1.0 {
-                    0.0
-                } else {
-                    (x_out as f32 * (len_in as f32 - 1.0)) / (output_width - 1.0)
-                }
-            }
-            CoordTransformer::Asymmetric => (x_out as f32) / scale,
-            CoordTransformer::PytorchHalfPixel => {
-                if len_out > 1 {
-                    (x_out as f32 + 0.5) / scale - 0.5
-                } else {
-                    0.0
-                }
-            }
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            CoordTransformer::HalfPixel => "half_pixel",
-            CoordTransformer::AlignCorners => "align_corners",
-            CoordTransformer::Asymmetric => "asymmetric",
-            CoordTransformer::PytorchHalfPixel => "pytorch_half_pixel",
-        }
-    }
-
-    pub fn parse(s: &str) -> TractResult<Self> {
-        Ok(match s {
-            "half_pixel" => CoordTransformer::HalfPixel,
-            "align_corners" => CoordTransformer::AlignCorners,
-            "asymmetric" => CoordTransformer::Asymmetric,
-            "pytorch_half_pixel" => CoordTransformer::PytorchHalfPixel,
-            s => bail!("coordinate_transformation_mode: {s}"),
-        })
-    }
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub enum Interpolator {
-    Linear,
-    Nearest,
-    Cubic,
-}
-
-impl Interpolator {
-    pub fn interpolate(
-        &self,
-        y_left: f32,
-        y_right: f32,
-        x_ratio: f32,
-        nearest_mode: Nearest,
-    ) -> f32 {
-        match self {
-            Interpolator::Linear => y_left * (1.0 - x_ratio) + y_right * x_ratio,
-            Interpolator::Nearest => match nearest_mode {
-                Nearest::Floor => y_left,
-                Nearest::Ceil => y_right,
-                Nearest::RoundPreferFloor => {
-                    if x_ratio <= 0.5 {
-                        y_left
-                    } else {
-                        y_right
-                    }
-                }
-                Nearest::RoundPreferCeil => {
-                    if x_ratio < 0.5 {
-                        y_left
-                    } else {
-                        y_right
-                    }
-                }
-            },
-            Interpolator::Cubic => {
-                unreachable!("cubic interpolation uses a 4-tap kernel, not the 2-tap path")
-            }
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Interpolator::Linear => "linear",
-            Interpolator::Nearest => "nearest",
-            Interpolator::Cubic => "cubic",
-        }
-    }
-
-    pub fn parse(s: &str) -> TractResult<Self> {
-        Ok(match s {
-            "linear" => Interpolator::Linear,
-            "nearest" => Interpolator::Nearest,
-            "cubic" => Interpolator::Cubic,
-            s => bail!("mode: {s}"),
-        })
-    }
-}
-
-fn cubic_kernel(s: f32, a: f32) -> f32 {
-    let abs_s = s.abs();
-    if abs_s <= 1.0 {
-        (a + 2.0) * abs_s * abs_s * abs_s - (a + 3.0) * abs_s * abs_s + 1.0
-    } else if abs_s <= 2.0 {
-        a * abs_s * abs_s * abs_s - 5.0 * a * abs_s * abs_s + 8.0 * a * abs_s - 4.0 * a
-    } else {
-        0.0
-    }
-}
-
+/// Nearest-neighbour tie-breaking, the full ONNX set. `Floor` and
+/// `RoundPreferCeil` are also supported by `tract_core::ops::nn::resize`; the
+/// other two stay here in the ONNX edge-case op.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Nearest {
     Floor,
@@ -130,6 +17,15 @@ pub enum Nearest {
 }
 
 impl Nearest {
+    fn prefers_right(&self, x_ratio: f32) -> bool {
+        match self {
+            Nearest::Floor => false,
+            Nearest::Ceil => true,
+            Nearest::RoundPreferFloor => x_ratio > 0.5,
+            Nearest::RoundPreferCeil => x_ratio >= 0.5,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Nearest::Floor => "floor",
@@ -150,14 +46,70 @@ impl Nearest {
     }
 }
 
+/// ONNX `coordinate_transformation_mode`. Every mode but `tf_crop_and_resize`
+/// inverts without an input ROI and is shared with tract-core.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub enum CoordTransform {
+    Plain(CoordTransformer),
+    TfCropAndResize,
+}
+
+impl CoordTransform {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CoordTransform::Plain(t) => t.as_str(),
+            CoordTransform::TfCropAndResize => "tf_crop_and_resize",
+        }
+    }
+
+    pub fn parse(s: &str) -> TractResult<Self> {
+        Ok(match s {
+            "tf_crop_and_resize" => CoordTransform::TfCropAndResize,
+            s => CoordTransform::Plain(CoordTransformer::parse(s)?),
+        })
+    }
+}
+
+/// ONNX `keep_aspect_ratio_policy`: reconciles the requested `sizes` into a
+/// single scale shared by every resized axis. Ignored when `scales` drives the
+/// resize.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum AspectRatio {
+    Stretch,
+    NotLarger,
+    NotSmaller,
+}
+
+impl AspectRatio {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AspectRatio::Stretch => "stretch",
+            AspectRatio::NotLarger => "not_larger",
+            AspectRatio::NotSmaller => "not_smaller",
+        }
+    }
+
+    pub fn parse(s: &str) -> TractResult<Self> {
+        Ok(match s {
+            "stretch" => AspectRatio::Stretch,
+            "not_larger" => AspectRatio::NotLarger,
+            "not_smaller" => AspectRatio::NotSmaller,
+            s => bail!("keep_aspect_ratio_policy: {s}"),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Resize {
     pub axes: Option<Vec<i64>>,
-    pub coord_transformer: CoordTransformer,
+    pub coord_transformer: CoordTransform,
     pub interpolator: Interpolator,
     pub nearest: Nearest,
+    pub antialias: bool,
     pub cubic_coeff_a_bits: u32,
     pub exclude_outside: bool,
+    pub extrapolation_value_bits: u32,
+    pub keep_aspect_ratio_policy: AspectRatio,
     pub optional_roi_input: Option<usize>,
     pub optional_scales_input: Option<usize>,
     pub optional_sizes_input: Option<usize>,
@@ -167,45 +119,63 @@ impl Resize {
     pub fn cubic_coeff_a(&self) -> f32 {
         f32::from_bits(self.cubic_coeff_a_bits)
     }
-}
 
-impl Resize {
+    pub fn extrapolation_value(&self) -> f32 {
+        f32::from_bits(self.extrapolation_value_bits)
+    }
+
+    /// The axes `scales`, `sizes` and `roi` describe, negatives resolved. Axes
+    /// left out keep their input length.
+    pub fn resized_axes(&self, rank: usize) -> TractResult<TVec<usize>> {
+        let Some(axes) = &self.axes else { return Ok((0..rank).collect()) };
+        axes.iter()
+            .map(|a| {
+                let a = if *a < 0 { a + rank as i64 } else { *a };
+                ensure!((0..rank as i64).contains(&a), "Resize axes {axes:?} out of rank {rank}");
+                Ok(a as usize)
+            })
+            .collect()
+    }
+
     pub fn compute_output_shape<D: DimLike>(
         &self,
         input_shape: &[D],
         input_scale: Option<&Tensor>,
         input_sizes: Option<&Tensor>,
     ) -> TractResult<TVec<D>> {
-        if let Some(scale) = input_scale {
-            if scale.len() == input_shape.len() {
-                let mut shape = tvec!();
-                for (i, s) in input_shape
-                    .iter()
-                    .zip(scale.cast_to::<f32>()?.try_as_plain()?.as_slice::<f32>()?.iter())
-                {
-                    if s.round() == *s {
-                        shape.push(i.clone() * (*s as usize));
-                    } else if let Ok(i) = i.to_usize() {
-                        shape.push(((i as f32 * s) as usize).into());
-                    } else {
-                        bail!(
-                            "Can not compute output shape. inputs are {input_shape:?} and scale {scale:?}"
-                        )
-                    }
-                }
-                return Ok(shape);
+        let axes = self.resized_axes(input_shape.len())?;
+        let mut shape: TVec<D> = input_shape.into();
+        if let Some(scale) = input_scale.filter(|s| s.len() == axes.len()) {
+            let scale = scale.cast_to::<f32>()?;
+            for (&axis, s) in axes.iter().zip(scale.try_as_plain()?.as_slice::<f32>()?) {
+                let i = &input_shape[axis];
+                shape[axis] = if s.round() == *s {
+                    i.clone() * (*s as usize)
+                } else if let Ok(i) = i.to_usize() {
+                    ((i as f32 * s) as usize).into()
+                } else {
+                    bail!(
+                        "Can not compute output shape. inputs are {input_shape:?} and scale {scale:?}"
+                    )
+                };
             }
+            return Ok(shape);
         }
-        if let Some(sizes) = input_sizes {
-            if sizes.len() == input_shape.len() {
-                return sizes
-                    .cast_to::<TDim>()?
-                    .try_as_plain()?
-                    .as_slice::<TDim>()?
-                    .iter()
-                    .map(|i| i.try_into())
-                    .collect();
+        if let Some(sizes) = input_sizes.filter(|s| s.len() == axes.len()) {
+            let sizes = sizes.cast_to::<TDim>()?;
+            let sizes = sizes.try_as_plain()?.as_slice::<TDim>()?;
+            if self.keep_aspect_ratio_policy == AspectRatio::Stretch {
+                for (&axis, s) in axes.iter().zip(sizes) {
+                    shape[axis] = s.try_into()?;
+                }
+            } else {
+                let scale = self.aspect_ratio_scale(input_shape, &axes, sizes)?;
+                for &axis in &axes {
+                    let len = input_shape[axis].to_usize()?;
+                    shape[axis] = ((scale * len as f32 + 0.5) as usize).into();
+                }
             }
+            return Ok(shape);
         }
         bail!(
             "Neither sizes nor scales makes sense: input_shape: {:?}, scale: {:?}, sizes: {:?}",
@@ -213,6 +183,173 @@ impl Resize {
             input_scale,
             input_sizes,
         );
+    }
+
+    /// The scale every resized axis takes under a non-`Stretch` policy: the
+    /// smallest requested ratio to stay within `sizes`, the largest to cover it.
+    fn aspect_ratio_scale<D: DimLike>(
+        &self,
+        input_shape: &[D],
+        axes: &[usize],
+        sizes: &[TDim],
+    ) -> TractResult<f32> {
+        let mut ratios: TVec<f32> = tvec!();
+        for (&axis, size) in axes.iter().zip(sizes) {
+            ratios.push(size.to_usize()? as f32 / input_shape[axis].to_usize()? as f32);
+        }
+        let pick = if self.keep_aspect_ratio_policy == AspectRatio::NotLarger {
+            f32::min
+        } else {
+            f32::max
+        };
+        ratios.into_iter().reduce(pick).context("Resize sizes must not be empty")
+    }
+
+    /// Per-axis scale and output length over the full rank.
+    fn resolve(
+        &self,
+        input_shape: &[usize],
+        scales: Option<&Tensor>,
+        sizes: Option<&Tensor>,
+    ) -> TractResult<(TVec<f32>, TVec<usize>)> {
+        let axes = self.resized_axes(input_shape.len())?;
+        let output_shape = self.compute_output_shape(input_shape, scales, sizes)?;
+        let mut per_axis: TVec<f32> = tvec!(1.0; input_shape.len());
+        if let Some(scales) = scales.filter(|s| s.len() == axes.len()) {
+            let scales = scales.cast_to::<f32>()?;
+            for (&axis, s) in axes.iter().zip(scales.try_as_plain()?.as_slice::<f32>()?) {
+                per_axis[axis] = *s;
+            }
+        } else if self.keep_aspect_ratio_policy != AspectRatio::Stretch {
+            let sizes =
+                sizes.context("Resize aspect ratio policy needs sizes")?.cast_to::<TDim>()?;
+            let scale =
+                self.aspect_ratio_scale(input_shape, &axes, sizes.try_as_plain()?.as_slice()?)?;
+            for &axis in &axes {
+                per_axis[axis] = scale;
+            }
+        } else {
+            for &axis in &axes {
+                per_axis[axis] = output_shape[axis] as f32 / input_shape[axis] as f32;
+            }
+        }
+        Ok((per_axis, output_shape))
+    }
+
+    /// Normalized ROI `(start, end)` per axis, `(0, 1)` for the axes left out.
+    fn roi(&self, rank: usize, roi: Option<&Tensor>) -> TractResult<TVec<(f32, f32)>> {
+        let axes = self.resized_axes(rank)?;
+        let Some(roi) = roi.filter(|r| r.len() == 2 * axes.len()) else {
+            bail!("Resize in tf_crop_and_resize mode needs a roi of 2 x {} elements", axes.len())
+        };
+        let roi = roi.cast_to::<f32>()?;
+        let roi = roi.try_as_plain()?.as_slice::<f32>()?;
+        let mut per_axis: TVec<(f32, f32)> = tvec!((0.0, 1.0); rank);
+        for (i, &axis) in axes.iter().enumerate() {
+            per_axis[axis] = (roi[i], roi[i + axes.len()]);
+        }
+        Ok(per_axis)
+    }
+
+    fn plan_axis(&self, scale: f32, len_in: usize, len_out: usize, roi: (f32, f32)) -> AxisPlan {
+        let window = window_size(&self.interpolator, self.antialias, scale);
+        let coord: Box<dyn Fn(usize) -> Option<f32>> = match &self.coord_transformer {
+            CoordTransform::Plain(t) => {
+                let t = t.clone();
+                Box::new(move |x| Some(t.transform(x, scale, len_in, len_out)))
+            }
+            CoordTransform::TfCropAndResize => {
+                let last = len_in as f32 - 1.0;
+                let span = last * (roi.1 - roi.0);
+                let width = scale * len_in as f32;
+                Box::new(move |x| {
+                    let offset =
+                        if width == 1.0 { span / 2.0 } else { x as f32 * span / (width - 1.0) };
+                    let x = offset + roi.0 * last;
+                    (x >= 0.0 && x <= last).then_some(x)
+                })
+            }
+        };
+        let exclude = self.exclude_outside;
+        let (antialias, a) = (self.antialias, self.cubic_coeff_a());
+        match self.interpolator {
+            Interpolator::Linear => plan_axis(len_in, len_out, window, exclude, coord, |r, w| {
+                linear_weights(r, scale, antialias, w)
+            }),
+            Interpolator::Cubic => plan_axis(len_in, len_out, window, exclude, coord, |r, w| {
+                cubic_weights(r, scale, a, antialias, w)
+            }),
+            Interpolator::Nearest => plan_axis(len_in, len_out, window, exclude, coord, |r, w| {
+                let right = r == 1.0 || self.nearest.prefers_right(r);
+                w[0] = !right as u8 as f32;
+                w[1] = right as u8 as f32;
+            }),
+        }
+    }
+
+    /// The clean subset reachable by `tract_core::ops::nn::resize::Resize`:
+    /// default `cubic_coeff_a`, no `exclude_outside`, no antialiasing, no ROI,
+    /// a stretching aspect ratio and a nearest mode core understands. `None`
+    /// keeps the op as an ONNX edge-case op.
+    fn as_core(&self) -> Option<resize::Resize> {
+        if self.exclude_outside
+            || self.antialias
+            || self.keep_aspect_ratio_policy != AspectRatio::Stretch
+        {
+            return None;
+        }
+        let CoordTransform::Plain(coord_transformer) = &self.coord_transformer else {
+            return None;
+        };
+        if self.interpolator == Interpolator::Cubic && self.cubic_coeff_a() != -0.75 {
+            return None;
+        }
+        let nearest = match self.nearest {
+            Nearest::Floor => resize::Nearest::Floor,
+            Nearest::RoundPreferCeil => resize::Nearest::RoundPreferCeil,
+            Nearest::Ceil | Nearest::RoundPreferFloor
+                if self.interpolator != Interpolator::Nearest =>
+            {
+                resize::Nearest::Floor
+            }
+            _ => return None,
+        };
+        Some(resize::Resize {
+            coord_transformer: coord_transformer.clone(),
+            interpolator: self.interpolator.clone(),
+            nearest,
+            optional_scales_input: Some(1),
+            optional_sizes_input: None,
+        })
+    }
+
+    /// Spreads a per-`axes` `scales`/`sizes` constant over the full rank, so the
+    /// core op — which carries no `axes` of its own — can take the node over.
+    fn full_rank_aux(
+        &self,
+        input_shape: &ShapeFact,
+        axes: &[usize],
+        konst: &Tensor,
+        sizes: bool,
+    ) -> TractResult<Arc<Tensor>> {
+        if sizes {
+            let mut full: Vec<i64> = vec![0; input_shape.rank()];
+            for (slot, dim) in full.iter_mut().zip(input_shape.iter()) {
+                *slot = dim.to_usize()? as i64;
+            }
+            let konst = konst.cast_to::<i64>()?;
+            for (&axis, v) in axes.iter().zip(konst.try_as_plain()?.as_slice::<i64>()?) {
+                full[axis] = *v;
+            }
+            Ok(tract_ndarray::arr1(&full).into_arc_tensor())
+        } else {
+            let mut full = vec![1.0f32; input_shape.rank()];
+            let konst = konst.cast_to::<f32>()?;
+            for (&axis, v) in axes.iter().zip(konst.try_as_plain()?.as_slice::<f32>()?) {
+                full[axis] = *v;
+            }
+            Ok(tract_ndarray::arr1(&full).into_arc_tensor())
+        }
     }
 }
 
@@ -225,86 +362,41 @@ impl Op for Resize {
 }
 
 impl EvalOp for Resize {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, mut inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
-        let scales = self.optional_scales_input.and_then(|ix| inputs.get(ix));
-        let sizes = self.optional_sizes_input.and_then(|ix| inputs.get(ix));
-        let output_shape = self.compute_output_shape(
-            inputs[0].shape(),
-            scales.map(|t| &**t),
-            sizes.map(|t| &**t),
-        )?;
-        let scales: TVec<f32> = if let Some(scales) = scales.filter(|s| s.len() == inputs[0].rank())
-        {
-            scales.try_as_plain()?.as_slice::<f32>()?.into()
+    fn eval(&self, _ctx: &EvalContext, mut inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        let input_dt = inputs[0].datum_type();
+        let rank = inputs[0].rank();
+        let tf_crop = self.coord_transformer == CoordTransform::TfCropAndResize;
+        let roi = if tf_crop {
+            self.roi(rank, self.optional_roi_input.and_then(|ix| inputs.get(ix)).map(|t| &**t))?
         } else {
-            output_shape.iter().zip(inputs[0].shape()).map(|(o, i)| *o as f32 / *i as f32).collect()
+            tvec!((0.0, 1.0); rank)
         };
-        let mut data = inputs.remove(0).into_tensor().into_plain_array::<f32>()?;
-        for (axis, scale) in scales.into_iter().enumerate().filter(|(_, s)| *s != 1.0) {
-            let mut new_shape: TVec<usize> = data.shape().into();
-            new_shape[axis] = output_shape[axis];
-            let input_len = data.shape()[axis];
-            data = match self.interpolator {
-                Interpolator::Cubic => {
-                    let a = self.cubic_coeff_a();
-                    let exclude = self.exclude_outside;
-                    tract_ndarray::ArrayD::from_shape_fn(&*new_shape, |co_o| -> f32 {
-                        let x_out = co_o[axis];
-                        let x_in = self.coord_transformer.transform(
-                            x_out,
-                            scale,
-                            input_len,
-                            new_shape[axis],
-                        );
-                        let x_floor = x_in.floor() as isize;
-                        let t = x_in - x_floor as f32;
-                        let mut co_i = co_o;
-                        let mut weights = [0.0f32; 4];
-                        let mut values = [0.0f32; 4];
-                        for (i, j) in (-1..=2isize).enumerate() {
-                            let raw_idx = x_floor + j;
-                            let w = cubic_kernel(t - j as f32, a);
-                            if exclude && (raw_idx < 0 || raw_idx >= input_len as isize) {
-                                weights[i] = 0.0;
-                            } else {
-                                weights[i] = w;
-                                let idx = raw_idx.clamp(0, input_len as isize - 1) as usize;
-                                co_i[axis] = idx;
-                                values[i] = data[&co_i];
-                            }
-                        }
-                        if exclude {
-                            let sum: f32 = weights.iter().sum();
-                            if sum != 0.0 {
-                                for w in &mut weights {
-                                    *w /= sum;
-                                }
-                            }
-                        }
-                        weights.iter().zip(values.iter()).map(|(w, v)| w * v).sum()
-                    })
-                }
-                _ => tract_ndarray::ArrayD::from_shape_fn(&*new_shape, |co_o| -> f32 {
-                    let x_out = co_o[axis];
-                    let x_in =
-                        self.coord_transformer.transform(x_out, scale, input_len, new_shape[axis]);
-                    let mut co_i = co_o;
-                    let x_left = (x_in as usize).clamp(0, input_len - 1);
-                    co_i[axis] = x_left;
-                    let y_left = data[&co_i];
-                    let x_right = (x_left + 1).min(input_len - 1);
-                    co_i[axis] = x_right;
-                    let y_right = data[&co_i];
-                    let x_frac = x_in - x_left as f32;
-                    self.interpolator.interpolate(y_left, y_right, x_frac, self.nearest)
-                }),
+        let (scales, output_shape) = self.resolve(
+            inputs[0].shape(),
+            self.optional_scales_input.and_then(|ix| inputs.get(ix)).map(|t| &**t),
+            self.optional_sizes_input.and_then(|ix| inputs.get(ix)).map(|t| &**t),
+        )?;
+        let input = inputs.remove(0).into_tensor();
+        let input = input.cast_to::<f32>()?;
+        let mut shape: TVec<usize> = input.shape().into();
+        let mut data: Vec<f32> = input.try_as_plain()?.as_slice::<f32>()?.to_vec();
+        for (axis, scale) in scales.into_iter().enumerate() {
+            let (len_in, len_out) = (shape[axis], output_shape[axis]);
+            if len_in == len_out && scale == 1.0 && !tf_crop {
+                continue;
             }
+            let plan = self.plan_axis(scale, len_in, len_out, roi[axis]);
+            let mut resampled = vec![0f32; data.len() / len_in * len_out];
+            resample_axis(&data, &shape, axis, &plan, self.extrapolation_value(), &mut resampled);
+            data = resampled;
+            shape[axis] = len_out;
         }
-        Ok(tvec!(data.into_tvalue()))
+        let out = tract_ndarray::ArrayD::from_shape_vec(&*shape, data)?.into_tensor();
+        let out =
+            if out.datum_type() == input_dt { out } else { out.cast_to_dt(input_dt)?.into_owned() };
+        Ok(tvec!(out.into_tvalue()))
     }
 }
 
@@ -312,7 +404,6 @@ impl TypedOp for Resize {
     as_op!();
 
     fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
-        let _roi = self.optional_roi_input.and_then(|ix| inputs.get(ix));
         let scales = self.optional_scales_input.and_then(|ix| inputs.get(ix));
         let sizes = self.optional_sizes_input.and_then(|ix| inputs.get(ix));
         let output_shape = self.compute_output_shape(
@@ -328,99 +419,77 @@ impl TypedOp for Resize {
         model: &TypedModel,
         node: &TypedNode,
     ) -> TractResult<Option<TypedModelPatch>> {
-        // Lower nearest-neighbor integer-scale upsamples to Reshape → Tile → Reshape
+        let input_fact = model.outlet_fact(node.inputs[0])?;
+        let rank = input_fact.rank();
+        let axes = self.resized_axes(rank)?;
+        if let Some(mut core_op) = self.as_core() {
+            let konst = |ix: usize| -> Option<Arc<Tensor>> {
+                model
+                    .outlet_fact(node.inputs[ix])
+                    .ok()?
+                    .konst
+                    .clone()
+                    .filter(|k| k.len() == axes.len())
+            };
+            let active = self
+                .optional_scales_input
+                .filter(|&ix| konst(ix).is_some())
+                .map(|ix| (ix, false))
+                .or_else(|| {
+                    self.optional_sizes_input.filter(|&ix| konst(ix).is_some()).map(|ix| (ix, true))
+                });
+            if let Some((ix, use_sizes)) = active {
+                core_op.optional_scales_input = (!use_sizes).then_some(1);
+                core_op.optional_sizes_input = use_sizes.then_some(1);
+                let mut patch = TypedModelPatch::default();
+                let data = patch.tap_model(model, node.inputs[0])?;
+                let aux = if axes.len() == rank {
+                    patch.tap_model(model, node.inputs[ix])?
+                } else {
+                    let full = self.full_rank_aux(
+                        &input_fact.shape,
+                        &axes,
+                        &konst(ix).unwrap(),
+                        use_sizes,
+                    )?;
+                    patch.add_const(format!("{}.resize_aux", node.name), full)?
+                };
+                let wire = patch.wire_node(&node.name, core_op, &[data, aux])?;
+                patch.shunt_outside(model, node.id.into(), wire[0])?;
+                return Ok(Some(patch));
+            }
+        }
+
         rule_if!(matches!(self.interpolator, Interpolator::Nearest));
         rule_if_some!(scales_input = self.optional_scales_input);
-        let input_fact = model.outlet_fact(node.inputs[0])?;
         let scales_fact = model.outlet_fact(node.inputs[scales_input])?;
         rule_if_some!(scales_tensor = &scales_fact.konst);
+        rule_if!(scales_tensor.len() == rank);
         let scales: Vec<f32> =
             scales_tensor.cast_to::<f32>()?.try_as_plain()?.as_slice::<f32>()?.to_vec();
-
-        // Check all scales are positive integers
         let int_scales: Vec<usize> = scales.iter().map(|&s| s.round() as usize).collect();
         rule_if!(
             scales.iter().zip(&int_scales).all(|(&s, &i)| (s - i as f32).abs() <= 1e-5 && i != 0)
         );
-        // Only if at least one axis actually upsamples
         rule_if!(int_scales.iter().any(|&s| s != 1));
-
-        let input_shape = &input_fact.shape;
-
-        let mut patch = TypedModelPatch::default();
-        let mut wire = patch.tap_model(model, node.inputs[0])?;
-
-        // Step 1: Reshape to interleave size-1 axes after each upsampled dim
-        // e.g. (N, C, H, W) with scales (1,1,2,2) → (N, C, H, 1, W, 1)
-        let mut from_dims: TVec<TDim> = tvec![];
-        let mut to_dims: TVec<TDim> = tvec![];
-        let mut tile_multipliers: TVec<TDim> = tvec![];
-        let mut first_upsampled = None;
-
-        for (i, &scale) in int_scales.iter().enumerate() {
-            from_dims.push(input_shape[i].clone());
-            to_dims.push(input_shape[i].clone());
-            tile_multipliers.push(1.into());
-            if scale > 1 {
-                if first_upsampled.is_none() {
-                    first_upsampled = Some(i);
-                }
-                to_dims.push(1.into());
-                tile_multipliers.push(scale.into());
-            }
+        let CoordTransform::Plain(coord_transformer) = &self.coord_transformer else {
+            return Ok(None);
+        };
+        for (axis, &scale) in int_scales.iter().enumerate().filter(|&(_, &s)| s > 1) {
+            let Some(len_in) = probe_length(coord_transformer, &input_fact.shape[axis]) else {
+                return Ok(None);
+            };
+            rule_if!(is_pixel_replication(
+                &self.plan_axis(scale as f32, len_in, len_in * scale, (0.0, 1.0)),
+                scale
+            ));
         }
 
-        if to_dims.len() > from_dims.len() {
-            let first = first_upsampled.unwrap();
-            wire = patch.wire_node(
-                format!("{}.reshape_pre", node.name),
-                AxisOp::Reshape(first, from_dims[first..].into(), to_dims[first..].into()),
-                &[wire],
-            )?[0];
-        }
-
-        // Step 2: Tile the size-1 axes
-        use tract_core::ops::array::Tile;
-        wire = patch.wire_node(
-            format!("{}.tile", node.name),
-            Tile { multipliers: tile_multipliers },
-            &[wire],
-        )?[0];
-
-        // Step 3: Reshape back to merge the tiled dims
-        // e.g. (N, C, H, 2, W, 2) → (N, C, H*2, W*2)
-        let tiled_shape: TVec<TDim> = to_dims
-            .iter()
-            .zip(int_scales.iter().flat_map(|&s| if s > 1 { vec![1usize, s] } else { vec![1] }))
-            .map(|(d, s)| d.clone() * s)
-            .collect();
-        let mut final_dims: TVec<TDim> = tvec![];
-        let mut idx = 0;
-        for &scale in &int_scales {
-            if scale > 1 {
-                final_dims.push(tiled_shape[idx].clone() * tiled_shape[idx + 1].clone());
-                idx += 2;
-            } else {
-                final_dims.push(tiled_shape[idx].clone());
-                idx += 1;
-            }
-        }
-
-        if tiled_shape.len() > final_dims.len() {
-            let first = first_upsampled.unwrap();
-            wire = patch.wire_node(
-                format!("{}.reshape_post", node.name),
-                AxisOp::Reshape(first, tiled_shape[first..].into(), final_dims[first..].into()),
-                &[wire],
-            )?[0];
-        }
-
-        patch.shunt_outside(model, node.id.into(), wire)?;
-        Ok(Some(patch))
+        lower_nearest_integer_upsample(model, node, &int_scales)
     }
 }
 
-// --- NNEF serialization ---
+// --- NNEF serialization (edge-case op) ---
 
 pub fn register(registry: &mut Registry) {
     registry.register_primitive(
@@ -436,135 +505,102 @@ fn parameters() -> Vec<Parameter> {
     vec![
         TypeName::Scalar.tensor().named("input"),
         TypeName::Scalar.tensor().named("scales"),
+        TypeName::Scalar.tensor().named("roi").default(false),
         TypeName::String.named("coord_transformer").default("half_pixel"),
         TypeName::String.named("interpolator").default("nearest"),
         TypeName::String.named("nearest_mode").default("floor"),
         TypeName::Scalar.named("cubic_coeff_a").default(-0.75f32),
         TypeName::Logical.named("exclude_outside").default(false),
+        TypeName::Logical.named("antialias").default(false),
+        TypeName::Scalar.named("extrapolation_value").default(0.0f32),
     ]
 }
 
 fn dump(ast: &mut IntoAst, node: &TypedNode, op: &Resize) -> TractResult<Option<Arc<RValue>>> {
     let input = ast.mapping[&node.inputs[0]].clone();
-    let scales = if let Some(scales_ix) = op.optional_scales_input {
-        ast.mapping[&node.inputs[scales_ix]].clone()
-    } else if let Some(sizes_ix) = op.optional_sizes_input {
-        let input_shape = ast.model.outlet_fact(node.inputs[0])?.shape.to_tvec();
-        let sizes_fact = ast.model.outlet_fact(node.inputs[sizes_ix])?;
-        let sizes =
-            sizes_fact.konst.as_ref().context("sizes must be a constant for NNEF export")?;
-        let sizes = sizes.cast_to::<f32>()?;
-        let sizes = sizes.try_as_plain()?.as_slice::<f32>()?;
-        let scales: Vec<f32> = input_shape
-            .iter()
-            .zip(sizes.iter())
-            .map(|(i, s)| i.to_usize().map(|i| *s / i as f32).unwrap_or(1.0))
-            .collect();
-        let scales_tensor = tract_ndarray::arr1(&scales).into_arc_tensor();
-        ast.konst_variable(format!("{}.scales", node.name), &scales_tensor)?
+    let input_shape = ast.model.outlet_fact(node.inputs[0])?.shape.to_tvec();
+    let axes = op.resized_axes(input_shape.len())?;
+    let passthrough = op.optional_scales_input.filter(|&ix| {
+        axes.len() == input_shape.len()
+            && ast
+                .model
+                .outlet_fact(node.inputs[ix])
+                .map(|f| f.shape.volume() == axes.len().to_dim())
+                .unwrap_or(false)
+    });
+    let scales = if let Some(ix) = passthrough {
+        ast.mapping[&node.inputs[ix]].clone()
     } else {
-        bail!("Resize op has neither scales nor sizes input")
+        let output_shape = &node.outputs[0].fact.shape;
+        let mut scales = vec![1.0f32; input_shape.len()];
+        for &axis in &axes {
+            let (i, o) = (input_shape[axis].to_usize()?, output_shape[axis].to_usize()?);
+            scales[axis] = o as f32 / i as f32;
+        }
+        let scales = tract_ndarray::arr1(&scales).into_arc_tensor();
+        ast.konst_variable(format!("{}.scales", node.name), &scales)?
     };
-    Ok(Some(invocation(
-        "tract_onnx_resize",
-        &[input, scales],
-        &[
-            ("coord_transformer", string(op.coord_transformer.as_str())),
-            ("interpolator", string(op.interpolator.as_str())),
-            ("nearest_mode", string(op.nearest.as_str())),
-            ("cubic_coeff_a", numeric(op.cubic_coeff_a())),
-            ("exclude_outside", logical(op.exclude_outside)),
-        ],
-    )))
+    let mut args = vec![
+        ("coord_transformer", string(op.coord_transformer.as_str())),
+        ("interpolator", string(op.interpolator.as_str())),
+        ("nearest_mode", string(op.nearest.as_str())),
+        ("cubic_coeff_a", numeric(op.cubic_coeff_a())),
+        ("exclude_outside", logical(op.exclude_outside)),
+        ("antialias", logical(op.antialias)),
+        ("extrapolation_value", numeric(op.extrapolation_value())),
+    ];
+    if op.coord_transformer == CoordTransform::TfCropAndResize {
+        let ix = op.optional_roi_input.context("tf_crop_and_resize needs a roi input")?;
+        let roi = ast.model.outlet_fact(node.inputs[ix])?;
+        let roi = roi.konst.as_ref().context("roi must be a constant for NNEF export")?;
+        let roi = full_rank_roi(&axes, input_shape.len(), roi)?;
+        let roi = ast.konst_variable(format!("{}.roi", node.name), &roi)?;
+        args.push(("roi", (*roi).clone()));
+    }
+    Ok(Some(invocation("tract_onnx_resize", &[input, scales], &args)))
+}
+
+/// Spreads a per-`axes` ROI over the full rank, the layout the NNEF op expects.
+fn full_rank_roi(axes: &[usize], rank: usize, roi: &Tensor) -> TractResult<Arc<Tensor>> {
+    let roi = roi.cast_to::<f32>()?;
+    let roi = roi.try_as_plain()?.as_slice::<f32>()?;
+    let mut full = vec![0.0f32; rank];
+    full.extend(std::iter::repeat_n(1.0f32, rank));
+    for (i, &axis) in axes.iter().enumerate() {
+        full[axis] = roi[i];
+        full[rank + axis] = roi[i + axes.len()];
+    }
+    Ok(tract_ndarray::arr1(&full).into_arc_tensor())
 }
 
 fn load(builder: &mut ModelBuilder, invocation: &ResolvedInvocation) -> TractResult<Value> {
     let input = invocation.named_arg_as(builder, "input")?;
     let scales = invocation.named_arg_as(builder, "scales")?;
+    let roi = invocation.optional_named_arg_as::<OutletId>(builder, "roi")?;
     let coord_transformer: String = invocation.named_arg_as(builder, "coord_transformer")?;
     let interpolator: String = invocation.named_arg_as(builder, "interpolator")?;
     let nearest_mode: String = invocation.named_arg_as(builder, "nearest_mode")?;
     let cubic_coeff_a: f32 = invocation.named_arg_as(builder, "cubic_coeff_a")?;
     let exclude_outside: bool = invocation.named_arg_as(builder, "exclude_outside")?;
+    let antialias: bool = invocation.named_arg_as(builder, "antialias")?;
+    let extrapolation_value: f32 = invocation.named_arg_as(builder, "extrapolation_value")?;
 
     let op = Resize {
         axes: None,
-        coord_transformer: CoordTransformer::parse(&coord_transformer)?,
+        coord_transformer: CoordTransform::parse(&coord_transformer)?,
         interpolator: Interpolator::parse(&interpolator)?,
         nearest: Nearest::parse(&nearest_mode)?,
+        antialias,
         cubic_coeff_a_bits: cubic_coeff_a.to_bits(),
         exclude_outside,
-        optional_roi_input: None,
+        extrapolation_value_bits: extrapolation_value.to_bits(),
+        keep_aspect_ratio_policy: AspectRatio::Stretch,
+        optional_roi_input: roi.map(|_| 2),
         optional_scales_input: Some(1),
         optional_sizes_input: None,
     };
 
-    builder.wire(op, &[input, scales])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cubic_kernel_properties() {
-        let a = -0.75f32;
-        assert!((cubic_kernel(0.0, a) - 1.0).abs() < 1e-6);
-        assert!(cubic_kernel(2.0, a).abs() < 1e-6);
-        assert!(cubic_kernel(3.0, a).abs() < 1e-6);
-
-        for t_int in 0..=100 {
-            let t = t_int as f32 / 100.0;
-            let sum = cubic_kernel(t + 1.0, a)
-                + cubic_kernel(t, a)
-                + cubic_kernel(1.0 - t, a)
-                + cubic_kernel(2.0 - t, a);
-            assert!((sum - 1.0).abs() < 1e-5, "kernel weights must sum to 1.0, got {sum} at t={t}");
-        }
-    }
-
-    #[test]
-    fn cubic_resize_1d_upsample() {
-        let input = tract_ndarray::arr1(&[0.0f32, 1.0, 2.0, 3.0]);
-        let input_tensor = input.into_tensor().into_tvalue();
-        let scales = tract_ndarray::arr1(&[2.0f32]);
-        let scales_tensor = scales.into_tensor().into_tvalue();
-        let op = Resize {
-            axes: None,
-            coord_transformer: CoordTransformer::HalfPixel,
-            interpolator: Interpolator::Cubic,
-            nearest: Nearest::Floor,
-            cubic_coeff_a_bits: (-0.75f32).to_bits(),
-            exclude_outside: false,
-            optional_roi_input: None,
-            optional_scales_input: Some(1),
-            optional_sizes_input: None,
-        };
-        let result = op.eval(tvec!(input_tensor, scales_tensor)).unwrap();
-        let output = result[0].try_as_plain().unwrap().as_slice::<f32>().unwrap();
-        assert_eq!(output.len(), 8);
-        assert!((output[0] - (-0.10546875)).abs() < 1e-4, "got {}", output[0]);
-    }
-
-    #[test]
-    fn cubic_resize_2d_upsample() {
-        let input = tract_ndarray::arr2(&[[1.0f32, 2.0], [3.0, 4.0]]);
-        let input_tensor = input.into_tensor().into_tvalue();
-        let scales = tract_ndarray::arr1(&[2.0f32, 2.0]);
-        let scales_tensor = scales.into_tensor().into_tvalue();
-        let op = Resize {
-            axes: None,
-            coord_transformer: CoordTransformer::HalfPixel,
-            interpolator: Interpolator::Cubic,
-            nearest: Nearest::Floor,
-            cubic_coeff_a_bits: (-0.75f32).to_bits(),
-            exclude_outside: false,
-            optional_roi_input: None,
-            optional_scales_input: Some(1),
-            optional_sizes_input: None,
-        };
-        let result = op.eval(tvec!(input_tensor, scales_tensor)).unwrap();
-        let shape = result[0].shape();
-        assert_eq!(shape, &[4, 4]);
-    }
+    let mut wires = tvec!(input, scales);
+    wires.extend(roi);
+    builder.wire(op, &wires)
 }

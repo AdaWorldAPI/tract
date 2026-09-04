@@ -7,7 +7,7 @@ edition = "2024"
 anyhow.workspace = true
 float-ord = "0.3.2"
 ndarray.workspace = true
-tract.workspace = true
+tract = { workspace = true, features = ["cuda-13000"] }
 axum = "0.8.4"
 tokio = { version = "1.47.1", features = ["rt-multi-thread"] }
 clap = { version = "4", features = ["derive"] }
@@ -21,6 +21,13 @@ ndarray-npy.workspace = true
 tokio-scoped = "0.2.0"
 rand.workspace = true
 
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "spec_host"
+harness = false
 
 # tokenizer special handle for wasm
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

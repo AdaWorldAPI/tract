@@ -3,12 +3,6 @@
 WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
-if [ -e /proc/cpuinfo ]
-then
-    grep "^flags" /proc/cpuinfo | head -1 | \
-        grep --color=always '\(s\?sse[0-9_]*\|fma\|f16c\|avx[^ ]*\)'
-fi
-
 set -x
 
 ROOT=$(dirname $0)/..
@@ -37,6 +31,13 @@ do
     echo
     cargo -q test $CARGO_EXTRA -q -p tract-$c
 done
+
+# The registry declares every architecture's kernels, and its tests -- what each machine picks,
+# and which cells a settlement speaks for -- only see the trees this feature compiles in.
+echo
+echo "$WHITE ### linalg, every tree ### $NC"
+echo
+cargo -q test $CARGO_EXTRA -q -p tract-linalg --features foreign-inventory
 
 if [ `uname` = "Darwin" -a -z "$CI" ]
 then

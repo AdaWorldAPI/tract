@@ -29,11 +29,9 @@ impl Op for LoopGate {
 }
 
 impl EvalOp for LoopGate {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         Ok(inputs)
     }
 }
@@ -76,11 +74,9 @@ impl Op for NextIteration {
 }
 
 impl EvalOp for NextIteration {
-    fn is_stateless(&self) -> bool {
-        false
-    }
+    not_out_of_plan!();
 
-    fn state(&self, _state: &TurnState, _id: usize) -> TractResult<Option<Box<dyn OpState>>> {
+    fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         unimplemented!();
     }
 }

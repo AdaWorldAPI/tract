@@ -9,7 +9,29 @@ use tract::prelude::*;
 tract::impl_ndarray_interop!();
 
 fn argmax(slice: &[f32]) -> Option<usize> {
-    slice.into_iter().position_max_by_key(|x| FloatOrd(**x))
+    slice.iter().position_max_by_key(|x| FloatOrd(**x))
+}
+
+/// One prednet (decoder) step, tolerant of the split-RNNT export shape. t2n>=0.24
+/// adds a `target_length` input and a `prednet_lengths` output; when the latter is
+/// a pass-through tract prunes both back to the older 3-in/3-out shape. States are
+/// always the last two outputs.
+fn run_decoder(
+    decoder: &Runnable,
+    wants_length: bool,
+    tokens: Tensor,
+    n_tokens: i32,
+    state_0: Tensor,
+    state_1: Tensor,
+) -> anyhow::Result<(Tensor, Tensor, Tensor)> {
+    let mut inputs = vec![tokens];
+    if wants_length {
+        inputs.push(Tensor::from_slice(&[1], &[n_tokens])?);
+    }
+    inputs.push(state_0);
+    inputs.push(state_1);
+    let out = decoder.run(inputs)?;
+    Ok((out[0].clone(), out[out.len() - 2].clone(), out[out.len() - 1].clone()))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -20,19 +42,22 @@ fn main() -> anyhow::Result<()> {
     let vocab: Vec<&str> = vocab.iter().map(|v| v.as_str().unwrap()).collect();
 
     let nnef = tract::nnef()?.with_tract_transformers()?;
-    let gpu = ["cuda", "metal", "default"]
-        .iter()
-        .find_map(|rt| tract::runtime_for_name(rt).ok())
-        .unwrap();
+    let gpu = tract::runtime_for_name("gpu-or-cpu")?;
+    eprintln!("runtime: {}", gpu.name()?);
 
     let preprocessor = nnef.load("assets/model/preprocessor.nnef.tgz")?.into_runnable()?;
 
     let mut encoder = nnef.load("assets/model/encoder.nnef.tgz")?;
+    encoder.transform(SetSymbols::new().value("BATCH", 1))?;
     encoder.transform("transformers_detect_all")?;
+    encoder
+        .transform(r#"{"name":"patch","body":"length = tract_core_shape_of(audio_signal)[2];"}"#)?;
+    encoder.transform(r#"{"name":"select_inputs","inputs":["audio_signal"]}"#)?;
     let encoder = gpu.prepare(encoder)?;
 
     let decoder = nnef.load("assets/model/decoder.nnef.tgz")?;
     let decoder = gpu.prepare(decoder)?;
+    let dec_wants_length = decoder.input_count()? == 4;
 
     let joint = nnef.load("assets/model/joint.nnef.tgz")?;
     let joint = gpu.prepare(joint)?;
@@ -44,8 +69,8 @@ fn main() -> anyhow::Result<()> {
     let samples = Tensor::from_slice(&[1, wav.len()], &wav)?;
     let len = arr1(&[wav.len() as i64]).tract()?;
 
-    let [features, feat_len] = preprocessor.run([samples, len])?.try_into().unwrap();
-    let [encoded, _lens] = encoder.run([features, feat_len])?.try_into().unwrap();
+    let [features, _feat_len] = preprocessor.run([samples, len])?.try_into().unwrap();
+    let [encoded, _lens] = encoder.run([features])?.try_into().unwrap();
 
     let encoded: ArrayD<f32> = encoded.ndarray()?.into_owned();
 
@@ -58,7 +83,8 @@ fn main() -> anyhow::Result<()> {
     let mut state_0 = Array3::<f32>::zeros([2, 1, 640]).tract()?;
     let mut state_1 = Array3::<f32>::zeros([2, 1, 640]).tract()?;
 
-    [token, state_0, state_1] = decoder.run([token, state_0, state_1])?.try_into().unwrap();
+    (token, state_0, state_1) =
+        run_decoder(&decoder, dec_wants_length, token, 1, state_0, state_1)?;
     while hyp.len() < max_len && frame_ix < max_frames {
         let frame = encoded.slice_axis(Axis(2), (frame_ix..frame_ix + 1).into()).tract()?;
         let [logits] = joint.run([frame, token.clone()])?.try_into().unwrap();
@@ -68,8 +94,9 @@ fn main() -> anyhow::Result<()> {
             frame_ix += argmax(&logits[blank_id + 1..]).unwrap_or(0).max(1);
         } else {
             hyp.push(token_id);
-            token = Tensor::from_slice(&[1, 1], &[token_id as i32])?;
-            [token, state_0, state_1] = decoder.run([token, state_0, state_1])?.try_into().unwrap();
+            let next = Tensor::from_slice(&[1, 1], &[token_id as i32])?;
+            (token, state_0, state_1) =
+                run_decoder(&decoder, dec_wants_length, next, 1, state_0, state_1)?;
         }
     }
 

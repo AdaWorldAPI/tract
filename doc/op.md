@@ -79,7 +79,7 @@ pub trait EvalOp {
 
      fn state(
          &self,
-         session: &mut TurnState,
+         turn: &mut TurnState,
          node_id: usize,
      ) -> TractResult<Option<Box<dyn OpState>>> {
          Ok(None)
@@ -101,7 +101,7 @@ instead:
 pub trait OpState: fmt::Debug + dyn_clone::DynClone + OpStateFreeze + Downcast {
     fn eval(
         &mut self,
-        session: &mut TurnState,
+        turn: &mut TurnState,
         op: &dyn Op,
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>>;
@@ -110,7 +110,7 @@ pub trait OpState: fmt::Debug + dyn_clone::DynClone + OpStateFreeze + Downcast {
 ```
 
 Here the eval implementation is free to mute some operation internal state if
-required, or access the `SessionState`.
+required, or access the `TurnState`.
 
 But most operators are stateless anyway.
 
@@ -242,9 +242,9 @@ rank determined or not and individual dimensions known or not.
 The framework will try to propagate type information accross the graph,
 refining incrementally its knowledge of all the inference facts. It will do
 so by calling the `infer()` method on operators which interfaces are not fully
-determined. The operator receives as paramaters the current information on its
+determined. The operator receives as parameters the current information on its
 inputs and outputs, try to improve them and returns the refined versions. The
-third paramaters and result (`observed`) is out of scope here.
+third parameters and result (`observed`) is out of scope here.
 
 Once a network has been entirely typed, it can be translated to a TypedOp. The
 framework will visit the entire network and call the `to_typed()` method on

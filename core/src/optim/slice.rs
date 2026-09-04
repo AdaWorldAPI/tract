@@ -110,7 +110,7 @@ fn op_slices_to_slice_op(
                     wire = patch.wire_node(
                         format!(
                             "{}.split-{}-over-{}.{}..{}.slice",
-                            &node.name, input_ix, input_axis, start, end
+                            node.name, input_ix, input_axis, start, end
                         ),
                         Slice { axis: input_axis, start: start.to_dim(), end: end.to_dim() },
                         &[wire],
@@ -126,7 +126,7 @@ fn op_slices_to_slice_op(
                     &mut patch,
                     model,
                     node,
-                    &format!("{}.split-over-{}.{}..{}", &node.name, axis, start, end),
+                    &format!("{}.split-over-{}.{}..{}", node.name, axis, start, end),
                     &wires,
                     axis,
                     start,
@@ -155,7 +155,7 @@ fn should_slice_output(
         })
         .map(|inlet| inlet.node)
         .collect();
-    /* aggressive: 1 slice as succesor => we propagate it */
+    /* aggressive: 1 slice as successor => we propagate it */
     /*
     let Some(slice) = node.outputs[0].successors.iter().find_map(|inlet| {
         model.node(inlet.node).op_as::<Slice>().filter(|slice| slice.axis == axis).map(|_| inlet.node)
@@ -180,7 +180,7 @@ fn should_slice_output(
         }
     }
     rule_if_let!(Ok(mut boundaries) =
-        boundaries.iter().map(|x| x.to_usize()).collect::<TractResult<TVec<usize>>>());
+        boundaries.iter().map(|x| x.to_usize()).collect::<Result<TVec<usize>, _>>());
     rule_if_let!(Ok(end) = node.outputs[0].fact.shape[axis].to_usize());
     // op_slices_to_slice_op requires boundaries to cover the full
     // [0..full_len] range. When every slicing successor starts at

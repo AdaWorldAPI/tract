@@ -8,7 +8,7 @@ use tract_core::ops::{change_axes, math};
 use tract_nnef::internal::*;
 use tract_nnef::ser::datum_type;
 use tract_nnef::tract_core::ops::math::mul;
-use tract_nnef::tract_core::ops::nn::{Softmax, SoftmaxExp, SoftmaxKind};
+use tract_nnef::tract_core::ops::nn::{Softmax, SoftmaxKind};
 
 use crate::ops::dyn_kv_cache::DynKeyValueCache;
 use crate::ops::flash_sdpa::FlashSdpaOp;
@@ -121,7 +121,7 @@ impl Sdpa {
             graph
                 .wire_node(
                     "att_softmax",
-                    Softmax::new(tvec![rank - 1], None, SoftmaxKind::Softmax(SoftmaxExp::Libc)),
+                    Softmax::new(tvec![rank - 1], None, SoftmaxKind::Softmax),
                     &[scaled_scores],
                 )
                 .map(|o| o[0])
@@ -197,10 +197,10 @@ impl Sdpa {
 
         let scores_einsum = EinSum::new("bhgmk,bhgnk->bhgmn".parse().unwrap(), self.acc_datum_type);
         let scores = graph.wire_node("scores", scores_einsum, &[q, k])?[0];
-        if let Some(m) = &mut mask {
-            if graph.outlet_fact(*m)?.datum_type != self.acc_datum_type {
-                *m = graph.wire_node("cast_mask", Cast::new(self.acc_datum_type), &[*m])?[0];
-            }
+        if let Some(m) = &mut mask
+            && graph.outlet_fact(*m)?.datum_type != self.acc_datum_type
+        {
+            *m = graph.wire_node("cast_mask", Cast::new(self.acc_datum_type), &[*m])?[0];
         }
 
         let attention_weights =
@@ -244,9 +244,24 @@ impl Sdpa {
 
         let body_outputs = patch.model.output_outlets()?;
         patch.shunt_outside(model, node.id.into(), body_outputs[0])?;
-        //println!("{}",&patch.model);
         Ok(Some(patch))
     }
+}
+
+tract_core::declare_knob!(
+    TRACT_FLASH_SDPA_MIN_SEQ_LEN,
+    usize,
+    0,
+    "Minimum K/V sequence length for head-parallel flash SDPA on CPU; below it the decomposed matmul+softmax path is used."
+);
+
+/// Minimum K/V sequence length at which an f32 `Sdpa` lowers to the (head-parallel)
+/// `FlashSdpaOp` on CPU. Shorter sequences fall back to the decomposed matmul+softmax
+/// path. Override with `TRACT_FLASH_SDPA_MIN_SEQ_LEN`; default `0` = always flash
+/// (head-parallel flash beat the decomposed path at every sequence length measured on
+/// Apple M1, 128–4096; raise this on low-core hosts where short-seq decompose wins).
+fn flash_min_seq_len() -> usize {
+    TRACT_FLASH_SDPA_MIN_SEQ_LEN.get()
 }
 
 impl Op for Sdpa {
@@ -260,11 +275,9 @@ impl Op for Sdpa {
 }
 
 impl EvalOp for Sdpa {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input_facts: TVec<TypedFact> = inputs
             .iter()
             .map(|tv| TypedFact::try_from(tv.clone().into_arc_tensor()))
@@ -364,18 +377,29 @@ impl TypedOp for Sdpa {
         model: &TypedModel,
         node: &TypedNode,
     ) -> TractResult<Option<TypedModelPatch>> {
-        if self.acc_datum_type.is::<f32>() {
+        // FlashSdpaOp accumulates in f32 whatever the input floats are, so an f16
+        // accumulator request is satisfied (with extra precision) as well.
+        if self.acc_datum_type.is::<f32>() || self.acc_datum_type.is::<f16>() {
             // FlashSdpaOp requires Q and V to share the same head dim (last axis).
             // When they differ (MLA / diff-head-sizes attention), fall back to the
             // generic SDPA expansion instead.
             let q_head_dim = model.outlet_fact(node.inputs[0])?.shape.last().cloned();
             let v_head_dim = model.outlet_fact(node.inputs[2])?.shape.last().cloned();
-            if q_head_dim == v_head_dim {
+            // Heuristic: very short K/V sequences are faster through the decomposed
+            // matmul+softmax path (tract's optimized multipliers) than through the
+            // block-wise flash kernel. The head-parallel FlashSdpaOp wins at longer
+            // sequences (and always on memory). Threshold is tunable; default 0 keeps
+            // flash for every sequence — see `flash_min_seq_len`.
+            let k_fact = model.outlet_fact(node.inputs[1])?;
+            let kv_len = k_fact.shape.get(k_fact.rank() - 2).and_then(|d| d.to_usize().ok());
+            let too_short = kv_len.is_some_and(|n| n < flash_min_seq_len());
+            if q_head_dim == v_head_dim && !too_short {
                 let scale = self.scale.as_ref().map(|t| t.cast_to_scalar()).transpose()?;
                 let op = FlashSdpaOp { causal: self.is_causal, scale };
                 TypedModelPatch::replace_single_op(model, node, &node.inputs, op).map(Some)
             } else {
-                self.patch_sdpa(model, node).context("Wiring fallback SDPA (diff head dims)")
+                self.patch_sdpa(model, node)
+                    .context("Wiring fallback SDPA (short seq / diff head dims)")
             }
         } else {
             self.patch_sdpa(model, node).context("Wiring fallback SDPA")
@@ -424,8 +448,12 @@ pub fn match_broadcast_kv_cache_pattern(
         n.op_is::<DynKeyValueCache>() && n.inputs.len() == 1 && n.outputs.len() == 1
     }
 
-    // Find concat or dyn kvcache node
-    rule_if_some!(node = model.previous_node(unsqueeze_node));
+    // Find concat or dyn kvcache node, looking through layout-preserving ops
+    // (dtype casts, rope applied at cache-read time) on the unrepeated branch.
+    let mut node = model.node(unsqueeze_node.inputs[0].node);
+    while node.op_is::<Cast>() || node.op_is::<crate::ops::apply_rope::ApplyRope>() {
+        node = model.node(node.inputs[0].node);
+    }
     rule_if!(is_concat(model, node) || is_dynkv(node));
 
     let kv_outlet = unsqueeze_node.inputs[0];
@@ -533,4 +561,102 @@ pub fn wire_attention_mask(
         &[mask],
     )?[0];
     Ok(reshaped_mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::apply_rope::ApplyRope;
+    use tract_core::ops::array::MultiBroadcastTo;
+    use tract_core::ops::nn::Reduce;
+
+    fn seq_tensor(shape: &[usize], seed: f32) -> Tensor {
+        let n: usize = shape.iter().product();
+        let v: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37 + seed).sin() * 0.5).collect();
+        Tensor::from_shape(shape, &v).unwrap()
+    }
+
+    /// The torch-exported GQA idiom: the repeat-interleave chain sits on top of
+    /// cache-read Cast/ApplyRope ops. The fusion must look through them and hand
+    /// the unrepeated K/V to the (GQA-aware) Sdpa.
+    #[test]
+    fn fuse_kv_broadcast_through_cast_and_rope() -> TractResult<()> {
+        let (b, hq, hkv, s, d) = (1usize, 4usize, 2usize, 6usize, 8usize);
+        let g = hq / hkv;
+        let mut model = TypedModel::default();
+        let dim = |x: usize| x.to_dim();
+        let q = model.add_source("q", f32::fact([b, hq, s, d]))?;
+        let knew = model.add_source("k", f32::fact([b, hkv, s, d]))?;
+        let vnew = model.add_source("v", f32::fact([b, hkv, s, d]))?;
+        let p_sym = model.sym("P");
+        let mkcache = |nm: &str| DynKeyValueCache {
+            name: nm.to_string(),
+            axis: 2,
+            past_sequence_fact: f32::fact([dim(b), dim(hkv), p_sym.clone().into(), dim(d)]),
+            input_sequence_fact: f32::fact([b, hkv, s, d]),
+        };
+        let kc = model.wire_node("kc", mkcache("kc"), &[knew])?[0];
+        let vc = model.wire_node("vc", mkcache("vc"), &[vnew])?[0];
+        let cos = model
+            .add_const("cos", seq_tensor(&[1, 1, s, d], 1.5).cast_to::<f16>()?.into_owned())?;
+        let sin = model
+            .add_const("sin", seq_tensor(&[1, 1, s, d], 2.5).cast_to::<f16>()?.into_owned())?;
+        let k16 = model.wire_node("k.cast16", Cast::new(f16::datum_type()), &[kc])?[0];
+        let kroped = model.wire_node("k.rope", ApplyRope, &[k16, cos, sin])?;
+        let k32 = model.wire_node("k.cast32", Cast::new(f32::datum_type()), &kroped)?[0];
+
+        let mut repeat = |name: &str, outlet: OutletId| -> TractResult<OutletId> {
+            let unsq =
+                model.wire_node(format!("{name}.unsq"), change_axes::AxisOp::Add(2), &[outlet])?[0];
+            let bc = model.wire_node(
+                format!("{name}.bc"),
+                MultiBroadcastTo::new(tvec![dim(b), dim(hkv), dim(g), dim(s), dim(d)].into()),
+                &[unsq],
+            )?[0];
+            Ok(model.wire_node(
+                format!("{name}.reshape"),
+                change_axes::AxisOp::Reshape(1, tvec![dim(hkv), dim(g)], tvec![dim(hkv * g)]),
+                &[bc],
+            )?[0])
+        };
+        let krep = repeat("k", k32)?;
+        let vrep = repeat("v", vc)?;
+
+        let sdpa = Sdpa {
+            scale: None,
+            datum_type: f32::datum_type(),
+            acc_datum_type: f32::datum_type(),
+            is_causal: false,
+        };
+        let out = model.wire_node("sdpa", sdpa, &[q, krep, vrep])?;
+        // keep a single output to compare
+        let red = model.wire_node(
+            "sum",
+            Reduce::new(tvec![0, 1, 2, 3], tract_core::ops::nn::Reducer::Sum),
+            &out,
+        )?;
+        model.select_output_outlets(&red)?;
+
+        let reference = model.clone().into_runnable()?;
+        let mut fused_model = model.clone();
+        Rewriter::default()
+            .with_rule_for("detect-sdpa-kv-cache-broadcast", fuse_kv_cache_broadcast_rule)
+            .rewrite(&(), &mut fused_model)?;
+        ensure!(
+            fused_model.nodes().iter().filter(|n| n.op_is::<MultiBroadcastTo>()).count() == 0,
+            "broadcasts should be fused away"
+        );
+        let fused = fused_model.into_runnable()?;
+
+        let qv = seq_tensor(&[b, hq, s, d], 0.1);
+        let kv = seq_tensor(&[b, hkv, s, d], 0.2);
+        let vv = seq_tensor(&[b, hkv, s, d], 0.3);
+        let r = reference
+            .spawn()?
+            .run(tvec![qv.clone().into(), kv.clone().into(), vv.clone().into()])?
+            .remove(0);
+        let f = fused.spawn()?.run(tvec![qv.into(), kv.into(), vv.into()])?.remove(0);
+        r.close_enough(&f, Approximation::Approximate)?;
+        Ok(())
+    }
 }

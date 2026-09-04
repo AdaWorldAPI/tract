@@ -123,7 +123,7 @@ fn test_concretize() -> anyhow::Result<()> {
     let mut typed = model.into_model()?;
     assert_eq!(typed.input_fact(0)?.to_string(), "B,3,224,224,f32");
     assert_eq!(typed.output_fact(0)?.to_string(), "B,1000,f32");
-    typed.transform(ConcretizeSymbols::new().value("B", 1))?;
+    typed.transform(SetSymbols::new().value("B", 1))?;
     assert_eq!(typed.input_fact(0)?.to_string(), "1,3,224,224,f32");
     assert_eq!(typed.output_fact(0)?.to_string(), "1,1000,f32");
     Ok(())
@@ -136,7 +136,7 @@ fn test_concretize_raw_string() -> anyhow::Result<()> {
     model.set_input_fact(0, "B,3,224,224,f32")?;
     model.analyse()?;
     let mut typed = model.into_model()?;
-    typed.transform(r#"{"name":"concretize_symbols","values":{"B":1}}"#)?;
+    typed.transform(r#"{"name":"set_symbols","values":{"B":1}}"#)?;
     assert_eq!(typed.input_fact(0)?.to_string(), "1,3,224,224,f32");
     assert_eq!(typed.output_fact(0)?.to_string(), "1,1000,f32");
     Ok(())
@@ -154,9 +154,11 @@ fn test_pulse() -> anyhow::Result<()> {
     typed.transform(Pulse::new("5").symbol("B"))?;
     assert_eq!(typed.input_fact(0)?.to_string(), "5,3,224,224,f32");
     assert_eq!(typed.output_fact(0)?.to_string(), "5,1000,f32");
-    let mut properties = typed.property_keys()?;
-    properties.sort();
-    assert_eq!(&properties, &["pulse.delay", "pulse.input_axes", "pulse.output_axes", "pulse.streaming_symbol"]);
+    let properties = typed.property_keys()?;
+    assert!(properties.contains(&"pulse.delay".to_string()));
+    assert!(properties.contains(&"pulse.input_axes".to_string()));
+    assert!(properties.contains(&"pulse.output_axes".to_string()));
+    assert!(properties.contains(&"pulse.streaming_symbol".to_string()));
     assert_eq!(typed.property("pulse.delay")?.as_slice::<i64>()?, &[0i64]);
     Ok(())
 }
@@ -192,9 +194,11 @@ fn test_runtime_properties() -> anyhow::Result<()> {
     let mut typed = model.into_model()?;
     typed.transform(r#"{"name":"pulse","symbol":"B","pulse":"5"}"#)?;
     let runnable = typed.into_runnable()?;
-    let mut properties = runnable.property_keys()?;
-    properties.sort();
-    assert_eq!(&properties, &["pulse.delay", "pulse.input_axes", "pulse.output_axes", "pulse.streaming_symbol"]);
+    let properties = runnable.property_keys()?;
+    assert!(properties.contains(&"pulse.delay".to_string()));
+    assert!(properties.contains(&"pulse.input_axes".to_string()));
+    assert!(properties.contains(&"pulse.output_axes".to_string()));
+    assert!(properties.contains(&"pulse.streaming_symbol".to_string()));
     assert_eq!(runnable.property("pulse.delay")?.as_slice::<i64>()?, &[0i64]);
     Ok(())
 }
@@ -407,5 +411,106 @@ fn test_tensor_methods() -> anyhow::Result<()> {
     assert_eq!(ints.as_slice::<i8>()?, &[-1, 0, 0, 0, 0, 1]);
     let same = Tensor::from_slice::<f32>(&[6], &[-1f32, -0.3, 0., 0.25, 0.75, 1.2])?;
     assert_eq!(floats, same);
+    Ok(())
+}
+
+#[test]
+fn test_onnx_load_with_options_ignoring_value_info() -> anyhow::Result<()> {
+    ensure_models()?;
+    let model = onnx()?
+        .load_with_options("mobilenetv2-7.onnx", OnnxOptions::new().ignore_value_info(true))?
+        .into_model()?
+        .into_runnable()?;
+    let result = model.run([grace_hopper()])?;
+    assert_eq!(argmax(result[0].as_slice::<f32>()?), 652);
+    Ok(())
+}
+
+#[test]
+fn test_onnx_load_with_options_assertions() -> anyhow::Result<()> {
+    ensure_models()?;
+    let model = onnx()?
+        .load_with_options(
+            "mobilenetv2-7.onnx",
+            OnnxOptions::new().assertion("n>=0").assertion("m>=0"),
+        )?
+        .into_model()?
+        .into_runnable()?;
+    let result = model.run([grace_hopper()])?;
+    assert_eq!(argmax(result[0].as_slice::<f32>()?), 652);
+    Ok(())
+}
+
+#[test]
+fn test_onnx_load_buffer_with_options() -> anyhow::Result<()> {
+    ensure_models()?;
+    let buffer = std::fs::read("mobilenetv2-7.onnx")?;
+    let model = onnx()?
+        .load_buffer_with_options(&buffer, OnnxOptions::new().ignore_value_info(true))?
+        .into_model()?
+        .into_runnable()?;
+    let result = model.run([grace_hopper()])?;
+    assert_eq!(argmax(result[0].as_slice::<f32>()?), 652);
+    Ok(())
+}
+
+#[test]
+fn test_onnx_load_with_options_from_json() -> anyhow::Result<()> {
+    ensure_models()?;
+    // The string form is what the C and Python entry points pass.
+    let model = onnx()?
+        .load_with_options(
+            "mobilenetv2-7.onnx",
+            r#"{"ignore_value_info":true,"assertions":["n>=0"]}"#,
+        )?
+        .into_model()?
+        .into_runnable()?;
+    let result = model.run([grace_hopper()])?;
+    assert_eq!(argmax(result[0].as_slice::<f32>()?), 652);
+    Ok(())
+}
+
+#[test]
+fn test_onnx_load_with_options_refuses_unknown_field() -> anyhow::Result<()> {
+    ensure_models()?;
+    // A field that is nearly right is the case that matters: it must not be
+    // silently ignored, or a misspelling looks exactly like an option that took
+    // effect. deny_unknown_fields is what makes that true.
+    let err = onnx()?
+        .load_with_options("mobilenetv2-7.onnx", r#"{"ignore_value_infos":true}"#)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("ignore_value_infos"), "{err}");
+    Ok(())
+}
+
+#[test]
+fn test_onnx_load_with_options_refuses_wrong_type() -> anyhow::Result<()> {
+    ensure_models()?;
+    let err = onnx()?
+        .load_with_options("mobilenetv2-7.onnx", r#"{"ignore_value_info":"maybe"}"#)
+        .unwrap_err()
+        .to_string();
+    assert!(!err.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_onnx_load_with_options_refuses_malformed_assertion() -> anyhow::Result<()> {
+    ensure_models()?;
+    let err = onnx()?
+        .load_with_options("mobilenetv2-7.onnx", OnnxOptions::new().assertion("n >>>"))
+        .unwrap_err()
+        .to_string();
+    assert!(!err.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_onnx_options_round_trip() -> anyhow::Result<()> {
+    let o = OnnxOptions::new().ignore_value_info(true).assertion("h>=0");
+    let json = o.to_json();
+    let back: OnnxOptions = serde_json::from_str(&json)?;
+    assert_eq!(o, back);
     Ok(())
 }

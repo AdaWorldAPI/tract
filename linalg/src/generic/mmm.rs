@@ -5,9 +5,11 @@ use tract_data::prelude::f16;
 use tract_data::prelude::*;
 
 use super::*;
-use crate::frame::block_quant::{BlockQuant, NibbleReader, PackedBlockQuantFormat, Q4_0};
+use crate::frame::block_quant::{
+    BlockQuant, CrumbReader, NibbleReader, PackedBlockQuantFormat, Q2_0_T, Q4_0,
+};
 use crate::frame::mmm::*;
-use crate::{LADatum, Ops, has_fp16};
+use crate::{LADatum, has_fp16};
 
 macro_rules! scalar {
     ($ab: expr, $m: expr, $f: expr) => {
@@ -129,6 +131,43 @@ unsafe fn add_mat_mul_pq40_scales_at_end<const MR: usize, const NR: usize, TB, T
                 let scale = pa.read_f16().as_();
                 for j in 0..NR {
                     ab[i][j] += temp[i][j] * scale;
+                }
+            }
+        }
+    }
+}
+
+// Ternary (Q2_0_T) analog of add_mat_mul_pq40: per 32-block, read MR f16 scales then 32
+// rows of MR 2-bit codes; a code `c` contributes `(c - 1) * scale` (c in {0,1,2}).
+unsafe fn add_mat_mul_pq20t<const MR: usize, const NR: usize, TB, TI>(
+    pa: *const u8,
+    pb: *const u8,
+    k: usize,
+    ab: &mut [[TI; NR]; MR],
+) where
+    TI: LADatum,
+    f16: AsPrimitive<TI>,
+    TB: AsPrimitive<TI>,
+    i8: AsPrimitive<TI>,
+{
+    unsafe {
+        assert!(k % Q2_0_T.block_len() == 0);
+        let len = (k * MR) / Q2_0_T.block_len() * Q2_0_T.block_bytes();
+        let mut pa = CrumbReader::for_slice(std::slice::from_raw_parts(pa, len));
+        let b = pb as *const TB;
+        for bk in 0..k / 32 {
+            let mut scales: [TI; MR] = [TI::zero(); MR];
+            scales.iter_mut().for_each(|x| *x = pa.read_f16().as_());
+            for ik in 0..32 {
+                let mut a: [TI; MR] = [TI::zero(); MR];
+                a.iter_mut()
+                    .zip(&scales)
+                    .for_each(|(x, s)| *x = *s * (pa.read_crumb() as i8 - 1).as_());
+                let b = std::slice::from_raw_parts(b.add(NR * (ik + 32 * bk)), NR);
+                for i in 0..MR {
+                    for j in 0..NR {
+                        ab[i][j] += a[i] * b[j].as_();
+                    }
                 }
             }
         }
@@ -302,6 +341,8 @@ where
                                 pa, pb, k, &mut ab,
                             ),
                             7 => add_mat_mul_pq40::<MR, NR, f32, TI>(pa, pb, k, &mut ab),
+                            8 => add_mat_mul_pq20t::<MR, NR, f16, TI>(pa, pb, k, &mut ab),
+                            9 => add_mat_mul_pq20t::<MR, NR, f32, TI>(pa, pb, k, &mut ab),
                             _ => unreachable!(),
                         }
                     } else if TI::datum_type() == i32::datum_type() {
@@ -351,8 +392,12 @@ fn pq40_r4_se() -> PackedBlockQuantFormat {
     PackedBlockQuantFormat::new(&Q4_0, 4, 0, true)
 }
 
+fn pq20t_r4() -> PackedBlockQuantFormat {
+    PackedBlockQuantFormat::new(&Q2_0_T, 4, 0, false)
+}
+
 // f16 kernels
-MMMRustKernel!(kernel::<f16, 4, 4> => generic_f16_4x4<f16>(4,4)
+MMMRustKernel!(generic; kernel::<f16, 4, 4> => generic_f16_4x4<f16>(4,4)
     packing[1] = f16f16bis => |k| k.with_packing(f16::packing(4), f16::packing(4));
     packing[2] = f32f32 => |k| k.with_packing(f32::packing(4), f32::packing(4));
     packing[3] = f16f32 => |k| k.with_packing(f16::packing(4), f32::packing(4));
@@ -360,11 +405,13 @@ MMMRustKernel!(kernel::<f16, 4, 4> => generic_f16_4x4<f16>(4,4)
     packing[5] = q40f16 => |k| k.with_packing(pq40_r4(), f16::packing(4));
     packing[6] = q40f16se => |k| k.with_packing(pq40_r4_se(), f16::packing(4));
     packing[7] = q40f32 => |k| k.with_packing(pq40_r4(), f32::packing(4));
-    quality(if has_fp16() { ImplementationQuality::Generic } else { ImplementationQuality::Dreadful })
+    packing[8] = q20tf16 => |k| k.with_packing(pq20t_r4(), f16::packing(4));
+    packing[9] = q20tf32 => |k| k.with_packing(pq20t_r4(), f32::packing(4));
+    emulated(|| !has_fp16())
     store(f32, f64)
 );
 
-MMMRustKernel! {kernel::<f16, 4, 1> => generic_f16_4x1<f16>(4,1)
+MMMRustKernel! { generic; kernel::<f16, 4, 1> => generic_f16_4x1<f16>(4,1)
     packing[1] = f16f16bis => |k| k.with_packing(f16::packing(4), f16::packing(1));
     packing[2] = f32f32 => |k| k.with_packing(f32::packing(4), f32::packing(1));
     packing[3] = f16f32 => |k| k.with_packing(f16::packing(4), f32::packing(1));
@@ -372,12 +419,14 @@ MMMRustKernel! {kernel::<f16, 4, 1> => generic_f16_4x1<f16>(4,1)
     packing[5] = q40f16 => |k| k.with_packing(pq40_r4(), f16::packing(1));
     packing[6] = q40f16se => |k| k.with_packing(pq40_r4_se(), f16::packing(1));
     packing[7] = q40f32 => |k| k.with_packing(pq40_r4(), f32::packing(1));
-    quality(if has_fp16() { ImplementationQuality::Generic } else { ImplementationQuality::Dreadful })
+    packing[8] = q20tf16 => |k| k.with_packing(pq20t_r4(), f16::packing(1));
+    packing[9] = q20tf32 => |k| k.with_packing(pq20t_r4(), f32::packing(1));
+    emulated(|| !has_fp16())
     store(f32, f64)
 }
 
 // f32 kernels
-MMMRustKernel!(kernel::<f32, 4, 4> => generic_f32_4x4<f32>(4,4)
+MMMRustKernel!(generic; kernel::<f32, 4, 4> => generic_f32_4x4<f32>(4,4)
     packing[1] = f16f16 => |k| k.with_packing(f16::packing(4), f16::packing(4));
     packing[2] = f32f32bis => |k| k.with_packing(f32::packing(4), f32::packing(4));
     packing[3] = f16f32 => |k| k.with_packing(f16::packing(4), f32::packing(4));
@@ -385,10 +434,11 @@ MMMRustKernel!(kernel::<f32, 4, 4> => generic_f32_4x4<f32>(4,4)
     packing[5] = q40f16 => |k| k.with_packing(pq40_r4(), f16::packing(4));
     packing[6] = q40f16se => |k| k.with_packing(pq40_r4_se(), f16::packing(4));
     packing[7] = q40f32 => |k| k.with_packing(pq40_r4(), f32::packing(4));
-    quality(ImplementationQuality::Generic)
+    packing[8] = q20tf16 => |k| k.with_packing(pq20t_r4(), f16::packing(4));
+    packing[9] = q20tf32 => |k| k.with_packing(pq20t_r4(), f32::packing(4));
     store(f16, f64)
 );
-MMMRustKernel! {kernel::<f32, 4, 1> => generic_f32_4x1<f32>(4,1)
+MMMRustKernel! { generic; kernel::<f32, 4, 1> => generic_f32_4x1<f32>(4,1)
     packing[1] = f16f16 => |k| k.with_packing(f16::packing(4), f16::packing(1));
     packing[2] = f32f32bis => |k| k.with_packing(f32::packing(4), f32::packing(1));
     packing[3] = f16f32 => |k| k.with_packing(f16::packing(4), f32::packing(1));
@@ -396,28 +446,25 @@ MMMRustKernel! {kernel::<f32, 4, 1> => generic_f32_4x1<f32>(4,1)
     packing[5] = q40f16 => |k| k.with_packing(pq40_r4(), f16::packing(1));
     packing[6] = q40f16se => |k| k.with_packing(pq40_r4_se(), f16::packing(1));
     packing[7] = q40f32 => |k| k.with_packing(pq40_r4(), f32::packing(1));
-    quality(ImplementationQuality::Generic)
+    packing[8] = q20tf16 => |k| k.with_packing(pq20t_r4(), f16::packing(1));
+    packing[9] = q20tf32 => |k| k.with_packing(pq20t_r4(), f32::packing(1));
     store(f16, f64)
 }
 
 // f64 kernels
-MMMRustKernel!(kernel::<f64, 4, 4> => generic_f64_4x4<f64>(4,4)
-    quality(ImplementationQuality::Generic)
+MMMRustKernel!(generic; kernel::<f64, 4, 4> => generic_f64_4x4<f64>(4,4)
     store(f16, f32));
-MMMRustKernel!(kernel::<f64, 4, 1> => generic_f64_4x1<f64>(4,1)
-    quality(ImplementationQuality::Generic)
+MMMRustKernel!(generic; kernel::<f64, 4, 1> => generic_f64_4x1<f64>(4,1)
     store(f16, f32));
 
 // I32 kernels
-MMMRustKernel! {kernel::<i32, 4, 4> => generic_i32_4x4<i32>(4,4)
+MMMRustKernel! { generic; kernel::<i32, 4, 4> => generic_i32_4x4<i32>(4,4)
     packing[1] = i8i8 => |k| k.with_packing(i8::packing(4), i8::packing(4));
-    quality(ImplementationQuality::Generic)
     store(i8)
 }
 
-MMMRustKernel! {kernel::<i32, 4, 1> => generic_i32_4x1<i32>(4,1)
+MMMRustKernel! { generic; kernel::<i32, 4, 1> => generic_i32_4x1<i32>(4,1)
     packing[1] = i8i8 => |k| k.with_packing(i8::packing(4), i8::packing(1));
-    quality(ImplementationQuality::Generic)
     store(i8)
 }
 
@@ -431,23 +478,34 @@ MMMRustKernel! {kernel::<i32, 3, 2> => generic_i32_3x2<i32>(3,2)
     store(i8)
 }
 
-pub fn plug(ops: &mut Ops) {
-    ops.mmm_impls.push(generic_f16_4x4.mmm());
-    ops.mmm_impls.push(generic_f16_4x1.mmm());
-    ops.mmm_impls.push(generic_f32_4x4.mmm());
-    ops.mmm_impls.push(generic_f32_4x1.mmm());
-    ops.mmm_impls.push(generic_f64_4x4.mmm());
-    ops.mmm_impls.push(generic_f64_4x1.mmm());
-    ops.mmm_impls.push(generic_i32_4x4.mmm());
-    ops.mmm_impls.push(generic_i32_4x1.mmm());
+/// The generic rules, the tier every platform ends on: fixed kernels, in the tile the
+/// shape asks for. Rank 0, so any arch tier that claims the query answers before it.
+fn generic_preferred(
+    _isa: &crate::isa::IsaSet,
+    dt: DatumType,
+    query: &crate::mmm::Query,
+    _suitable: &[crate::mmm::Suitable],
+) -> Option<&'static str> {
+    let vec = query.n == Some(1);
+    let name = match dt {
+        DatumType::F64 if vec => generic_f64_4x1.name.as_str(),
+        DatumType::F64 => generic_f64_4x4.name.as_str(),
+        DatumType::F32 if vec => generic_f32_4x1.name.as_str(),
+        DatumType::F32 => generic_f32_4x4.name.as_str(),
+        DatumType::F16 if vec => generic_f16_4x1.name.as_str(),
+        DatumType::F16 => generic_f16_4x4.name.as_str(),
+        DatumType::I32 => generic_i32_4x4.name.as_str(),
+        _ => return None,
+    };
+    Some(name)
 }
 
-#[cfg(test)]
-mod test {
-
-    #[test]
-    fn kits() {
-        let mut ops = crate::generic();
-        super::plug(&mut ops);
+inventory::submit! {
+    crate::mmm_tiers::MmmTier {
+        arch: None,
+        precedence: 0,
+        name: "generic",
+        applies: |_| true,
+        preferred: generic_preferred,
     }
 }

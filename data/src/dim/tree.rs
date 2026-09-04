@@ -240,17 +240,52 @@ impl TDim {
     }
 
     #[inline]
-    pub fn to_i64(&self) -> TractResult<i64> {
-        if let Val(v) = self {
-            Ok(*v)
-        } else {
-            Err(TooEarly::UndeterminedSymbol(self.to_string()))?
-        }
+    /// Concrete value of the dim, or a lightweight `TooEarly` for a symbolic
+    /// one. The error is a plain enum — no anyhow conversion, no message
+    /// formatting, and (crucially) no backtrace — so probing concreteness by
+    /// discarding the error (`.ok()`, `if let Ok`) is cheap. Use `?` in a
+    /// `TractResult` context to promote a genuine failure to a full error.
+    pub fn to_i64(&self) -> Result<i64, TooEarly> {
+        if let Val(v) = self { Ok(*v) } else { Err(TooEarly::UndeterminedSymbol(self.to_string())) }
     }
 
     #[inline]
     pub fn as_i64(&self) -> Option<i64> {
         if let Val(v) = self { Some(*v) } else { None }
+    }
+
+    /// Non-erroring counterpart of `eval_to_i64`: returns `None` instead of
+    /// building an error when a symbol is undetermined or arithmetic overflows.
+    /// Use this on hot paths that only want the constant value and discard the
+    /// reason for failure, so no message string is formatted and (crucially,
+    /// when `RUST_BACKTRACE` is set) no backtrace is captured.
+    pub fn maybe_eval_to_i64(&self, values: &SymbolValues) -> Option<i64> {
+        match self {
+            Sym(sym) => values.get(sym),
+            Val(v) => Some(*v),
+            Add(terms) => terms
+                .iter()
+                .try_fold(0i64, |acc, it| acc.checked_add(it.maybe_eval_to_i64(values)?)),
+            Mul(terms) => terms
+                .iter()
+                .try_fold(1i64, |acc, it| acc.checked_mul(it.maybe_eval_to_i64(values)?)),
+            Min(terms) => terms
+                .iter()
+                .try_fold(i64::MAX, |acc, it| Some(acc.min(it.maybe_eval_to_i64(values)?))),
+            Max(terms) => terms
+                .iter()
+                .try_fold(i64::MIN, |acc, it| Some(acc.max(it.maybe_eval_to_i64(values)?))),
+            Broadcast(terms) => terms.iter().try_fold(1i64, |acc, it| {
+                (acc as usize)
+                    .broadcast(it.maybe_eval_to_i64(values)? as usize)
+                    .ok()
+                    .map(|x| x as i64)
+            }),
+            Div(a, q) => Some(a.maybe_eval_to_i64(values)? / *q as i64),
+            MulInt(p, a) => a.maybe_eval_to_i64(values)?.checked_mul(*p),
+            Ge(a, b) => Some((a.maybe_eval_to_i64(values)? >= b.maybe_eval_to_i64(values)?) as i64),
+            Eq(a, b) => Some((a.maybe_eval_to_i64(values)? == b.maybe_eval_to_i64(values)?) as i64),
+        }
     }
 
     pub fn eval_to_i64(&self, values: &SymbolValues) -> TractResult<i64> {
@@ -549,7 +584,7 @@ impl TDim {
 
     pub fn simplify(self) -> TDim {
         use self::TDim::*;
-        if let Ok(v) = self.eval_to_i64(&SymbolValues::default()) {
+        if let Some(v) = self.maybe_eval_to_i64(&SymbolValues::default()) {
             return Val(v);
         }
         let Some(scope) = self.find_scope() else {
@@ -576,7 +611,7 @@ impl TDim {
         if extra.is_empty() {
             return self.simplify();
         }
-        if let Ok(v) = self.eval_to_i64(&SymbolValues::default()) {
+        if let Some(v) = self.maybe_eval_to_i64(&SymbolValues::default()) {
             return Val(v);
         }
         let Some(scope) = self.find_scope() else {
@@ -1056,19 +1091,18 @@ impl TDim {
                                 (Val(1), e) | (e, Val(1)) => Some((e, true)),
                                 _ => None,
                             };
-                            if let Some((expr, equals_one)) = boolean_case {
-                                if scope.prove_positive_or_zero_with_extra(expr, extra)
-                                    && scope.prove_positive_or_zero_with_extra(
-                                        &(Val(1) - expr.clone()),
-                                        extra,
-                                    )
-                                {
-                                    return if equals_one {
-                                        expr.clone()
-                                    } else {
-                                        (Val(1) - expr.clone()).simplify_rec(scope, scenario, extra)
-                                    };
-                                }
+                            if let Some((expr, equals_one)) = boolean_case
+                                && scope.prove_positive_or_zero_with_extra(expr, extra)
+                                && scope.prove_positive_or_zero_with_extra(
+                                    &(Val(1) - expr.clone()),
+                                    extra,
+                                )
+                            {
+                                return if equals_one {
+                                    expr.clone()
+                                } else {
+                                    (Val(1) - expr.clone()).simplify_rec(scope, scenario, extra)
+                                };
                             }
                             Eq(b!(a), b!(b))
                         }
@@ -1124,10 +1158,9 @@ impl TDim {
             Add(terms) => {
                 let mut bound: i64 = 0;
                 for t in terms {
-                    if let Some(b) = t.inclusive_bound(scope, upper) {
+                    {
+                        let b = t.inclusive_bound(scope, upper)?;
                         bound = bound.checked_add(b)?;
-                    } else {
-                        return None;
                     }
                 }
                 Some(bound)
@@ -1365,7 +1398,7 @@ impl TDim {
     }
 
     pub fn compatible_with(&self, other: &TDim) -> bool {
-        if let Ok(x) = (self.clone() - other).to_i64() {
+        if let Some(x) = (self.clone() - other).as_i64() {
             return x == 0;
         }
         true // maybe ? :)
@@ -2308,9 +2341,9 @@ mod tests {
         }
     }
 
-    /// Sym without an explicit `MulInt` wrapper has implicit coefficient
-    /// 1.  Any common factor gcd including 1 collapses to 1, so the
-    /// reduction does nothing — the rule must not silently drop the Sym.
+    /// Sym without an explicit `MulInt` wrapper has implicit coefficient 1.
+    /// Any common factor gcd including 1 collapses to 1, so the reduction
+    /// does nothing — the rule must not silently drop the Sym.
     #[test]
     fn no_reduce_when_sym_has_implicit_unit_coefficient() {
         // (a + 4) / 2 must stay non-trivial — gcd(1, 4, 2) = 1.

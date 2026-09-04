@@ -1,6 +1,5 @@
 use tract_nnef::internal::*;
 use tract_nnef::ser::tdim;
-use tract_nnef::tract_core::trivial_op_state_freeze;
 
 pub fn register(registry: &mut Registry) {
     registry.register_primitive(
@@ -47,29 +46,28 @@ struct PulseMaskOpState {
 impl OpState for PulseMaskOpState {
     fn eval(
         &mut self,
-        session: &mut TurnState,
+        ctx: &EvalContext,
         op: &dyn Op,
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs).into_tensor();
         let op = op.downcast_ref::<PulseMask>().ok_or_else(|| format_err!("Wrong Op type"))?;
-        let tensor = self.pad(session, op, input)?;
+        let tensor = self.pad(ctx, op, input)?;
         Ok(tvec!(tensor.into_tvalue()))
+    }
+
+    fn reset_lanes(&mut self, _lanes: &[LaneId]) -> TractResult<()> {
+        bail!("PulseMask is not lane-aware: current_pos has no lane axis")
     }
 }
 
 impl PulseMaskOpState {
-    fn pad(
-        &mut self,
-        session: &TurnState,
-        op: &PulseMask,
-        mut input: Tensor,
-    ) -> TractResult<Tensor> {
+    fn pad(&mut self, ctx: &EvalContext, op: &PulseMask, mut input: Tensor) -> TractResult<Tensor> {
         let pulse = input.shape()[op.axis];
         let pulse_begin = self.current_pos;
         let pulse_end = self.current_pos + pulse;
         self.current_pos += pulse;
-        let end = op.end.eval(&session.resolved_symbols).to_usize().unwrap_or(usize::MAX);
+        let end = op.end.eval(ctx.symbols).to_usize().unwrap_or(usize::MAX);
 
         // pulse is entirely in valid input, just forward
         if pulse_begin >= op.begin && pulse_end <= end {
@@ -78,25 +76,11 @@ impl PulseMaskOpState {
 
         if pulse_begin < op.begin {
             let fill_up_to = (op.begin - pulse_begin).min(pulse);
-            unsafe {
-                dispatch_copy_by_size!(crate::pad::fill_slice_constant(input.datum_type())(
-                    &mut input,
-                    &op.value,
-                    op.axis,
-                    0..fill_up_to
-                ))
-            };
+            input.fill_slice(0..fill_up_to, &op.value, op.axis)?;
         }
         if pulse_end > end {
             let fill_from = pulse - (pulse_end - end).min(pulse);
-            unsafe {
-                dispatch_copy_by_size!(crate::pad::fill_slice_constant(input.datum_type())(
-                    &mut input,
-                    &op.value,
-                    op.axis,
-                    fill_from..pulse
-                ))
-            }
+            input.fill_slice(fill_from..pulse, &op.value, op.axis)?;
         }
 
         Ok(input)
@@ -124,15 +108,9 @@ impl Op for PulseMask {
 }
 
 impl EvalOp for PulseMask {
-    fn is_stateless(&self) -> bool {
-        false
-    }
+    not_out_of_plan!();
 
-    fn state(
-        &self,
-        _session: &TurnState,
-        _node_id: usize,
-    ) -> TractResult<Option<Box<dyn OpState>>> {
+    fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(Some(Box::<PulseMaskOpState>::default()))
     }
 }
@@ -144,5 +122,3 @@ impl TypedOp for PulseMask {
 
     as_op!();
 }
-
-trivial_op_state_freeze!(PulseMaskOpState);

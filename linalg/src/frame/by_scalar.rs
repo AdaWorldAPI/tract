@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use crate::element_wise::{ElementWise, ElementWiseKer};
 use crate::element_wise_helper::map_slice_with_alignment;
-use crate::{LADatum, LinalgFn};
+use crate::{BinFn, LADatum};
 use tract_data::internal::*;
 
 /// Generic implementation struct that unify all by scalar kernels.
@@ -34,7 +34,7 @@ pub trait ByScalarKer<T>: ElementWiseKer<T, T>
 where
     T: LADatum,
 {
-    fn bin() -> Box<LinalgFn> {
+    fn bin() -> Box<BinFn> {
         Box::new(|a: &mut TensorView, b: &TensorView| {
             let a_slice = a.as_slice_mut()?;
             let b = b.as_slice()?[0];
@@ -43,10 +43,92 @@ where
     }
 }
 
-macro_rules! by_scalar_impl_wrap {
+// A by-scalar binary kernel from a `run` body. A leading arch ident is for bodies that are
+// inline arch asm or intrinsics, which will not even compile elsewhere: those builds get a
+// signature-matched panic stub instead, so the kernel struct exists everywhere.
+/// Declare a by-scalar routine: the kernel, its registry descriptors and its accuracy tests, from
+/// one statement. `op` is what the kernel computes, which is what the tests compare against; `bin`
+/// and `param` ask for the two shapes a by-scalar kernel can answer in -- two views, or a typed
+/// scalar -- and `isa` says which machines may run it, and therefore which may test it.
+macro_rules! routine_by_scalar_rust {
+    (arm; $($rest:tt)*) => { routine_by_scalar_rust!(@ arm, target_arch = "arm"; $($rest)*); };
+    (aarch64; $($rest:tt)*) => {
+        routine_by_scalar_rust!(@ aarch64, target_arch = "aarch64"; $($rest)*);
+    };
+    (x86_64; $($rest:tt)*) => {
+        routine_by_scalar_rust!(@ x86_64, target_arch = "x86_64"; $($rest)*);
+    };
+    (riscv64; $($rest:tt)*) => {
+        routine_by_scalar_rust!(@ riscv64, target_arch = "riscv64"; $($rest)*);
+    };
+    (wasm32; $($rest:tt)*) => {
+        routine_by_scalar_rust!(@ wasm32,
+            all(target_arch = "wasm32", target_feature = "simd128"); $($rest)*);
+    };
+    (generic; $($rest:tt)*) => { routine_by_scalar_rust!(@ generic, all(); $($rest)*); };
+
+    // Each descriptor clause adds its own and hands the rest on, so the kernel and its tests are
+    // written once and no clause has to be spelled inside another.
+    (@ $arch:ident, $built:meta; $ti:ident, $ker:ident, $nr:expr, $alignment_items:expr,
+     $run:item, op($op:ident), bin $(, param($param:ident))? $(, isa($($isa:ident),+))?) => {
+        paste! {
+            submit_routine!($arch; [<Bin $ti:upper>], BinByScalar($op), $ker $(, isa($($isa),+))?);
+        }
+        routine_by_scalar_rust!(@ $arch, $built; $ti, $ker, $nr, $alignment_items, $run,
+            op($op) $(, param($param))? $(, isa($($isa),+))?);
+    };
+
+    (@ $arch:ident, $built:meta; $ti:ident, $ker:ident, $nr:expr, $alignment_items:expr,
+     $run:item, op($op:ident), param($param:ident) $(, isa($($isa:ident),+))?) => {
+        paste! {
+            submit_routine!($arch; [<$ti:upper Param>], $param, $ker $(, isa($($isa),+))?);
+        }
+        routine_by_scalar_rust!(@ $arch, $built; $ti, $ker, $nr, $alignment_items, $run,
+            op($op) $(, isa($($isa),+))?);
+    };
+
+    (@ $arch:ident, $built:meta; $ti:ident, $ker:ident, $nr:expr, $alignment_items:expr,
+     $run:item, op($op:ident) $(, isa($($isa:ident),+))?) => {
+        by_scalar_kernel!(@ $built; $ti, $ker, $nr, $alignment_items, $ti, $run);
+        paste! {
+            #[cfg(test)]
+            mod [<test_ $ker:snake>] {
+                use super::*;
+                by_scalar_frame_tests!(
+                    cfg!($built)
+                        && $crate::isa::IsaReq::ANY
+                            $(.needing(&[$($crate::isa::Isa::$isa),+]))?
+                            .satisfied_by($crate::isa::native()),
+                    $ti,
+                    $ker,
+                    bin_reference!($op)
+                );
+            }
+        }
+    };
+}
+
+macro_rules! by_scalar_kernel {
+    (arm; $($rest:tt)*) => { by_scalar_kernel!(@ target_arch = "arm"; $($rest)*); };
+    (aarch64; $($rest:tt)*) => { by_scalar_kernel!(@ target_arch = "aarch64"; $($rest)*); };
+    (x86_64; $($rest:tt)*) => { by_scalar_kernel!(@ target_arch = "x86_64"; $($rest)*); };
+    (riscv64; $($rest:tt)*) => { by_scalar_kernel!(@ target_arch = "riscv64"; $($rest)*); };
+    (wasm32; $($rest:tt)*) => { by_scalar_kernel!(@ all(target_arch = "wasm32", target_feature = "simd128"); $($rest)*); };
+
+    (@ $built:meta; $ti:ident, $func:ident, $nr:expr, $alignment_items:expr, $params:ty, $run:item) => {
+        #[cfg($built)]
+        by_scalar_kernel!($ti, $func, $nr, $alignment_items, $params, $run);
+        #[cfg(not($built))]
+        by_scalar_kernel!($ti, $func, $nr, $alignment_items, $params,
+            fn run(_vec: &mut [$ti], _params: $params) {
+                panic!(concat!(stringify!($func), ": kernel not built for this target"))
+            }
+        );
+    };
+
     ($ti: ident, $func: ident, $nr: expr, $alignment_items: expr, $params: ty, $run: item) => {
         paste! {
-            ew_impl_wrap!($ti, $func, $nr, $alignment_items, $ti, $run);
+            ew_kernel!($ti, $func, $nr, $alignment_items, $ti, $run);
 
             impl crate::frame::by_scalar::ByScalarKer<$ti> for $func {}
         }

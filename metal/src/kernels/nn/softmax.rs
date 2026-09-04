@@ -47,8 +47,19 @@ impl Softmax {
         let shape_nd3 = utils::reshape_to_rank_3(input.shape(), axis);
         let strides_nd3 = Tensor::natural_strides(&shape_nd3);
 
-        let pipeline =
-            stream.load_pipeline(LibraryName::NNOps, &self.kernel_name(input.datum_type())?)?;
+        // Fast path for contiguous last-axis softmax (strides[1]==1) whose dim is
+        // a multiple of 4 (so every row start stays 16-byte aligned for the
+        // float4/half4 loads). Falls back to the general strided kernel otherwise.
+        let dt = input.datum_type();
+        let tname = DeviceTensor::tname(dt)?;
+        let use_contig = strides_nd3[1] == 1 && shape_nd3[1].is_multiple_of(4);
+        let kernel_name = if use_contig {
+            ensure!(Self::is_supported_dt(dt), "Unsupported dt {:?} for metal softmaxop", dt);
+            format!("nn_ops::softmax_nd3_contig_{tname}")
+        } else {
+            self.kernel_name(dt)?
+        };
+        let pipeline = stream.load_pipeline(LibraryName::NNOps, &kernel_name)?;
 
         let command_buffer = stream.command_buffer();
         command_buffer.encode(|encoder| {
@@ -96,7 +107,7 @@ mod tests {
     use proptest::prelude::*;
     use tract_core::internal::Tensor;
     use tract_core::ops::nn::Softmax as TractSoftmax;
-    use tract_core::ops::nn::{SoftmaxExp, SoftmaxKind};
+    use tract_core::ops::nn::SoftmaxKind;
     use tract_gpu::tensor::IntoDevice;
 
     #[test]
@@ -112,11 +123,13 @@ mod tests {
             let cpu_softmax = TractSoftmax {
                 axes: tvec![axis],
                 quant_output_dt: None,
-                kind: SoftmaxKind::Softmax(SoftmaxExp::Libc),
+                kind: SoftmaxKind::Softmax,
             };
 
-            let cpu_output =
-                cpu_softmax.eval(tvec![a.to_host()?.into_tvalue()])?[0].clone().into_tensor();
+            let cpu_output = cpu_softmax
+                .eval(&EvalContext::out_of_plan(), tvec![a.to_host()?.into_tvalue()])?[0]
+                .clone()
+                .into_tensor();
             let metal_output = Softmax.eval(stream, &a, axis)?;
             cpu_output
                 .close_enough(&metal_output.to_host()?.into_tensor(), Approximation::Approximate)?;
@@ -140,11 +153,13 @@ mod tests {
             let cpu_softmax = TractSoftmax {
                 axes: tvec![axis],
                 quant_output_dt: None,
-                kind: SoftmaxKind::Softmax(SoftmaxExp::Libc),
+                kind: SoftmaxKind::Softmax,
             };
 
-            let cpu_output =
-                cpu_softmax.eval(tvec![a.to_host()?.into_tvalue()])?[0].clone().into_tensor();
+            let cpu_output = cpu_softmax
+                .eval(&EvalContext::out_of_plan(), tvec![a.to_host()?.into_tvalue()])?[0]
+                .clone()
+                .into_tensor();
             let metal_output = Softmax.eval(stream, &a, axis)?;
             cpu_output
                 .close_enough(&metal_output.to_host()?.into_tensor(), Approximation::Approximate)?;
@@ -168,11 +183,13 @@ mod tests {
             let cpu_softmax = TractSoftmax {
                 axes: tvec![axis],
                 quant_output_dt: None,
-                kind: SoftmaxKind::Softmax(SoftmaxExp::Libc),
+                kind: SoftmaxKind::Softmax,
             };
 
-            let cpu_output =
-                cpu_softmax.eval(tvec![a.to_host()?.into_tvalue()])?[0].clone().into_tensor();
+            let cpu_output = cpu_softmax
+                .eval(&EvalContext::out_of_plan(), tvec![a.to_host()?.into_tvalue()])?[0]
+                .clone()
+                .into_tensor();
             let metal_output = Softmax.eval(stream, &a, axis)?;
             cpu_output
                 .close_enough(&metal_output.to_host()?.into_tensor(), Approximation::Approximate)?;
@@ -255,9 +272,12 @@ mod tests {
             let cpu_softmax = TractSoftmax {
                 axes: tvec![self.axis],
                 quant_output_dt: None,
-                kind: SoftmaxKind::Softmax(SoftmaxExp::Libc),
+                kind: SoftmaxKind::Softmax,
             };
-            let cpu_output = cpu_softmax.eval(tvec![a.into_tvalue()])?[0].clone().into_tensor();
+            let cpu_output = cpu_softmax
+                .eval(&EvalContext::out_of_plan(), tvec![a.into_tvalue()])?[0]
+                .clone()
+                .into_tensor();
             Ok(cpu_output)
         }
 

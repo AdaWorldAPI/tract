@@ -55,19 +55,12 @@ impl Op for Slice {
 }
 
 impl EvalOp for Slice {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        _node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs);
-        let start = self.start.eval(&session.resolved_symbols).to_usize()?;
-        let end = self.end.eval(&session.resolved_symbols).to_usize()?;
+        let start = self.start.eval(ctx.symbols).to_usize()?;
+        let end = self.end.eval(ctx.symbols).to_usize()?;
         eval_slice(&input, self.axis, start, end)
     }
 }
@@ -88,8 +81,8 @@ fn eval_slice(input: &Tensor, axis: usize, start: usize, end: usize) -> TractRes
 impl TypedOp for Slice {
     fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
         anyhow::ensure!(inputs.len() == 1, "Slice has one single input");
-        if let (Ok(start), Ok(end), Ok(len)) =
-            (self.start.to_usize(), self.end.to_usize(), inputs[0].shape[self.axis].to_usize())
+        if let (Some(start), Some(end), Some(len)) =
+            (self.start.as_usize(), self.end.as_usize(), inputs[0].shape[self.axis].as_usize())
         {
             ensure!(start <= end);
             ensure!(end <= len);
@@ -178,7 +171,7 @@ impl TypedOp for Slice {
         }
     }
 
-    fn substitute_symbols(
+    fn set_symbols(
         &self,
         _source: &TypedModel,
         node: &TypedNode,

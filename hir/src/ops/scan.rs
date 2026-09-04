@@ -41,12 +41,10 @@ impl Op for InferenceScan {
 }
 
 impl EvalOp for InferenceScan {
-    fn is_stateless(&self) -> bool {
-        false
-    }
+    not_out_of_plan!();
 
-    fn state(&self, session: &TurnState, node_id: usize) -> TractResult<Option<Box<dyn OpState>>> {
-        self.to_mir_scan()?.state(session, node_id)
+    fn state(&self, ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
+        self.to_mir_scan()?.state(ctx)
     }
 }
 

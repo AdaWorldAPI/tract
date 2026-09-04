@@ -149,7 +149,9 @@ impl ConvProblem {
         let (m, k, n, h, w) = mknhw(self.filters.shape(), self.input.shape());
         let output_shape = [m, h, w];
         let internal_output_shape = [m, h * w];
-        let mmm = tract_linalg::ops().mmm(F32, Some(m), Some(k), Some(n)).unwrap();
+        let mmm = tract_linalg::MmmDispatch::native()
+            .preferred_kernel(F32, Some(m), Some(k), Some(n))
+            .unwrap();
         let output = Tensor::zero::<f32>(&internal_output_shape)?;
         let reshaped_filters = self.filters.clone().into_shape(&[k, m])?;
         let (a_pack, b_pack) = &mmm.packings()[0];
@@ -294,9 +296,9 @@ impl MMMInputFormat for EagerIm2colSpec {
         todo!();
     }
 
-    fn prepare_one(
+    fn prepare_one_view(
         &self,
-        _t: &Tensor,
+        _t: &TensorView,
         _k_axis: usize,
         _mn_axis: usize,
     ) -> TractResult<Box<dyn MMMInputValue>> {
@@ -417,9 +419,9 @@ impl MMMInputFormat for LazyIm2colSpec {
     fn prepare_tensor(&self, _t: &Tensor, _k_axis: usize, _mn_axis: usize) -> TractResult<Tensor> {
         todo!();
     }
-    fn prepare_one(
+    fn prepare_one_view(
         &self,
-        _t: &Tensor,
+        _t: &TensorView,
         _k_axis: usize,
         _mn_axis: usize,
     ) -> TractResult<Box<dyn MMMInputValue>> {

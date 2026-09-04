@@ -102,7 +102,7 @@ fn pulse_driven_blockify(
     model.symbols.add_assertion(format!("{chunk_sym} >= 0"))?;
     let subs: HashMap<Symbol, TDim> =
         HashMap::from([(symbol.clone(), chunk_sym.to_dim() * pulse_value)]);
-    *model = model.substitute_symbols(&subs)?;
+    *model = model.set_symbols(&subs)?;
     crate::blockify::rewrite_sections(model, &chunk_sym, pulse_value)?;
     model.properties.insert(
         crate::blockify::BLOCKIFY_ORIGINAL_SYMBOL.to_string(),
@@ -371,16 +371,16 @@ impl Op for PulseWrappingOp {
 }
 
 impl EvalOp for PulseWrappingOp {
-    fn is_stateless(&self) -> bool {
-        self.0.is_stateless()
+    fn eval_out_of_plan(&self, inputs: TVec<TValue>) -> TractResult<Option<TVec<TValue>>> {
+        self.0.eval_out_of_plan(inputs)
     }
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
-        self.0.eval(inputs)
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        self.0.eval(&EvalContext::out_of_plan(), inputs)
     }
 
-    fn state(&self, session: &TurnState, node_id: usize) -> TractResult<Option<Box<dyn OpState>>> {
-        self.0.state(session, node_id)
+    fn state(&self, ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
+        self.0.state(ctx)
     }
 }
 
@@ -461,16 +461,16 @@ impl Op for NonPulsingWrappingOp {
 }
 
 impl EvalOp for NonPulsingWrappingOp {
-    fn is_stateless(&self) -> bool {
-        self.0.is_stateless()
+    fn eval_out_of_plan(&self, inputs: TVec<TValue>) -> TractResult<Option<TVec<TValue>>> {
+        self.0.eval_out_of_plan(inputs)
     }
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
-        self.0.eval(inputs)
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        self.0.eval(&EvalContext::out_of_plan(), inputs)
     }
 
-    fn state(&self, session: &TurnState, node_id: usize) -> TractResult<Option<Box<dyn OpState>>> {
-        self.0.state(session, node_id)
+    fn state(&self, ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
+        self.0.state(ctx)
     }
 }
 

@@ -43,7 +43,9 @@ fn mk_suite() -> infra::TestSuite {
         "proptest_f16",
         SdpaProblemParams { embed_dims: vec![64, 128] },
     );
-    infra::TestSuite::default().with("onnx", onnx).with("unit", unit)
+    let pulse = suite_pulse::suite().unwrap().clone();
+
+    infra::TestSuite::default().with("onnx", onnx).with("unit", unit).with("pulse", pulse)
 }
 
 fn ignore_unit(t: &[String], case: &dyn Test) -> bool {
@@ -54,6 +56,7 @@ fn ignore_unit(t: &[String], case: &dyn Test) -> bool {
     if let Some(sdpab) = case.downcast_ref::<SdpaProblem<half::f16>>() {
         return !compatible_sdpa::<half::f16>(sdpab);
     }
+
     t[0] == "sdpa" && t[1] == "proptest_f32"
 }
 

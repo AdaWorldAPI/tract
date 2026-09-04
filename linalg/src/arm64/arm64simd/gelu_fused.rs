@@ -6,12 +6,11 @@
 // computation up front and the final 0.5*x*(1+tanh) combined via fmla.
 // Single memory pass (load + store), no scratch buffer.
 
-ew_impl_wrap!(
+routine_ew_rust!(aarch64;
     f32,
     arm64simd_gelu_f32_4n_fused,
     4,
     4,
-    (),
     #[inline(never)]
     fn run(buf: &mut [f32], _: ()) {
         // Tanh Padé coefficients (matches arm64simd_tanh_f32_4n.S.j2) +
@@ -20,8 +19,8 @@ ew_impl_wrap!(
         //   index 14: sqrt(2/pi)              ≈ 0.7978846
         //   index 15: 0.044715 * sqrt(2/pi)   ≈ 0.0356774
         static COEFFS: [f32; 16] = [
-            -8.9,
-            8.9,
+            -7.5,
+            7.5,
             -8.488492677e-14,
             5.277853000e-11,
             -2.022500419e-8,
@@ -51,8 +50,8 @@ ew_impl_wrap!(
             // Register layout (loop4):
             //   v0-v3: coefficients
             //   v4:    sqrt(2/pi)  (broadcast of v3.s[2])
-            //   v5:    tanh clamp low (-8.9, dup v0.s[0])
-            //   v6:    tanh clamp high (8.9, dup v0.s[1])
+            //   v5:    tanh clamp low (-7.5, dup v0.s[0])
+            //   v6:    tanh clamp high (7.5, dup v0.s[1])
             //   v7:    0.5 (broadcast of v3.s[1])
             //   v8-v11: 0.5 * original x (saved after load)
             //   v16-v19: working (load -> pre_tanh -> clamped -> numerator)
@@ -209,7 +208,9 @@ ew_impl_wrap!(
                     fdiv v18.4s, v18.4s, v26.4s
                     fdiv v19.4s, v19.4s, v27.4s
 
-                    // result = 0.5*x * (1 + tanh) = (0.5*x) + (0.5*x) * tanh
+                    // result = 0.5*x * (1 + tanh) = (0.5*x) + (0.5*x) * tanh, one
+                    // rounding, so the sign holds as long as the quotient holds [-1, 1] —
+                    // which is what keeps the argument clamp at 7.5 and not higher.
                     fmla v8.4s, v8.4s, v16.4s
                     fmla v9.4s, v9.4s, v17.4s
                     fmla v10.4s, v10.4s, v18.4s
@@ -282,11 +283,6 @@ ew_impl_wrap!(
             options(nostack),
             );
         }
-    }
+    },
+    func(Gelu)
 );
-
-#[cfg(test)]
-pub mod test_arm64simd_gelu_f32_4n_fused {
-    use super::*;
-    gelu_frame_tests!(true, f32, arm64simd_gelu_f32_4n_fused);
-}

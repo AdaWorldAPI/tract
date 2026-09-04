@@ -1,13 +1,11 @@
 use crate::fact::DeviceTypedFactExt;
-use crate::tensor::{DeviceTensor, DeviceTensorExt, IntoDevice};
+use crate::tensor::{DeviceTensorExt, IntoDevice};
 use derive_new::new;
 use tract_core::internal::*;
-use tract_core::ops::OpStateFreeze;
 use tract_transformers::ops::dyn_kv_cache::{DynKeyValueCache, DynKeyValueCacheState};
 
 #[derive(Debug, Clone, new)]
 pub struct GpuDynKVCacheState {
-    node_id: usize,
     name: String,
     axis: usize,
     past_sequence_fact: TypedFact,
@@ -43,6 +41,10 @@ impl OpState for GpuDynKVCacheState {
         Some((self.name.clone(), self.past_sequence_fact.clone()))
     }
 
+    fn has_init_tensor_fact(&self) -> bool {
+        true
+    }
+
     fn resolve_symbols(&mut self, state: &mut TurnState) -> TractResult<()> {
         let shape = self
             .kv_cache
@@ -53,7 +55,7 @@ impl OpState for GpuDynKVCacheState {
 
     fn eval(
         &mut self,
-        session: &mut TurnState,
+        ctx: &EvalContext,
         op: &dyn Op,
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>> {
@@ -74,12 +76,8 @@ impl OpState for GpuDynKVCacheState {
             op_inputs.iter().map(|it| it.to_device_tensor()).collect::<TractResult<TVec<_>>>()?;
         let mut output_shape = inputs[0].shape().to_vec();
         output_shape[axis] = inputs.iter().map(|it| it.shape()[axis]).sum();
-        let output = crate::session_handler::make_tensor_for_node(
-            session,
-            self.node_id,
-            inputs[0].datum_type(),
-            &output_shape,
-        )?;
+        let output =
+            crate::turn_handler::make_tensor_for_node(ctx, inputs[0].datum_type(), &output_shape)?;
 
         // Concat inputs into output
         let ctx = crate::device::get_context()?;
@@ -107,6 +105,10 @@ impl OpState for GpuDynKVCacheState {
         self.kv_cache = Some(res.clone());
         Ok(tvec!(res))
     }
+
+    fn reset_lanes(&mut self, _lanes: &[LaneId]) -> TractResult<()> {
+        bail!("GpuDynKVCache is not lane-aware: the cache has no lane axis")
+    }
 }
 
 impl GpuDynKVCacheState {
@@ -117,49 +119,6 @@ impl GpuDynKVCacheState {
             *v = t.into_device()?.into_tensor().into_tvalue();
         }
         Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct FrozenGpuDynKVCacheState {
-    node_id: usize,
-    name: String,
-    axis: usize,
-    past_sequence_fact: TypedFact,
-    kv_cache: Option<DeviceTensor>,
-}
-
-impl OpStateFreeze for GpuDynKVCacheState {
-    fn freeze(&self) -> Box<dyn FrozenOpState + 'static> {
-        Box::new(FrozenGpuDynKVCacheState {
-            node_id: self.node_id,
-            name: self.name.clone(),
-            axis: self.axis,
-            past_sequence_fact: self.past_sequence_fact.clone(),
-            kv_cache: self.kv_cache.clone().map(|t| t.to_device_tensor().cloned().unwrap()),
-        })
-    }
-
-    fn freeze_into(self: Box<Self>) -> Box<dyn FrozenOpState> {
-        Box::new(FrozenGpuDynKVCacheState {
-            node_id: self.node_id,
-            name: self.name,
-            axis: self.axis,
-            past_sequence_fact: self.past_sequence_fact,
-            kv_cache: self.kv_cache.map(|t| t.to_device_tensor().cloned().unwrap()),
-        })
-    }
-}
-
-impl FrozenOpState for FrozenGpuDynKVCacheState {
-    fn unfreeze(&self) -> Box<dyn OpState> {
-        Box::new(GpuDynKVCacheState {
-            node_id: self.node_id,
-            name: self.name.clone(),
-            axis: self.axis,
-            past_sequence_fact: self.past_sequence_fact.clone(),
-            kv_cache: self.kv_cache.clone().map(|t| t.into_tensor().into_tvalue()),
-        })
     }
 }
 
@@ -219,13 +178,10 @@ impl Op for GpuDynKVCache {
 }
 
 impl EvalOp for GpuDynKVCache {
-    fn is_stateless(&self) -> bool {
-        false
-    }
+    not_out_of_plan!();
 
-    fn state(&self, _session: &TurnState, node_id: usize) -> TractResult<Option<Box<dyn OpState>>> {
+    fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(Some(Box::new(GpuDynKVCacheState::new(
-            node_id,
             self.name.clone(),
             self.axis,
             self.past_sequence_fact.clone(),

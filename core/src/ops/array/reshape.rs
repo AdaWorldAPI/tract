@@ -19,11 +19,9 @@ impl Op for FiniteReshape {
 }
 
 impl EvalOp for FiniteReshape {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs);
         let mut tensor = input.into_tensor();
         unsafe {

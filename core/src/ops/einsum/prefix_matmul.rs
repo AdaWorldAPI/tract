@@ -36,6 +36,10 @@ fn rule(
     let is_fp_mm = op.q_params.is_none() && node.inputs.len() == 2;
     let is_q_mm = op.q_params.is_some() && node.inputs.len() == 9;
     rule_if!(is_fp_mm || is_q_mm);
+    // PrefixMatMul carries no bias; the quantized fusion would drop the einsum
+    // bias input. Only the serialization path (strict) relies on this form, so
+    // on exec backends leave quantized einsums to lower through requant.
+    rule_if!(ctx.ensure_strict_matmul_semantic || op.q_params.is_none());
     rule_if!(
         op.q_params.is_none()
             || model.node_input_facts(node.id)?.iter().skip(3).all(|i| i.konst.is_some())
@@ -247,11 +251,9 @@ impl Op for PrefixMatMul {
 }
 
 impl EvalOp for PrefixMatMul {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let c_dt = self.operating_dt.unwrap_or_else(|| {
             let a_dt = inputs[0].datum_type();
             let b_dt = inputs[1].datum_type();

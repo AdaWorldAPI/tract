@@ -21,12 +21,13 @@ pub mod downsample;
 pub mod dummy;
 pub mod einsum;
 pub mod fft;
+pub mod gru_cell;
 pub mod identity;
 pub mod konst;
 pub mod logic;
+pub mod lstm_cell;
 pub mod math;
 pub mod matmul;
-// pub mod memory;
 pub mod nn;
 pub mod quant;
 pub mod scan;
@@ -84,21 +85,7 @@ impl std::fmt::Debug for Cost {
     }
 }
 
-pub trait FrozenOpState: fmt::Debug + dyn_clone::DynClone + Send + 'static {
-    fn unfreeze(&self) -> Box<dyn OpState>;
-}
-
-pub trait OpStateFreeze {
-    fn freeze(&self) -> Box<dyn FrozenOpState>;
-    /// Consuming freeze: moves data instead of cloning. Default delegates to freeze().
-    fn freeze_into(self: Box<Self>) -> Box<dyn FrozenOpState> {
-        self.freeze()
-    }
-}
-
-dyn_clone::clone_trait_object!(FrozenOpState);
-
-pub trait OpState: fmt::Debug + dyn_clone::DynClone + OpStateFreeze + Downcast {
+pub trait OpState: fmt::Debug + dyn_clone::DynClone + Downcast + Send {
     fn load_from(
         &mut self,
         _: &mut TurnState,
@@ -115,42 +102,70 @@ pub trait OpState: fmt::Debug + dyn_clone::DynClone + OpStateFreeze + Downcast {
         None
     }
 
+    /// Allocation-free predicate mirroring whether [`OpState::init_tensor_fact`]
+    /// returns `Some`. The per-run symbol-resolution path queries this once for
+    /// every stateful op on every `run`, so it must not call `init_tensor_fact`
+    /// (which clones a `String` and a `TypedFact`) merely to test for presence.
+    /// Any impl that overrides `init_tensor_fact` to return `Some` must override
+    /// this to return `true` (and delegate it wherever `init_tensor_fact` is
+    /// delegated), or its `resolve_symbols` will not run.
+    fn has_init_tensor_fact(&self) -> bool {
+        false
+    }
+
     fn resolve_symbols(&mut self, _: &mut TurnState) -> TractResult<()> {
         Ok(())
     }
 
     fn eval(
         &mut self,
-        session: &mut TurnState,
+        ctx: &EvalContext,
         op: &dyn Op,
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>>;
+
+    /// Discard what this state carries for `lanes`, so each can be handed to
+    /// another stream. Required, with no default: an op holding per-lane state
+    /// clears those rows, one holding none says so with `Ok(())`, and one that
+    /// cannot serve several streams at once fails here -- which is where a laned
+    /// runtime finds out, since it resets every lane before the first turn.
+    fn reset_lanes(&mut self, lanes: &[LaneId]) -> TractResult<()>;
 }
 dyn_clone::clone_trait_object!(OpState);
 impl_downcast!(OpState);
 
 pub trait EvalOp {
+    /// Evaluate the op. `ctx` says where and when: the turn's symbols, the shared
+    /// resources a handler installed, and `(session, node_id)` so an op can key
+    /// whatever scratch it manages for itself. Ops carrying state that must
+    /// survive from one turn to the next build it in [`EvalOp::state`] instead,
+    /// and evaluate through [`OpState::eval`].
     #[allow(unused_variables)]
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
-        bail!("stateless evaluation not implemented")
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        bail!("{} has neither eval nor state", std::any::type_name::<Self>())
     }
 
-    #[allow(unused_variables)]
-    fn eval_with_session(
-        &self,
-        node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
-        self.eval(inputs).context("Running legacy eval")
-    }
+    /// Evaluate with no plan around the node -- const folding, shape inference,
+    /// tests -- or `None` when there is no answer without one, because the op
+    /// reads the context or keeps state between turns. Required, with no default:
+    /// an op answering `Some` has produced the value from `inputs` alone, by
+    /// construction, so the claim and the act cannot disagree. Write it with
+    /// `op_out_of_plan!()` or `not_out_of_plan!()`.
+    fn eval_out_of_plan(&self, inputs: TVec<TValue>) -> TractResult<Option<TVec<TValue>>>;
 
+    /// Build this node's inter-turn state, or `None` when the op keeps nothing
+    /// between turns. This is what decides whether the plan holds an
+    /// [`OpState`] for the node; there is no separate predicate.
     #[allow(unused_variables)]
-    fn state(&self, session: &TurnState, node_id: usize) -> TractResult<Option<Box<dyn OpState>>> {
+    fn state(&self, ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(None)
     }
 
-    fn is_stateless(&self) -> bool;
+    /// Release whatever the op manages for `session`, called for every node as a
+    /// state is dropped. Ops keeping scratch keyed by `(session, node_id)` must
+    /// implement it, or that scratch outlives the session that made it.
+    #[allow(unused_variables)]
+    fn drop_session(&self, session: SessionId, node_id: usize) {}
 }
 
 /// A base operation
@@ -295,7 +310,7 @@ pub trait TypedOp:
     /// expressions (a concrete integer is `TDim::Val(v)`; an expression
     /// can be any other TDim, including symbolic ones).
     #[allow(unused_variables)]
-    fn substitute_symbols(
+    fn set_symbols(
         &self,
         source: &TypedModel,
         node: &TypedNode,

@@ -1,6 +1,7 @@
 pub mod apply_rope;
 pub mod gelu_approximate;
 pub mod leaky_relu;
+pub mod pool;
 pub mod reduce;
 pub mod rms_norm;
 pub mod scaled_masked_softmax;
@@ -32,7 +33,11 @@ pub fn all_functions() -> Vec<String> {
             .flat_map(|op| {
                 tract_gpu::tensor::DeviceTensor::SUPPORTED_DT.into_iter().map(move |dt| (op, dt))
             })
-            .flat_map(|(op, dt)| reduce::kernel_name(&op, dt).into_iter()),
+            .flat_map(|(op, dt)| {
+                [false, true]
+                    .into_iter()
+                    .flat_map(move |large| reduce::kernel_name(&op, dt, large).into_iter())
+            }),
     );
     functions.extend(
         tract_gpu::tensor::DeviceTensor::SUPPORTED_DT
@@ -40,11 +45,11 @@ pub fn all_functions() -> Vec<String> {
             .flat_map(|dt| Softmax.kernel_name(dt).into_iter()),
     );
 
-    functions.extend(
-        tract_gpu::tensor::DeviceTensor::SUPPORTED_DT
+    functions.extend(tract_gpu::tensor::DeviceTensor::SUPPORTED_DT.into_iter().flat_map(|dt| {
+        [false, true]
             .into_iter()
-            .flat_map(|dt| ScaledMaskedSoftmax.kernel_name(dt).into_iter()),
-    );
+            .flat_map(move |mb| ScaledMaskedSoftmax.kernel_name(dt, mb).into_iter())
+    }));
 
     functions.extend(
         tract_gpu::tensor::DeviceTensor::SUPPORTED_DT

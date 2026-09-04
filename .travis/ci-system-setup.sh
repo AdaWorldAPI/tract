@@ -3,19 +3,41 @@ set -e
 
 [ -d $ROOT/.travis ] || exit 1 "\$ROOT not set correctly '$ROOT'"
 
-if [ -z "$RUSTUP_TOOLCHAIN" ]
-then
-    export RUSTUP_TOOLCHAIN=1.91.0
-fi
+sh $ROOT/.travis/cpu-features.sh
 
 export RUSTUP_TOOLCHAIN
 PATH=$PATH:$HOME/.cargo/bin
 
-if [ -n "$CI" -a ! -e /tmp/ci-setup-done ]
+# Defined unconditionally (not gated on the once-per-job /tmp/ci-setup-done
+# marker below) so every script that sources this file gets apt_retry, even
+# when ci-system-setup.sh's own one-time setup already ran in a parent shell.
+if [ `uname` != "Darwin" -a "$RUNNER_ENVIRONMENT" != "self-hosted" ]
+then
+    if [ `whoami` != "root" ]
+    then
+        SUDO=sudo
+    fi
+    apt_retry() {
+        tries=0
+        while [ $tries -lt 3 ]
+        do
+            timeout 150 $SUDO "$@" && return 0
+            tries=$((tries + 1))
+            # azure.archive.ubuntu.com is a known flaky mirror; after the
+            # first failure, drop it so the rest of the retries go
+            # straight to the canonical mirror instead of stalling again.
+            $SUDO sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt 2>/dev/null || true
+            $SUDO sed -i 's/azure\.archive\.ubuntu\.com/archive.ubuntu.com/g' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
+            sleep 5
+        done
+        return 1
+    }
+fi
+
+if [ -n "$CI" -a ! -e /tmp/ci-setup-done -a -z "$TRACT_PREBUILT_CI" ]
 then
     if [ `uname` = "Darwin" ]
     then
-        sysctl -n machdep.cpu.brand_string
         python3 --version
         brew install coreutils numpy python-setuptools jshon
         PATH="/opt/homebrew/opt/coreutils/libexec/gnubin:$PATH"
@@ -23,21 +45,9 @@ then
     else
         if [ "$RUNNER_ENVIRONMENT" != "self-hosted" ]
         then
-            if [ `whoami` != "root" ]
-            then
-                SUDO=sudo
-            fi
-            $SUDO apt-get update
-            # $SUDO apt-get upgrade -y
-            $SUDO apt-get install -y llvm python3 python3-numpy jshon wget curl build-essential sudo jshon clang 
-            if ! which aws
-            then
-                curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
-                $SUDO apt-get install -y unzip
-                unzip -q awscliv2.zip
-                $SUDO ./aws/install
-                aws --version
-            fi
+            apt_retry apt-get update
+            # apt_retry apt-get upgrade -y
+            apt_retry apt-get install -y llvm python3 python3-numpy jshon wget curl build-essential sudo jshon clang
         fi
     fi
 
@@ -49,21 +59,22 @@ then
     touch /tmp/ci-setup-done
 fi
 
-S3=https://s3.amazonaws.com/tract-ci-builds/tests
+export TRACT_MODELS_URL=${TRACT_MODELS_URL:-https://tract-test-assets.tract.rs}
 
 if  [ -n "$LARGE_MODELS" ]
 then
     export CACHE_FILE=$ROOT/.travis/cache_file.sh
-    export MODELS=$HOME/.cache/models
+    export MODELS=$HOME/.cache/tract-test-assets
     export CACHEDIR=$MODELS
     mkdir -p $MODELS
 elif [ -n "$CI" ]
 then
-    MODELS=$S3
+    MODELS=$TRACT_MODELS_URL
     CACHE_FILE=true
-else 
+else
     CACHE_FILE=$ROOT/.travis/cache_file.sh
-    MODELS=${MODELS:-$ROOT/.cached}
+    MODELS=${MODELS:-$HOME/.cache/tract-test-assets}
+    export CACHEDIR=${CACHEDIR:-$MODELS}
     mkdir -p $MODELS
 fi
 
@@ -84,4 +95,5 @@ then
     TRACT_RUNTIMES="$TRACT_RUNTIMES --cuda"
 fi
 
+export TRACT_RUNTIMES
 echo $TRACT_RUNTIMES

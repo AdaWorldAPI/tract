@@ -30,7 +30,9 @@ fn mk_suite() -> infra::TestSuite {
         ConvProblemParams { no_batch: true, ..ConvProblemParams::default() },
     );
 
-    infra::TestSuite::default().with("onnx", onnx).with("unit", unit)
+    let pulse = suite_pulse::suite().unwrap().clone();
+
+    infra::TestSuite::default().with("onnx", onnx).with("unit", unit).with("pulse", pulse)
 }
 
 fn ignore_unit(t: &[String], _case: &dyn Test) -> bool {

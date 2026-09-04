@@ -1,4 +1,5 @@
 pub mod max;
+pub mod min;
 pub mod softmax;
 pub mod sum;
 
@@ -11,7 +12,93 @@ use crate::LADatum;
 
 use super::element_wise_helper::{map_reduce_slice_with_alignment, reduce_slice_with_alignment};
 
-macro_rules! reduce_impl_wrap {
+// A reduction kernel from a `run` body. A leading arch ident is for bodies that are inline
+// arch asm or intrinsics, which will not even compile elsewhere: those builds get
+// signature-matched panic stubs instead, so the kernel struct exists everywhere.
+/// Declare a reduction routine: the kernel, its registry descriptor and its accuracy tests, from
+/// one statement. `op` is what the kernel folds, which gives the descriptor's function, the tests'
+/// reference, the identity to start from and how two answers combine; `isa` says which machines
+/// may run it, and therefore which may test it.
+macro_rules! routine_reduce_rust {
+    (arm; $($rest:tt)*) => { routine_reduce_rust!(@ arm, target_arch = "arm"; $($rest)*); };
+    (aarch64; $($rest:tt)*) => {
+        routine_reduce_rust!(@ aarch64, target_arch = "aarch64"; $($rest)*);
+    };
+    (x86_64; $($rest:tt)*) => {
+        routine_reduce_rust!(@ x86_64, target_arch = "x86_64"; $($rest)*);
+    };
+    (riscv64; $($rest:tt)*) => {
+        routine_reduce_rust!(@ riscv64, target_arch = "riscv64"; $($rest)*);
+    };
+    (wasm32; $($rest:tt)*) => {
+        routine_reduce_rust!(@ wasm32,
+            all(target_arch = "wasm32", target_feature = "simd128"); $($rest)*);
+    };
+    (generic; $($rest:tt)*) => { routine_reduce_rust!(@ generic, all(); $($rest)*); };
+
+    // One arm per operation, each naming the identity it starts from and how two answers combine,
+    // then handing the rest on. That is the only place those two facts are written.
+    (@ $arch:ident, $built:meta; $ti:ident, $ker:ident, $nr:expr, $alignment_items:expr,
+     $run:item, op(Max) $(, isa($($isa:ident),+))?) => {
+        routine_reduce_rust!(@@ $arch, $built; $ti, $ker, $nr, $alignment_items, $run, Max,
+            <$ti>::MIN, fn reduce_two(a: $ti, b: $ti) -> $ti { a.max(b) }
+            $(, isa($($isa),+))?);
+    };
+    (@ $arch:ident, $built:meta; $ti:ident, $ker:ident, $nr:expr, $alignment_items:expr,
+     $run:item, op(Min) $(, isa($($isa:ident),+))?) => {
+        routine_reduce_rust!(@@ $arch, $built; $ti, $ker, $nr, $alignment_items, $run, Min,
+            <$ti>::MAX, fn reduce_two(a: $ti, b: $ti) -> $ti { a.min(b) }
+            $(, isa($($isa),+))?);
+    };
+    (@ $arch:ident, $built:meta; $ti:ident, $ker:ident, $nr:expr, $alignment_items:expr,
+     $run:item, op(Sum) $(, isa($($isa:ident),+))?) => {
+        routine_reduce_rust!(@@ $arch, $built; $ti, $ker, $nr, $alignment_items, $run, Sum,
+            <$ti as num_traits::Zero>::zero(), fn reduce_two(a: $ti, b: $ti) -> $ti { a + b }
+            $(, isa($($isa),+))?);
+    };
+
+    (@@ $arch:ident, $built:meta; $ti:ident, $ker:ident, $nr:expr, $alignment_items:expr,
+     $run:item, $op:ident, $neutral:expr, $fold:item $(, isa($($isa:ident),+))?) => {
+        reduce_kernel!(@ $built; $ti, $ker, $nr, $alignment_items, (), $neutral, $run, $fold);
+        paste! {
+            submit_routine!($arch; [<$ti:upper Reduce>], [<Reduce $op>], $ker $(, isa($($isa),+))?);
+            #[cfg(test)]
+            mod [<test_ $ker:snake>] {
+                use super::*;
+                crate::[<$op:snake _frame_tests>]!(
+                    cfg!($built)
+                        && $crate::isa::IsaReq::ANY
+                            $(.needing(&[$($crate::isa::Isa::$isa),+]))?
+                            .satisfied_by($crate::isa::native()),
+                    $ti,
+                    $ker
+                );
+            }
+        }
+    };
+}
+
+macro_rules! reduce_kernel {
+    (arm; $($rest:tt)*) => { reduce_kernel!(@ target_arch = "arm"; $($rest)*); };
+    (aarch64; $($rest:tt)*) => { reduce_kernel!(@ target_arch = "aarch64"; $($rest)*); };
+    (x86_64; $($rest:tt)*) => { reduce_kernel!(@ target_arch = "x86_64"; $($rest)*); };
+    (riscv64; $($rest:tt)*) => { reduce_kernel!(@ target_arch = "riscv64"; $($rest)*); };
+    (wasm32; $($rest:tt)*) => { reduce_kernel!(@ all(target_arch = "wasm32", target_feature = "simd128"); $($rest)*); };
+
+    (@ $built:meta; $ti:ident, $func:ident, $nr:expr, $alignment_items:expr, $params:ty, $neutral:expr, $run:item, $reduce_two:item) => {
+        #[cfg($built)]
+        reduce_kernel!($ti, $func, $nr, $alignment_items, $params, $neutral, $run, $reduce_two);
+        #[cfg(not($built))]
+        reduce_kernel!($ti, $func, $nr, $alignment_items, $params, $neutral,
+            fn run(_vec: &[$ti], _params: $params) -> $ti {
+                panic!(concat!(stringify!($func), ": kernel not built for this target"))
+            },
+            fn reduce_two(_a: $ti, _b: $ti) -> $ti {
+                panic!(concat!(stringify!($func), ": kernel not built for this target"))
+            }
+        );
+    };
+
     ($ti: ident, $func: ident, $nr: expr, $alignment_items: expr, $params: ty, $neutral: expr, $run: item, $reduce_two: item) => {
         paste! {
             #[derive(Copy, Clone, Debug)]
@@ -113,7 +200,71 @@ where
 }
 
 #[allow(unused_macros)]
-macro_rules! map_reduce_impl_wrap {
+// A map-reduce kernel from a `run` body, arch ident as in `reduce_kernel!`.
+/// Declare a map-reduction routine: the kernel, its registry descriptor and its accuracy tests,
+/// from one statement. One arm per operation, naming the two identities it starts from and how two
+/// answers combine, which is the only place those follow from the operation.
+macro_rules! routine_map_reduce_rust {
+    (arm; $($rest:tt)*) => { routine_map_reduce_rust!(@ arm, target_arch = "arm"; $($rest)*); };
+    (aarch64; $($rest:tt)*) => {
+        routine_map_reduce_rust!(@ aarch64, target_arch = "aarch64"; $($rest)*);
+    };
+    (x86_64; $($rest:tt)*) => {
+        routine_map_reduce_rust!(@ x86_64, target_arch = "x86_64"; $($rest)*);
+    };
+    (riscv64; $($rest:tt)*) => {
+        routine_map_reduce_rust!(@ riscv64, target_arch = "riscv64"; $($rest)*);
+    };
+    (wasm32; $($rest:tt)*) => {
+        routine_map_reduce_rust!(@ wasm32,
+            all(target_arch = "wasm32", target_feature = "simd128"); $($rest)*);
+    };
+    (generic; $($rest:tt)*) => { routine_map_reduce_rust!(@ generic, all(); $($rest)*); };
+
+    (@ $arch:ident, $built:meta; $ti:ident, $ker:ident, $nr:expr, $alignment_items:expr,
+     $run:item, op(Softmax2) $(, isa($($isa:ident),+))?) => {
+        map_reduce_kernel!(@ $built; $ti, $ker, $nr, $alignment_items, $ti,
+            <$ti>::NEG_INFINITY, <$ti as num_traits::Zero>::zero(), $run,
+            fn reduce_two(a: $ti, b: $ti) -> $ti { a + b });
+        paste! {
+            submit_routine!($arch; [<$ti:upper MapReduce>], Softmax2, $ker $(, isa($($isa),+))?);
+            #[cfg(test)]
+            mod [<test_ $ker:snake>] {
+                use super::*;
+                crate::softmax_l2_frame_tests!(
+                    cfg!($built)
+                        && $crate::isa::IsaReq::ANY
+                            $(.needing(&[$($crate::isa::Isa::$isa),+]))?
+                            .satisfied_by($crate::isa::native()),
+                    $ti,
+                    $ker
+                );
+            }
+        }
+    };
+}
+
+macro_rules! map_reduce_kernel {
+    (arm; $($rest:tt)*) => { map_reduce_kernel!(@ target_arch = "arm"; $($rest)*); };
+    (aarch64; $($rest:tt)*) => { map_reduce_kernel!(@ target_arch = "aarch64"; $($rest)*); };
+    (x86_64; $($rest:tt)*) => { map_reduce_kernel!(@ target_arch = "x86_64"; $($rest)*); };
+    (riscv64; $($rest:tt)*) => { map_reduce_kernel!(@ target_arch = "riscv64"; $($rest)*); };
+    (wasm32; $($rest:tt)*) => { map_reduce_kernel!(@ all(target_arch = "wasm32", target_feature = "simd128"); $($rest)*); };
+
+    (@ $built:meta; $ti:ident, $func:ident, $nr:expr, $alignment_items:expr, $params:ty, $map_neutral:expr, $reduce_neutral:expr, $run:item, $reduce_two:item) => {
+        #[cfg($built)]
+        map_reduce_kernel!($ti, $func, $nr, $alignment_items, $params, $map_neutral, $reduce_neutral, $run, $reduce_two);
+        #[cfg(not($built))]
+        map_reduce_kernel!($ti, $func, $nr, $alignment_items, $params, $map_neutral, $reduce_neutral,
+            fn run(_vec: &mut [$ti], _params: $params) -> $ti {
+                panic!(concat!(stringify!($func), ": kernel not built for this target"))
+            },
+            fn reduce_two(_a: $ti, _b: $ti) -> $ti {
+                panic!(concat!(stringify!($func), ": kernel not built for this target"))
+            }
+        );
+    };
+
     ($ti: ident, $func: ident, $nr: expr, $alignment_items: expr, $params: ty, $map_neutral: expr, $reduce_neutral: expr, $run: item, $reduce_two: item) => {
         paste! {
             #[derive(Copy, Clone, Debug)]

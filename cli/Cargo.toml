@@ -1,6 +1,6 @@
 [package]
 name = "tract-cli"
-version = "0.23.0-pre"
+version = "0.23.7-pre"
 authors = [
   "Romain Liautaud <romain.liautaud@snips.ai>",
   "Mathieu Poumeyrol <kali@zoy.org>",
@@ -12,7 +12,8 @@ keywords = ["TensorFlow", "NeuralNetworks"]
 categories = ["science"]
 autobenches = false
 edition = "2024"
-include = ["Cargo.toml", "src/**/*.rs", "LICENSE*"]
+default-run = "tract"
+include = ["Cargo.toml", "src/**/*.rs", "cost-model-seeds/*.txt", "LICENSE*"]
 
 [[bin]]
 name = "tract"
@@ -22,11 +23,9 @@ path = "src/main.rs"
 maintenance = { status = "actively-developed" }
 
 [dependencies]
-atty.workspace = true
 box_drawing.workspace = true
 clap.workspace = true
 erased-serde.workspace = true
-criterion.workspace = true
 colorous.workspace = true
 env_logger.workspace = true
 flate2.workspace = true
@@ -47,12 +46,13 @@ py_literal.workspace = true
 readings-probe.workspace = true
 ron.workspace = true
 regex.workspace = true
-reqwest.workspace = true
-rustls.workspace = true
-webpki-roots.workspace = true
 scan_fmt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+minijinja = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
+time = { workspace = true, optional = true }
+toml = { workspace = true, optional = true, features = ["preserve_order"] }
 tract-linalg = { workspace = true, features = ["hwbench"] }
 tract-core.workspace = true
 tract-hir.workspace = true
@@ -70,12 +70,32 @@ tract-transformers = { workspace = true, optional = true }
 zerofrom.workspace = true
 float-ord.workspace = true
 
+# Neither the criterion harness (rayon) nor reqwest's transport (tokio/socket2)
+# builds for wasm, so the `criterion` subcommand and HTTP model loading are
+# native-only.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+criterion.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 tract-metal.workspace = true
 
+# Hosts we develop and benchmark on: there the CLI enumerates every architecture's kernels,
+# not just the ones it can run.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+tract-linalg = { workspace = true, features = ["foreign-inventory"] }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+tract-linalg = { workspace = true, features = ["foreign-inventory"] }
+
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-cudarc.workspace = true
-tract-cuda = { workspace = true, default-features = false }
+cudarc = { workspace = true, optional = true }
+tract-cuda = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 
 [features]
 default = [
@@ -96,23 +116,30 @@ pulse = ["tract-pulse", "tract-pulse-opl"]
 tf = ["tract-tensorflow", "tract-libcli/hir"]
 tflite = ["tract-tflite"]
 transformers = ["tract-transformers", "tract-libcli/transformers"]
-conform = ["tract-tensorflow/conform"]
 multithread-mm = ["tract-linalg/multithread-mm"]
+bench-suite = ["dep:toml", "dep:tar", "dep:minijinja", "dep:time", "multithread-mm"]
+
+# Marker feature implicitly enabled by every cuda-XXXXX selector below.
+# Use to gate cudarc-specific code paths in tract-cli. Not meant to be
+# enabled directly — always pick a concrete cuda-XXXXX so cudarc has an
+# API version to bind against.
+cuda = []
 
 # CUDA driver-API selectors (linux/windows targets only). Picking one binds
 # cudarc against the matching CUDA enum/struct layout; the resulting binary
 # runs on any driver whose API is >= the chosen one. Exactly one must be
 # active. The default pulls cuda-13000 in; cross-compiles aimed at older
-# drivers (e.g. aarch64 with CUDA 12) override with `--no-default-features`.
-cuda-12000 = ["tract-cuda/cuda-12000"]
-cuda-12010 = ["tract-cuda/cuda-12010"]
-cuda-12020 = ["tract-cuda/cuda-12020"]
-cuda-12030 = ["tract-cuda/cuda-12030"]
-cuda-12040 = ["tract-cuda/cuda-12040"]
-cuda-12050 = ["tract-cuda/cuda-12050"]
-cuda-12060 = ["tract-cuda/cuda-12060"]
-cuda-12080 = ["tract-cuda/cuda-12080"]
-cuda-12090 = ["tract-cuda/cuda-12090"]
-cuda-13000 = ["tract-cuda/cuda-13000"]
-cuda-13010 = ["tract-cuda/cuda-13010"]
-cuda-13020 = ["tract-cuda/cuda-13020"]
+# drivers (e.g. aarch64 with CUDA 12) override with `--no-default-features`
+# plus an explicit cuda-12XXX.
+cuda-12000 = ["cuda", "dep:cudarc", "dep:tract-cuda", "tract-libcli/cuda", "tract-cuda/cuda-12000"]
+cuda-12010 = ["cuda", "dep:cudarc", "dep:tract-cuda", "tract-libcli/cuda", "tract-cuda/cuda-12010"]
+cuda-12020 = ["cuda", "dep:cudarc", "dep:tract-cuda", "tract-libcli/cuda", "tract-cuda/cuda-12020"]
+cuda-12030 = ["cuda", "dep:cudarc", "dep:tract-cuda", "tract-libcli/cuda", "tract-cuda/cuda-12030"]
+cuda-12040 = ["cuda", "dep:cudarc", "dep:tract-cuda", "tract-libcli/cuda", "tract-cuda/cuda-12040"]
+cuda-12050 = ["cuda", "dep:cudarc", "dep:tract-cuda", "tract-libcli/cuda", "tract-cuda/cuda-12050"]
+cuda-12060 = ["cuda", "dep:cudarc", "dep:tract-cuda", "tract-libcli/cuda", "tract-cuda/cuda-12060"]
+cuda-12080 = ["cuda", "dep:cudarc", "dep:tract-cuda", "tract-libcli/cuda", "tract-cuda/cuda-12080"]
+cuda-12090 = ["cuda", "dep:cudarc", "dep:tract-cuda", "tract-libcli/cuda", "tract-cuda/cuda-12090"]
+cuda-13000 = ["cuda", "dep:cudarc", "dep:tract-cuda", "tract-libcli/cuda", "tract-cuda/cuda-13000"]
+cuda-13010 = ["cuda", "dep:cudarc", "dep:tract-cuda", "tract-libcli/cuda", "tract-cuda/cuda-13010"]
+cuda-13020 = ["cuda", "dep:cudarc", "dep:tract-cuda", "tract-libcli/cuda", "tract-cuda/cuda-13020"]

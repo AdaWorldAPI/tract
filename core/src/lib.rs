@@ -65,6 +65,9 @@ extern crate proptest;
 pub extern crate tract_data;
 pub extern crate tract_linalg;
 
+pub use tract_data::declare_knob;
+pub use tract_data::knobs;
+
 #[macro_use]
 pub mod macros;
 #[macro_use]
@@ -74,6 +77,7 @@ pub mod axes;
 pub mod broadcast;
 pub mod floats;
 pub mod framework;
+pub mod lanes;
 pub mod model;
 pub mod optim;
 pub mod plan;
@@ -91,9 +95,7 @@ mod late_bind;
 pub mod prelude {
     pub use crate::framework::Framework;
     pub use crate::model::*;
-    pub use crate::runtime::{
-        FrozenState, RunOptions, Runnable, Runtime, State, runtime_for_name, runtimes,
-    };
+    pub use crate::runtime::{RunOptions, Runnable, Runtime, State, runtime_for_name, runtimes};
     pub use crate::value::{IntoTValue, TValue};
     pub use std::sync::Arc;
     pub use tract_data::prelude::*;
@@ -109,12 +111,15 @@ pub mod prelude {
 pub mod internal {
     pub extern crate inventory;
     pub use crate::axes::{AxesMapping, Axis};
+    pub use crate::lanes::{LaneTable, LanedRunnable, SessionHandle};
     pub use crate::late_bind::*;
-    pub use crate::model::*;
     pub use crate::ops::change_axes::*;
     pub use crate::ops::element_wise::ElementWiseMiniOp;
-    pub use crate::ops::{Cost, EvalOp, FrozenOpState, Op, OpState, Validation};
-    pub use crate::plan::{SessionStateHandler, SimplePlan, SimpleState, TurnState};
+    pub use crate::ops::{Cost, EvalOp, Op, OpState, Validation};
+    pub use crate::plan::{
+        EvalContext, LaneId, Seating, SessionId, SimplePlan, SimpleState, TurnShared, TurnState,
+        TurnStateHandler,
+    };
     pub use crate::prelude::*;
     pub use crate::runtime::{
         DefaultRuntime, Runnable, Runtime, State, runtime_for_name, runtimes,
@@ -134,7 +139,7 @@ pub mod internal {
     };
     pub use tvec;
     pub use {args_1, args_2, args_3, args_4, args_5, args_6, args_7, args_8};
-    pub use {as_op, not_a_typed_op, op_as_typed_op};
+    pub use {as_op, not_a_typed_op, not_out_of_plan, op_as_typed_op, op_out_of_plan};
     pub use {bin_to_super_type, element_wise, element_wise_oop};
     pub use {rule_if, rule_if_let, rule_if_some};
 }

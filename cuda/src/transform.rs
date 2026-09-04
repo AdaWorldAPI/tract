@@ -13,6 +13,19 @@ use tract_core::ops::cnn::conv::rewrite_kernel_conv_in_oihw;
 use tract_core::ops::cnn::{Conv, rewrite_conv_with_n_axis};
 use tract_core::ops::einsum::prefix_matmul::{PrefixMatMul, rewrite_einsum_to_prefix_matmul};
 use tract_core::ops::konst::Const;
+
+tract_core::declare_knob!(
+    TRACT_CUDA_FORCE_CPU,
+    String,
+    String::new(),
+    "Comma-separated node-name substrings forced onto the CPU instead of CUDA."
+);
+tract_core::declare_knob!(
+    TRACT_CUDA_TRANSLATE_DEBUG,
+    bool,
+    false,
+    "Log nodes that fail output-fact validation during CUDA translation."
+);
 use tract_core::ops::nn::Reduce;
 use tract_core::tract_linalg::block_quant::Q4_0;
 use tract_core::transform::ModelTransform;
@@ -28,6 +41,7 @@ use tract_transformers::ops::sdpa::Sdpa;
 /// Each kernel module submits one (or more) of these via [`register_cuda_op!`].
 pub struct CudaOpTranslator {
     pub type_id: TypeId,
+    #[allow(clippy::type_complexity)]
     pub try_make: fn(&TypedModel, &TypedNode) -> TractResult<Option<Box<dyn TypedOp>>>,
 }
 
@@ -425,29 +439,81 @@ impl Translate<TypedFact, Box<dyn TypedOp>, TypedFact, Box<dyn TypedOp>> for Cud
                 convert_sdpa_to_cuda_flash_attn(source, node, target, &mut device_inputs, op)?;
             return sync_model_outputs_if_required(source, node, target, outlet_ids);
         }
-        if let Some(conv) = node.op_as::<Conv>() {
-            if input_facts.iter().all(|f| DeviceTensor::is_supported_dt(f.datum_type))
-                && matches!(input_facts[0].datum_type, F16 | F32)
-            {
-                let device_inputs =
-                    sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToDevice)?;
-                let outlet_ids = wire_cuda_conv(source, node, target, &device_inputs, conv)?;
-                return sync_model_outputs_if_required(source, node, target, outlet_ids);
-            }
+        if let Some(conv) = node.op_as::<Conv>()
+            && input_facts.iter().all(|f| DeviceTensor::is_supported_dt(f.datum_type))
+            && matches!(input_facts[0].datum_type, F16 | F32)
+        {
+            let device_inputs =
+                sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToDevice)?;
+            let outlet_ids = wire_cuda_conv(source, node, target, &device_inputs, conv)?;
+            return sync_model_outputs_if_required(source, node, target, outlet_ids);
         }
         // Const: inline conversion, not a GPU op
-        if let Some(op) = node.op_as::<Const>() {
-            if DeviceTensor::is_supported_dt(op.val().datum_type()) {
-                let device_inputs =
-                    sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToDevice)?;
-                let outlet_ids =
-                    target.wire_node(node.name.clone(), convert_const(op)?, &device_inputs)?;
-                return sync_model_outputs_if_required(source, node, target, outlet_ids);
-            }
+        if let Some(op) = node.op_as::<Const>()
+            && DeviceTensor::is_supported_dt(op.val().datum_type())
+        {
+            let device_inputs =
+                sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToDevice)?;
+            let outlet_ids =
+                target.wire_node(node.name.clone(), convert_const(op)?, &device_inputs)?;
+            return sync_model_outputs_if_required(source, node, target, outlet_ids);
         }
 
-        // Single-op translation
-        if let Some(gpu_op) = try_make_cuda_op(source, node)? {
+        // Single-op translation.  Pre-check that the gpu_op accepts the
+        // already-translated target-side input facts: some translators
+        // (notably the AxisOp path: GpuAxisOp can carry a `Reshape(from,
+        // to)` whose dims were synthesised from the source shape, but an
+        // upstream node may have been translated into a different shape
+        // — e.g. pulsification of an upstream matmul producing a smaller
+        // axis).  Without the pre-check, those stale reshapes pass
+        // try_make_cuda_op and then bail inside `wire_node`'s output_facts
+        // call, aborting the entire CUDA transform.  Fall back to the CPU
+        // op so the model stays runnable.
+        // Snapshot target-side input facts before any further mutation; clone
+        // out so we release the borrow on `target` before wiring below.
+        let target_inputs: TVec<TypedFact> = node
+            .inputs
+            .iter()
+            .map(|i| target.outlet_fact(mapping[i]).cloned())
+            .collect::<TractResult<_>>()?;
+        // Mirror what `sync_inputs_if_required(ToDevice)` will do at wire time:
+        // wrap any non-device input as a device fact so the GPU op's
+        // `output_facts` sees the same uniform device-fact inputs it will get
+        // after sync nodes are inserted.  Without this, mixed host/device
+        // inputs (e.g. an LLM kv-cache concat: host past + device current) make
+        // `output_facts` bail with "Inconsistent facts", wrongly tripping the
+        // CPU fallback.
+        let target_inputs_post_sync: TVec<TypedFact> = target_inputs
+            .iter()
+            .map(|f| -> TractResult<TypedFact> {
+                if f.as_device_fact().is_some() {
+                    Ok(f.clone())
+                } else {
+                    Ok(tract_gpu::fact::DeviceFact::from_host(f.clone())?.into_exotic_fact())
+                }
+            })
+            .collect::<TractResult<_>>()?;
+        let target_input_post_sync_refs: TVec<&TypedFact> =
+            target_inputs_post_sync.iter().collect();
+        let force_cpu = TRACT_CUDA_FORCE_CPU
+            .get()
+            .split(',')
+            .any(|pat| !pat.is_empty() && node.name.contains(pat));
+        let maybe_gpu_op = if force_cpu { None } else { try_make_cuda_op(source, node)? };
+        if let Some(ref op) = maybe_gpu_op
+            && TRACT_CUDA_TRANSLATE_DEBUG.get()
+            && let Err(e) = op.output_facts(&target_input_post_sync_refs)
+        {
+            eprintln!(
+                "cuda-translate-fallback: {} ({}) inputs={:?} -> {e:?}",
+                node.name,
+                op.name(),
+                target_inputs_post_sync,
+            );
+        }
+        if let Some(gpu_op) = maybe_gpu_op
+            && gpu_op.output_facts(&target_input_post_sync_refs).is_ok()
+        {
             let device_inputs =
                 sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToDevice)?;
             let outlet_ids = target.wire_node(node.name.clone(), gpu_op, &device_inputs)?;
@@ -457,45 +523,6 @@ impl Translate<TypedFact, Box<dyn TypedOp>, TypedFact, Box<dyn TypedOp>> for Cud
                 sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToHost)?;
             target.wire_node(&node.name, node.op.clone(), &cpu_inputs)
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_prefix_matmul_transform_f32_f16() -> TractResult<()> {
-        let mut model = TypedModel::default();
-        let (b, m, k, n) = (1, 16, 128, 32);
-
-        let a_fact = TypedFact::dt_shape(DatumType::F32, &[b, m, k]);
-        let b_fact = TypedFact::dt_shape(DatumType::F16, &[b, k, n]);
-
-        let source_a = model.add_source("a", a_fact)?;
-        let source_b = model.add_source("b", b_fact)?;
-
-        let op = PrefixMatMul {
-            transpose_a: false,
-            transpose_b: false,
-            transpose_c: false,
-            quantize_output: None,
-            operating_dt: Some(DatumType::F32),
-        };
-
-        let matmul_out = model.wire_node("matmul", op, &[source_a, source_b])?;
-        model.select_output_outlets(&matmul_out)?;
-
-        let tensor_a = Tensor::zero::<f32>(&[b, m, k])?;
-        let tensor_b = Tensor::zero::<f16>(&[b, k, n])?;
-        let inputs = tvec!(tensor_a.into(), tensor_b.into());
-
-        let transform = CudaTransform::default();
-        transform.transform(&mut model)?;
-
-        let cuda_runnable = model.into_runnable()?;
-        let _ = cuda_runnable.run(inputs)?;
-        Ok(())
     }
 }
 
@@ -520,4 +547,43 @@ fn split_multi_axis_reduce(
     }
     patch.shunt_outside(model, node.id.into(), wire)?;
     Ok(Some(patch))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_prefix_matmul_transform_f32_f16() -> TractResult<()> {
+        let mut model = TypedModel::default();
+        let (b, m, k, n) = (1, 16, 128, 32);
+
+        let a_fact = TypedFact::dt_shape(DatumType::F32, [b, m, k]);
+        let b_fact = TypedFact::dt_shape(DatumType::F16, [b, k, n]);
+
+        let source_a = model.add_source("a", a_fact)?;
+        let source_b = model.add_source("b", b_fact)?;
+
+        let op = PrefixMatMul {
+            transpose_a: false,
+            transpose_b: false,
+            transpose_c: false,
+            quantize_output: None,
+            operating_dt: Some(DatumType::F32),
+        };
+
+        let matmul_out = model.wire_node("matmul", op, &[source_a, source_b])?;
+        model.select_output_outlets(&matmul_out)?;
+
+        let tensor_a = Tensor::zero::<f32>(&[b, m, k])?;
+        let tensor_b = Tensor::zero::<f16>(&[b, k, n])?;
+        let inputs = tvec!(tensor_a.into(), tensor_b.into());
+
+        let transform = CudaTransform;
+        transform.transform(&mut model)?;
+
+        let cuda_runnable = model.into_runnable()?;
+        let _ = cuda_runnable.run(inputs)?;
+        Ok(())
+    }
 }

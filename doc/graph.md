@@ -83,7 +83,7 @@ the value (a tensor) of each wire in the graph,
 
 tract actually does much more than running the network as described in previous
 section. It is capable of performing several optimisations, at the single node
-or at the graph level. It can also perfom specific transformation, like
+or at the graph level. It can also perform specific transformation, like
 converting a streaming network to a pulsing network.
 
 In order to perform these network rewrites, tract needs to be able to reason
@@ -124,7 +124,7 @@ TypedFact has also a optional constant value: if a tensor in the graph has a
 constant value regardless of the network inputs, this is information the
 optimiser may be able to use to simplify the network.
 
-As we implied beforehand, this type is not suitable to reprensent network where
+As we implied beforehand, this type is not suitable to represent network where
 some wires have an unknown datum type, or partial shape information. In order
 to reason about these networks, we need a more flexible Fact:
 

@@ -1,5 +1,4 @@
 use crate::internal::*;
-use ndarray::*;
 
 use super::MultiBroadcastTo;
 
@@ -21,31 +20,22 @@ impl Op for Tile {
 }
 
 impl EvalOp for Tile {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        _node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let multipliers: TVec<usize> = self
             .multipliers
             .iter()
-            .map(|m| m.eval(&session.resolved_symbols).to_usize())
-            .collect::<TractResult<_>>()?;
-        let result =
-            dispatch_datum_by_size!(eval_t(inputs[0].datum_type())(&inputs[0], &multipliers))?;
-        Ok(tvec!(result))
+            .map(|m| m.eval(ctx.symbols).to_usize())
+            .collect::<Result<_, _>>()?;
+        Ok(tvec!(tile(&inputs[0], &multipliers)?))
     }
 }
 
 impl TypedOp for Tile {
     as_op!();
 
-    fn substitute_symbols(
+    fn set_symbols(
         &self,
         _source: &TypedModel,
         node: &TypedNode,
@@ -116,26 +106,17 @@ impl Op for DynTile {
 }
 
 impl EvalOp for DynTile {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        _node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let multipliers = inputs[1].cast_to::<TDim>()?;
         let multipliers: TVec<usize> = multipliers
             .try_as_plain()?
             .as_slice::<TDim>()?
             .iter()
-            .map(|m| Ok(m.eval_to_i64(&session.resolved_symbols)? as usize))
+            .map(|m| Ok(m.eval_to_i64(ctx.symbols)? as usize))
             .collect::<TractResult<_>>()?;
-        let result =
-            dispatch_datum_by_size!(eval_t(inputs[0].datum_type())(&inputs[0], &multipliers))?;
-        Ok(tvec!(result))
+        Ok(tvec!(tile(&inputs[0], &multipliers)?))
     }
 }
 
@@ -178,20 +159,24 @@ impl TypedOp for DynTile {
     }
 }
 
-fn eval_t<T: Datum>(data: &TValue, multipliers: &[usize]) -> TractResult<TValue> {
-    let data_plain = data.try_as_plain()?;
-    let view = unsafe { data_plain.to_array_view_unchecked::<T>() };
-    let output_shape: TVec<usize> =
-        view.shape().iter().zip(multipliers.iter()).map(|(&d, &m)| d * m).collect();
-    let output = ndarray::ArrayD::from_shape_fn(&*output_shape, |coords| {
-        let coords: TVec<usize> =
-            coords.slice().iter().zip(data.shape().iter()).map(|(&x, &d)| x % d).collect();
-        view[&*coords].clone()
-    });
-    let mut output = output.into_tensor();
-    unsafe {
-        output.set_datum_type(data.datum_type());
+/// Tile one axis at a time: a tiled axis repeats whole blocks of the tensor, so
+/// each repeat is one assignment into a slice of the growing output.
+fn tile(data: &TValue, multipliers: &[usize]) -> TractResult<TValue> {
+    ensure!(multipliers.len() == data.rank(), "Tiling {data:?} by {multipliers:?}");
+    let mut current = None;
+    for (axis, &m) in multipliers.iter().enumerate() {
+        let source: &Tensor = current.as_ref().unwrap_or(data);
+        if m == 1 {
+            continue;
+        }
+        let dim = source.shape()[axis];
+        let mut shape: TVec<usize> = source.shape().into();
+        shape[axis] = dim * m;
+        let mut output = Tensor::zero_dt(source.datum_type(), &shape)?;
+        for repeat in 0..m {
+            output.assign_slice(repeat * dim..(repeat + 1) * dim, source, .., axis)?;
+        }
+        current = Some(output);
     }
-
-    Ok(output.into_tvalue())
+    Ok(current.map(|t| t.into_tvalue()).unwrap_or_else(|| data.clone()))
 }

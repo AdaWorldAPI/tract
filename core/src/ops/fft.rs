@@ -3,7 +3,7 @@ use num_complex::Complex;
 use rustfft::num_traits::{Float, FromPrimitive};
 use rustfft::{FftDirection, FftNum};
 use tract_data::itertools::Itertools;
-use tract_ndarray::Axis;
+use tract_ndarray::Axis as NdAxis;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Fft {
@@ -60,11 +60,9 @@ impl Op for Fft {
 }
 
 impl EvalOp for Fft {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let mut tensor = args_1!(inputs).into_tensor();
         match tensor.datum_type() {
             DatumType::F16 => {
@@ -91,6 +89,43 @@ impl TypedOp for Fft {
             "Fft operators expect inner (last) dimension to be 2 for real and imaginary part"
         );
         Ok(tvec!(inputs[0].without_value()))
+    }
+
+    fn axes_mapping(
+        &self,
+        inputs: &[&TypedFact],
+        _outputs: &[&TypedFact],
+    ) -> TractResult<AxesMapping> {
+        // Fft is rank-preserving but it is NOT axes-natural: two axes do
+        // not map 1-to-1 from input to output and must be declared as a
+        // separate input-only and output-only axis.
+        //
+        //   - the FFT axis (`self.axis`): every output sample along it
+        //     depends on every input sample, so the axis cannot be
+        //     sliced or streamed.
+        //   - the trailing complex axis (`rank - 1`): the FFT mixes the
+        //     real and imaginary parts, so re/im do not map 1-to-1.
+        //
+        // Splitting them is exactly what makes the generic pulse fallback
+        // bail when asked to track a streaming axis through the FFT or
+        // complex axis, while every genuine batch axis stays 1-to-1 and
+        // is handled by the per-pulse `PulseWrappingOp`. No dedicated
+        // `Fft` pulsifier is needed.
+        let rank = inputs[0].rank();
+        let complex_axis = rank - 1;
+        let mut axes = tvec!();
+        let mut alphabet = 'a'..;
+        for i in 0..rank {
+            if i == self.axis || i == complex_axis {
+                axes.push(crate::axes::Axis::new(alphabet.next().unwrap(), 1, 1).input(0, i));
+                axes.push(crate::axes::Axis::new(alphabet.next().unwrap(), 1, 1).output(0, i));
+            } else {
+                axes.push(
+                    crate::axes::Axis::new(alphabet.next().unwrap(), 1, 1).input(0, i).output(0, i),
+                );
+            }
+        }
+        AxesMapping::new(1, 1, axes)
     }
 
     as_op!();
@@ -144,16 +179,11 @@ impl Stft {
                     (c..=c).into()
                 }
             });
+            let signal: Vec<Complex<T>> =
+                islice.iter().tuples().map(|(re, im)| Complex::new(*re, *im)).collect();
             for f in 0..frames {
                 v.clear();
-                v.extend(
-                    islice
-                        .iter()
-                        .tuples()
-                        .skip(self.stride * f)
-                        .take(self.frame)
-                        .map(|(re, im)| Complex::new(*re, *im)),
-                );
+                v.extend_from_slice(&signal[self.stride * f..self.stride * f + self.frame]);
                 if let Some(win) = &self.window {
                     let win = win.try_as_plain()?.as_slice::<T>()?;
                     // symmetric padding in case window is smaller than frames (aka n fft)
@@ -168,7 +198,7 @@ impl Stft {
                 }
                 fft.process(&mut v);
                 oslice
-                    .index_axis_mut(Axis(self.axis), f)
+                    .index_axis_mut(NdAxis(self.axis), f)
                     .iter_mut()
                     .zip(v.iter().flat_map(|cmpl| [cmpl.re, cmpl.im].into_iter()))
                     .for_each(|(s, v)| *s = v);
@@ -187,11 +217,9 @@ impl Op for Stft {
 }
 
 impl EvalOp for Stft {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs);
         let output = match input.datum_type() {
             DatumType::F16 => {
@@ -221,6 +249,43 @@ impl TypedOp for Stft {
         shape[self.axis] = frames;
         shape.insert(self.axis + 1, self.frame.to_dim());
         Ok(tvec!(inputs[0].datum_type.fact(shape)))
+    }
+
+    fn axes_mapping(
+        &self,
+        inputs: &[&TypedFact],
+        _outputs: &[&TypedFact],
+    ) -> TractResult<crate::axes::AxesMapping> {
+        // Stft is NOT rank-preserving: it inserts a frame axis at
+        // `axis + 1`. The mapping is:
+        //   - axes 0..self.axis (leading dims): 1-to-1 input <-> output.
+        //   - input axis `self.axis` (the time axis) <-> output axis
+        //     `self.axis` (now the n_frames axis -- same position, the
+        //     dim shrinks from `T` to `(T - frame) / stride + 1`).
+        //   - output axis `self.axis + 1` (the inserted frame axis):
+        //     output-only, no input correspondence.
+        //   - input axes `self.axis + 1..rank` (trailing dims incl.
+        //     the complex pair) <-> output axes `self.axis + 2..rank+1`
+        //     (shifted right by 1 to make room for the frame axis).
+        //
+        // Without this mapping the generic `PulseWrappingOp` fallback
+        // bails with "could not track pulsing axis" the moment a user
+        // streams a non-time axis through STFT (typical pattern: a
+        // batched STFT pipeline that streams the batch axis).
+        let in_rank = inputs[0].rank();
+        let mut axes = tvec!();
+        let mut alphabet = 'a'..;
+        for i in 0..in_rank {
+            let out_axis = if i <= self.axis { i } else { i + 1 };
+            axes.push(
+                crate::axes::Axis::new(alphabet.next().unwrap(), 1, 1)
+                    .input(0, i)
+                    .output(0, out_axis),
+            );
+        }
+        // Inserted frame axis (output-only).
+        axes.push(crate::axes::Axis::new(alphabet.next().unwrap(), 1, 1).output(0, self.axis + 1));
+        crate::axes::AxesMapping::new(1, 1, axes)
     }
 
     as_op!();

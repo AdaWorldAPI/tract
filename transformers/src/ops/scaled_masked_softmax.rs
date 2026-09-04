@@ -3,7 +3,7 @@ use tract_nnef::tract_core::axes::{AxesMapping, Axis};
 use tract_nnef::tract_core::ops::binary::{BinMiniOp, TypedBinOp};
 use tract_nnef::tract_core::ops::logic::Iff;
 use tract_nnef::tract_core::ops::math::{Add, Mul};
-use tract_nnef::tract_core::ops::nn::{Softmax, SoftmaxExp, SoftmaxKind};
+use tract_nnef::tract_core::ops::nn::{Softmax, SoftmaxKind};
 
 pub fn register(registry: &mut Registry) {
     registry.register_dumper(ser_scaled_masked_softmax);
@@ -79,11 +79,9 @@ impl Op for ScaledMaskedSoftmax {
 }
 
 impl EvalOp for ScaledMaskedSoftmax {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (input, mask) = args_2!(inputs);
         let softmax_axis = tvec!(input.rank() - 1);
         let dt = input.datum_type();
@@ -93,19 +91,24 @@ impl EvalOp for ScaledMaskedSoftmax {
         let pre_softmax: TValue = if mask.datum_type() == bool::datum_type() {
             // Boolean mask: keep score where mask=true, replace with -inf where mask=false.
             let fill = tensor0(-f32::INFINITY).cast_to_dt(dt)?.into_owned();
-            Iff.eval(tvec![mask.clone(), scaled.into(), fill.into_tvalue()])?.remove(0)
+            Iff.eval(
+                &EvalContext::out_of_plan(),
+                tvec![mask.clone(), scaled.into(), fill.into_tvalue()],
+            )?
+            .remove(0)
         } else {
             Add.eval(scaled.into(), mask.clone(), dt)?.into()
         };
 
-        let softmax_out = Softmax::new(softmax_axis, None, SoftmaxKind::Softmax(SoftmaxExp::Libc))
-            .eval(tvec![pre_softmax])?[0]
+        let softmax_out = Softmax::new(softmax_axis, None, SoftmaxKind::Softmax)
+            .eval(&EvalContext::out_of_plan(), tvec![pre_softmax])?[0]
             .clone();
 
         if self.post_softmax_mask {
             // Zero out positions where the bool mask is false.
             let zero = tensor0(0f32).cast_to_dt(dt)?.into_owned();
-            Ok(Iff.eval(tvec![mask, softmax_out, zero.into_tvalue()])?)
+            Ok(Iff
+                .eval(&EvalContext::out_of_plan(), tvec![mask, softmax_out, zero.into_tvalue()])?)
         } else {
             Ok(tvec![softmax_out])
         }
@@ -572,7 +575,7 @@ mod tests {
     fn input_roi_remaps_coord_syms_across_rank_diff() -> TractResult<()> {
         let mut model = TypedModel::default();
         // Scores: rank 4 — [B=2, H=8, T_q=4, T_k=4]
-        let scores = model.add_source("scores", f32::fact(&[2usize, 8, 4, 4]))?;
+        let scores = model.add_source("scores", f32::fact([2usize, 8, 4, 4]))?;
         // Mask: rank 3 — [B=2, T_q=4, T_k=4], with band uniform_tdim on its
         // own axis 2 (T_k axis): `Mul(Ge(🎯2, 1), Ge(2, 🎯2))` = `1 ≤ k ≤ 2`.
         let mask_axis_k = model.symbols.coord_sym(2);
@@ -580,7 +583,7 @@ mod tests {
             TDim::Ge(Box::new(TDim::Sym(mask_axis_k.clone())), Box::new(TDim::Val(1))),
             TDim::Ge(Box::new(TDim::Val(2)), Box::new(TDim::Sym(mask_axis_k))),
         ]);
-        let mut mask_fact = bool::fact(&[2usize, 4, 4]);
+        let mut mask_fact = bool::fact([2usize, 4, 4]);
         mask_fact.uniform_tdim = Some(band);
         let mask = model.add_source("mask", mask_fact)?;
         let sms = model.wire_node("sms", smsoftmax(), &[scores, mask])?[0];

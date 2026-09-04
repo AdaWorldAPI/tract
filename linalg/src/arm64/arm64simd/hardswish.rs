@@ -1,9 +1,8 @@
-ew_impl_wrap!(
+routine_ew_rust!(aarch64;
     f32,
     arm64simd_hardswish_f32_8n,
     8,
     4,
-    (),
     #[inline(never)]
     fn run(buf: &mut [f32], _: ()) {
         assert!(buf.len() % 8 == 0);
@@ -53,11 +52,6 @@ ew_impl_wrap!(
             out("q7") _,
             );
         }
-    }
+    },
+    func(Hardswish)
 );
-
-#[cfg(test)]
-pub mod test_arm64simd_hardswish_f32_8n {
-    use super::*;
-    hardswish_frame_tests!(true, f32, arm64simd_hardswish_f32_8n);
-}

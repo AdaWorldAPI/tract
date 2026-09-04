@@ -48,11 +48,9 @@ impl TypedOp for OneHot {
 }
 
 impl EvalOp for OneHot {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs);
         let mut shape: TVec<usize> = input.shape().into();
         shape.insert(self.axis, self.dim);

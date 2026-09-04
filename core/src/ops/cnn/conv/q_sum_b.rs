@@ -24,17 +24,10 @@ impl Op for QSumB {
 }
 
 impl EvalOp for QSumB {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        _node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
-        let n = self.n.eval_to_i64(&session.resolved_symbols)? as usize;
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        let n = self.n.eval_to_i64(ctx.symbols)? as usize;
         self.eval(inputs, n)
     }
 }

@@ -20,18 +20,11 @@ impl Op for Range {
 }
 
 impl EvalOp for Range {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        _node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (start, end, step) = args_3!(inputs);
-        Ok(tvec!(self.make(&start, &end, &step, &session.resolved_symbols)?.into_tvalue()))
+        Ok(tvec!(self.make(&start, &end, &step, ctx.symbols)?.into_tvalue()))
     }
 }
 
@@ -47,8 +40,9 @@ impl Range {
             let step = step.try_as_plain()?.to_scalar::<T>()?;
             {
                 let mut result_plain = result.try_as_plain_mut()?;
+                let slots = result_plain.as_slice_mut_unchecked::<T>().as_mut_ptr();
                 for i in 0..len {
-                    result_plain.as_slice_mut_unchecked::<T>()[i] = v.clone();
+                    std::ptr::write(slots.add(i), v.clone());
                     v = v + step;
                 }
             }
@@ -153,16 +147,16 @@ impl TypedOp for Range {
             }
         } else {
             let mut fact = start.datum_type.fact(std::slice::from_ref(&self.len));
-            if let (Some(s), Some(k)) = (&start.uniform_tdim, &step.uniform_tdim) {
-                if let Some(scope) = self.len.find_scope() {
-                    let x0 = TDim::Sym(scope.coord_sym(0));
-                    let term = match k {
-                        TDim::Val(1) => x0,
-                        TDim::Val(v) => TDim::MulInt(*v, Box::new(x0)),
-                        other => TDim::Mul(vec![other.clone(), x0]),
-                    };
-                    fact.uniform_tdim = Some((s.clone() + term).reduce());
-                }
+            if let (Some(s), Some(k)) = (&start.uniform_tdim, &step.uniform_tdim)
+                && let Some(scope) = self.len.find_scope()
+            {
+                let x0 = TDim::Sym(scope.coord_sym(0));
+                let term = match k {
+                    TDim::Val(1) => x0,
+                    TDim::Val(v) => TDim::MulInt(*v, Box::new(x0)),
+                    other => TDim::Mul(vec![other.clone(), x0]),
+                };
+                fact.uniform_tdim = Some((s.clone() + term).reduce());
             }
             Ok(tvec!(fact))
         }

@@ -1,14 +1,15 @@
 use crate::internal::*;
-use crate::ndarray::Dimension;
 use downcast_rs::Downcast;
 use dyn_eq::DynEq;
 use std::fmt::{self, Debug};
 use tract_data::itertools::izip;
 use tract_itertools::Itertools;
-use tract_linalg::{BinOp, LinalgFn};
+use tract_linalg::multithread::BShare;
+use tract_linalg::{BinFn, BinOp};
 
 use super::math::{Add, Max, Min, Mul, Sub};
 use super::{cast::cast, math::SubF};
+use tract_linalg::routines::Func;
 
 pub trait BinMiniOp:
     fmt::Debug + dyn_clone::DynClone + dyn_eq::DynEq + Send + Sync + 'static + Downcast
@@ -99,7 +100,7 @@ pub trait BinMiniOp:
     #[allow(unused_variables)]
     fn eval_symbolic(
         &self,
-        session: &TurnState,
+        ctx: &EvalContext,
         inputs: TVec<TValue>,
     ) -> TractResult<Option<TVec<TValue>>> {
         Ok(None)
@@ -137,26 +138,12 @@ impl TypedBinOp {
 }
 
 impl EvalOp for TypedBinOp {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        _node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
-        if let Some(result) = self.0.eval_symbolic(session, inputs.clone())? {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        if let Some(result) = self.0.eval_symbolic(ctx, inputs.clone())? {
             return Ok(result);
         }
-        let (a, b) = args_2!(inputs);
-        ensure!(a.rank() == b.rank());
-        let c_dt = self.output_datum_type(a.datum_type(), b.datum_type())?;
-        Ok(tvec!(self.0.eval(a, b, c_dt)?.into_tvalue()))
-    }
-
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (a, b) = args_2!(inputs);
         ensure!(a.rank() == b.rank());
         let c_dt = self.output_datum_type(a.datum_type(), b.datum_type())?;
@@ -402,21 +389,25 @@ impl TypedOp for TypedBinOp {
 
             let dt = model.node_input_facts(node.id)?[0].datum_type;
             if by_scalar_should_be_efficient & can_eval_in_a & !op_is_quant {
-                rule_if_some!(func = tract_linalg::bin_by_scalar(dt, actual_linalg_op));
+                rule_if_some!(func = Func::BinByScalar(actual_linalg_op).bin(dt));
                 let eval_fn = Arc::from(func);
                 return Ok(Some(
                     TypedModelPatch::replace_single_op(
                         model,
                         node,
                         &inputs,
-                        OptBinByScalar { binop: actual_core_op, eval_fn },
+                        OptBinByScalar {
+                            binop: actual_core_op,
+                            eval_fn,
+                            linalg_op: actual_linalg_op,
+                        },
                     )?
                     .with_context("ByScalar"),
                 ));
             }
 
             if unicast_should_be_efficient & can_eval_in_a & !op_is_quant {
-                rule_if_some!(func = tract_linalg::bin_unicast(dt, actual_linalg_op));
+                rule_if_some!(func = Func::BinUnicast(actual_linalg_op).bin(dt));
                 let eval_fn = Arc::from(func);
                 return Ok(Some(
                     TypedModelPatch::replace_single_op(
@@ -433,6 +424,63 @@ impl TypedOp for TypedBinOp {
         Ok(None)
     }
     as_op!();
+}
+
+/// `a[i*period + j] = op(a[i*period + j], b[i])` in one pass, for the float types
+/// that carry a short trailing broadcast. Returns false when the datum type has
+/// no typed path here, leaving the caller on the generic route.
+fn repeat_broadcast(op: BinOp, a: &mut Tensor, b: &Tensor, period: usize) -> TractResult<bool> {
+    macro_rules! run {
+        ($t:ty) => {{
+            let bview = b.view();
+            let bs: &[$t] = bview.as_slice::<$t>()?;
+            let mut aview = a.view_mut();
+            let av: &mut [$t] = aview.as_slice_mut::<$t>()?;
+            match op {
+                BinOp::Mul => {
+                    for (c, &s) in av.chunks_exact_mut(period).zip(bs) {
+                        c.iter_mut().for_each(|x| *x *= s)
+                    }
+                }
+                BinOp::Add => {
+                    for (c, &s) in av.chunks_exact_mut(period).zip(bs) {
+                        c.iter_mut().for_each(|x| *x += s)
+                    }
+                }
+                BinOp::Sub => {
+                    for (c, &s) in av.chunks_exact_mut(period).zip(bs) {
+                        c.iter_mut().for_each(|x| *x -= s)
+                    }
+                }
+                BinOp::SubF => {
+                    for (c, &s) in av.chunks_exact_mut(period).zip(bs) {
+                        c.iter_mut().for_each(|x| *x = s - *x)
+                    }
+                }
+                BinOp::Min => {
+                    for (c, &s) in av.chunks_exact_mut(period).zip(bs) {
+                        c.iter_mut().for_each(|x| *x = if *x < s { *x } else { s })
+                    }
+                }
+                BinOp::Max => {
+                    for (c, &s) in av.chunks_exact_mut(period).zip(bs) {
+                        c.iter_mut().for_each(|x| *x = if *x > s { *x } else { s })
+                    }
+                }
+            }
+            return Ok(true);
+        }};
+    }
+    if a.datum_type() != b.datum_type() {
+        return Ok(false);
+    }
+    if a.datum_type() == f32::datum_type() {
+        run!(f32)
+    }
+    if a.datum_type() == f16::datum_type() {
+        run!(f16)
+    }
+    Ok(false)
 }
 
 fn core_op_for_linalg_op(linalg: &BinOp) -> Box<dyn BinMiniOp> {
@@ -473,46 +521,42 @@ fn declutter_broadcasting_operand_1(
     Ok(None)
 }
 
+/// Shunt a binary op whose uniform input holds the op's neutral element
+/// (`x + 0`, `x * 1`, `x - 0`).
+///
+/// The neutral element is compared on dequantized values, so a quantized node
+/// can be arithmetically neutral while still re-encoding its input: `out_dt`
+/// may carry other quantization parameters than the variable input, and the
+/// same real value is then a different integer. Such a node degrades to a
+/// `Cast` instead of vanishing.
 fn declutter_neutral(
     model: &TypedModel,
     node: &TypedNode,
     mini_op: &dyn BinMiniOp,
     out_dt: DatumType,
 ) -> TractResult<Option<TypedModelPatch>> {
-    if let Some(uniform) = crate::ops::binary::one_input_is_uniform(model, node)? {
-        let is_neutral = mini_op
-            .neutral_element()
-            .map(|neutral| tensor0(neutral).close_enough(&uniform.uni, false).is_ok())
-            .unwrap_or(false);
-
-        // For some operand neural element can be the left one while for other
-        // it is not the case (neutral - 1 -> not ok, 1 - neutal -> ok)
-        let pos_checked = mini_op.is_commutative() || !uniform.left_is_uniform;
-
-        if is_neutral && pos_checked {
-            // Neutral decluttering for quant values is special.
-            // - if (fa) (a-az)*as + (fb = 0) (b-bz)*bs = (fc) (c-cz)*cs
-            // - then even if fa = fc, quant params needs to be updated (a != c).
-            // So it's not a no_op.
-            if uniform.uni.datum_type().is_quantized() {
-                return Ok(Some(TypedModelPatch::replace_single_op(
-                    model,
-                    node,
-                    &[node.inputs[0]],
-                    cast(out_dt),
-                )?));
-            // In the non quantized case, it's a no_op.
-            } else {
-                return Ok(Some(TypedModelPatch::rewire(
-                    model,
-                    &[uniform.var],
-                    &[node.id.into()],
-                    &|_, inputs| Ok(inputs.into()),
-                )?));
-            }
-        }
+    let Some(uniform) = crate::ops::binary::one_input_is_uniform(model, node)? else {
+        return Ok(None);
+    };
+    let uni_is_neutral = mini_op
+        .neutral_element()
+        .is_some_and(|neutral| tensor0(neutral).close_enough(&uniform.uni, false).is_ok());
+    // Non-commutative ops only have a right neutral: x - 0 == x, but 0 - x == -x.
+    let uniform_on_neutral_side = mini_op.is_commutative() || !uniform.left_is_uniform;
+    if !uni_is_neutral || !uniform_on_neutral_side {
+        return Ok(None);
     }
-    Ok(None)
+    if uniform.uni.datum_type().is_quantized() {
+        return Ok(Some(TypedModelPatch::replace_single_op(
+            model,
+            node,
+            &[uniform.var],
+            cast(out_dt),
+        )?));
+    }
+    Ok(Some(TypedModelPatch::rewire(model, &[uniform.var], &[node.id.into()], &|_, inputs| {
+        Ok(inputs.into())
+    })?))
 }
 
 /// When one input is the absorbing element (e.g. 0 for Mul, false for And),
@@ -606,7 +650,16 @@ fn find_most_efficient_config(
         };
 
         let min_num_elements = 32;
-        let by_scalar_should_be_efficient = gt_tdim(num_by_scalar_elements, min_num_elements);
+        // A short by-scalar group is still worth taking when the tensor is big:
+        // the eval reads b in place for those, so what pays off is the total
+        // element count, not the group. Requiring >= 2 also confirms b really has
+        // a trailing unary axis, which identical shapes satisfy only vacuously.
+        let total_elements = a_shape.iter().product::<TDim>();
+        let by_scalar_should_be_efficient =
+            gt_tdim(num_by_scalar_elements.clone(), min_num_elements)
+                || (by_scalar_is_possible
+                    && gt_tdim(num_by_scalar_elements, 2)
+                    && gt_tdim(total_elements, 256));
         let unicast_should_be_efficient = gt_tdim(num_unicast_elements, min_num_elements);
         return Ok((by_scalar_should_be_efficient, unicast_should_be_efficient));
     }
@@ -614,13 +667,14 @@ fn find_most_efficient_config(
 }
 
 pub fn gt_tdim(x: TDim, min_val: i64) -> bool {
-    TDim::Val(min_val).mini(x).to_i64().is_ok_and(|v| v == min_val)
+    TDim::Val(min_val).mini(x).as_i64().is_some_and(|v| v == min_val)
 }
 
 #[derive(Clone)]
 pub struct OptBinByScalar {
+    pub linalg_op: BinOp,
     pub binop: Box<dyn BinMiniOp>,
-    eval_fn: Arc<LinalgFn>,
+    eval_fn: Arc<BinFn>,
 }
 
 impl Debug for OptBinByScalar {
@@ -659,11 +713,9 @@ impl Op for OptBinByScalar {
 }
 
 impl EvalOp for OptBinByScalar {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (a, b) = args_2!(inputs);
         // Same as OptBinUnicast: the fast path uses at_prefix + as_slice_mut
         // and relies on natural C-order strides for the slice math. Fall back
@@ -679,9 +731,7 @@ impl EvalOp for OptBinByScalar {
             return Ok(tvec!(self.binop.eval(a, b, c_dt)?.into_tvalue()));
         }
 
-        // Not a requirement as TensorView doesn't require a owned tensor but in reality
-        // "a "should be mutable (it's omitted here as Rust compiler advise to remove it)
-        let a = a.into_tensor();
+        let mut a = a.into_tensor();
         let b_shape = b.shape();
 
         let first_unary_axis = b_shape
@@ -693,20 +743,18 @@ impl EvalOp for OptBinByScalar {
             .last()
             .context("Cannot use by_scalar when no trailing dimensions are unary")?;
 
-        let iterating_shape = &a.shape()[..first_unary_axis];
-        if !iterating_shape.is_empty() {
-            for it_coords in tract_ndarray::indices(iterating_shape) {
-                let mut view = TensorView::at_prefix(&a, it_coords.slice())?;
-                let b_view = TensorView::at_prefix(&b, it_coords.slice())?;
-                debug_assert_eq!(b_view.shape().iter().product::<usize>(), 1);
-                (self.eval_fn)(&mut view, &b_view)?;
-            }
-        } else {
-            let mut view = a.view();
-            let b_view = b.view();
-            debug_assert_eq!(b_view.shape().iter().product::<usize>(), 1);
-            (self.eval_fn)(&mut view, &b_view)?;
+        // b carries one scalar per block of a, the blocks being a's axes before
+        // first_unary_axis; check_input_shapes makes b's match a's there.
+        let n_blocks: usize = a.shape()[..first_unary_axis].iter().product();
+        // A zero-sized dim zeroes n_blocks, and par_bin no-ops on an empty a.
+        let period = a.len().checked_div(n_blocks).unwrap_or(0);
+        // A short period would mean one kernel dispatch per handful of elements,
+        // which costs far more than the arithmetic. Read b's scalar straight out
+        // of place instead, one pass, no broadcast buffer.
+        if period > 1 && period < 16 && repeat_broadcast(self.linalg_op, &mut a, &b, period)? {
+            return Ok(tvec!(a.into_tvalue()));
         }
+        tract_linalg::multithread::par_bin(&*self.eval_fn, &mut a, &b, period, BShare::PerBlock)?;
         Ok(tvec!(a.into_tvalue()))
     }
 }
@@ -735,7 +783,7 @@ impl TypedOp for OptBinByScalar {
 #[derive(Clone)]
 pub struct OptBinUnicast {
     pub binop: Box<dyn BinMiniOp>,
-    eval_fn: Arc<LinalgFn>,
+    eval_fn: Arc<BinFn>,
 }
 
 impl Debug for OptBinUnicast {
@@ -803,11 +851,9 @@ impl Op for OptBinUnicast {
 }
 
 impl EvalOp for OptBinUnicast {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (a, b) = args_2!(inputs);
         // The unicast fast path indexes each input's storage via at_prefix +
         // as_slice_mut, which uses `strides[i-1]` to size the resulting slice
@@ -828,27 +874,18 @@ impl EvalOp for OptBinUnicast {
             return Ok(tvec!(self.binop.eval(a, b, c_dt)?.into_tvalue()));
         }
 
-        // Not a requirement as TensorView doesn't require a owned tensor but in reality
-        // "a "should be mutable (it's omitted here as Rust compiler advise to remove it)
-        let a = a.into_tensor();
-        let b_shape = b.shape();
-        let b_view = b.view();
-        let first_non_unary_axis =
-            b_shape.iter().enumerate().take_while(|&(_, &dim)| dim == 1).map(|(i, _)| i + 1).last();
-
-        if let Some(first_non_unary_axis) = first_non_unary_axis {
-            // Iterate on outter dimensions and evaluate with unicast subviews
-            let iterating_shape = a.shape()[..first_non_unary_axis].to_vec();
-            for it_coords in tract_ndarray::indices(iterating_shape) {
-                let mut view = TensorView::at_prefix(&a, it_coords.slice())?;
-                debug_assert_eq!(view.shape(), &b_view.shape()[it_coords.slice().len()..]);
-                (self.eval_fn)(&mut view, &b_view)?;
-            }
-        } else {
-            let mut view = a.view();
-            debug_assert_eq!(view.shape(), b_view.shape());
-            (self.eval_fn)(&mut view, &b_view)?;
-        }
+        let mut a = a.into_tensor();
+        // b's leading unary axes are the ones a repeats over; past them b matches
+        // a exactly (check_input_shapes), so one kernel call covers b.len()
+        // elements of a and b is consumed in lockstep within each.
+        debug_assert!(
+            b.shape().iter().zip(a.shape()).skip_while(|(b, _)| **b == 1).all(|(b, a)| b == a),
+            "unicast b {:?} does not line up with a {:?}",
+            b.shape(),
+            a.shape()
+        );
+        let period = b.len();
+        tract_linalg::multithread::par_bin(&*self.eval_fn, &mut a, &b, period, BShare::Lockstep)?;
 
         Ok(tvec!(a.into_tvalue()))
     }
@@ -918,9 +955,16 @@ macro_rules! bin_to_super_type {
                                 let c_slice = c_plain.as_slice_mut::<$typ>()?;
                                 debug_assert_eq!(c_slice.len(), a_slice.len());
                                 debug_assert_eq!(c_slice.len(), b_slice.len());
-                                for ((cv, av), bv) in c_slice.iter_mut().zip(a_slice.iter()).zip(b_slice.iter()) {
-                                    cab(cv, av, bv);
-                                }
+                                let len = c_slice.len();
+                                tract_linalg::multithread::par_chunks_mut(c_slice, 1, len, |first_row, c_chunk| {
+                                    let n = c_chunk.len();
+                                    let a_chunk = &a_slice[first_row..first_row + n];
+                                    let b_chunk = &b_slice[first_row..first_row + n];
+                                    for ((cv, av), bv) in c_chunk.iter_mut().zip(a_chunk.iter()).zip(b_chunk.iter()) {
+                                        cab(cv, av, bv);
+                                    }
+                                    Ok(())
+                                })?;
                                 return Ok(())
                             })*
                         )*
@@ -994,9 +1038,15 @@ macro_rules! bin_to_super_type {
                             let mut a_plain = a.try_as_plain_mut()?;
                             let a_slice = a_plain.as_slice_mut::<$typ>()?;
                             debug_assert_eq!(a_slice.len(), b_slice.len());
-                            for (av, bv) in a_slice.iter_mut().zip(b_slice.iter()) {
-                                cab(av, &av.clone(), bv);
-                            }
+                            let len = a_slice.len();
+                            tract_linalg::multithread::par_chunks_mut(a_slice, 1, len, |first_row, a_chunk| {
+                                let n = a_chunk.len();
+                                let b_chunk = &b_slice[first_row..first_row + n];
+                                for (av, bv) in a_chunk.iter_mut().zip(b_chunk.iter()) {
+                                    cab(av, &av.clone(), bv);
+                                }
+                                Ok(())
+                            })?;
                             return Ok(())
                         })*
                     )*
@@ -1256,11 +1306,13 @@ mod tests {
         // and let the b-side go through cleanly.
         b = b.into_shape(&[1, 1, 640]).unwrap();
 
-        let linalg_fn = tract_linalg::bin_unicast(f32::datum_type(), BinOp::Add)
+        let linalg_fn = Func::BinUnicast(BinOp::Add)
+            .bin(f32::datum_type())
             .expect("f32 unicast Add kernel available");
         let op = OptBinUnicast { binop: Box::new(Add), eval_fn: Arc::from(linalg_fn) };
 
-        let out = op.eval(tvec!(a.into_tvalue(), b.into_tvalue())).unwrap();
+        let out =
+            op.eval(&EvalContext::out_of_plan(), tvec!(a.into_tvalue(), b.into_tvalue())).unwrap();
         let out = &out[0];
         assert_eq!(out.shape(), &[1, 1, 640]);
         let plain = out.try_as_plain().unwrap();
@@ -1268,5 +1320,67 @@ mod tests {
         for (i, v) in out_slice.iter().enumerate() {
             assert_eq!(*v, i as f32 + 1.0, "mismatch at {i}");
         }
+    }
+
+    /// A zero-sized outer dim (a symbolic batch or sequence resolving to 0) has
+    /// no elements to write, so both fast paths must no-op. The kernels cannot
+    /// be handed the empty tensor: `as_slice_mut` builds a slice from the null
+    /// data pointer, and the by-scalar kernel reads `b[0]` off a zero-length
+    /// slice.
+    #[test]
+    fn zero_sized_outer_dim_is_a_noop() {
+        let a = Tensor::zero::<f32>(&[0, 4, 8]).unwrap();
+        let b = Tensor::zero::<f32>(&[0, 4, 1]).unwrap();
+        let linalg_fn = Func::BinByScalar(BinOp::Add)
+            .bin(f32::datum_type())
+            .expect("f32 by_scalar Add kernel available");
+        let op = OptBinByScalar {
+            binop: Box::new(Add),
+            eval_fn: Arc::from(linalg_fn),
+            linalg_op: BinOp::Add,
+        };
+        let out =
+            op.eval(&EvalContext::out_of_plan(), tvec!(a.into_tvalue(), b.into_tvalue())).unwrap();
+        assert_eq!(out[0].shape(), &[0, 4, 8]);
+
+        let a = Tensor::zero::<f32>(&[0, 4, 16]).unwrap();
+        let b = Tensor::zero::<f32>(&[1, 4, 16]).unwrap();
+        let linalg_fn = Func::BinUnicast(BinOp::Add)
+            .bin(f32::datum_type())
+            .expect("f32 unicast Add kernel available");
+        let op = OptBinUnicast { binop: Box::new(Add), eval_fn: Arc::from(linalg_fn) };
+        let out =
+            op.eval(&EvalContext::out_of_plan(), tvec!(a.into_tvalue(), b.into_tvalue())).unwrap();
+        assert_eq!(out[0].shape(), &[0, 4, 16]);
+    }
+
+    /// A quantized uniform input that dequantizes to 0 is neutral for Add on
+    /// either side, but the node still re-encodes its variable input into the
+    /// output quantization parameters. `declutter_neutral` must therefore cast
+    /// the variable input, which is inlet 1 here, not inlet 0.
+    #[test]
+    fn q_neutral_add_requantizes_the_variable_input() -> TractResult<()> {
+        let x_dt = DatumType::QU8(QParams::ZpScale { zero_point: 10, scale: 0.02 });
+        let zero_dt = DatumType::QU8(QParams::ZpScale { zero_point: 61, scale: 1. });
+        let out_dt = DatumType::QU8(QParams::ZpScale { zero_point: 0, scale: 0.5 });
+
+        let mut model = TypedModel::default();
+        let x = model.add_source("x", x_dt.fact([4]))?;
+        // A quantized zero tensor is filled with its zero point, so this
+        // constant dequantizes to 0.0 everywhere.
+        let zero = model.add_const("zero", Tensor::zero_dt(zero_dt, &[4])?)?;
+        let add = model.wire_node("add", TypedBinOp(Box::new(Add), Some(out_dt)), &[zero, x])?[0];
+        model.select_output_outlets(&[add])?;
+
+        let mut input = Tensor::zero_dt(x_dt, &[4])?;
+        input.try_as_plain_mut()?.as_slice_mut::<u8>()?.copy_from_slice(&[10, 35, 60, 200]);
+        let input = tvec!(input.into_tvalue());
+
+        let before = model.clone().into_runnable()?.run(input.clone())?;
+        let decluttered = model.into_decluttered()?;
+        assert!(decluttered.nodes().iter().all(|n| n.op_as::<TypedBinOp>().is_none()));
+        let after = decluttered.into_runnable()?.run(input)?;
+        assert_eq!(&*before[0], &*after[0]);
+        Ok(())
     }
 }

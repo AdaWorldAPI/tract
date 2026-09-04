@@ -23,14 +23,16 @@ jobs:
         id: version
         run: echo value=$(echo ${GITHUB_REF} | cut -f 3 -d / | sed 's/^v//' ) >> $GITHUB_OUTPUT
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Create Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
-        with:
-          name: tract ${{ steps.version.outputs.value }}
         env:
-          GITHUB_TOKEN: ${{ secrets.ACCESS_TOKEN_RELEASE }}
+          GH_TOKEN: ${{ secrets.ACCESS_TOKEN_RELEASE }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          tag="v$VERSION"
+          gh release create "$tag" --title "tract $VERSION" --notes "" --verify-tag \
+            || gh release edit "$tag" --title "tract $VERSION"
 

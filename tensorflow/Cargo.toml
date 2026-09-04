@@ -1,6 +1,6 @@
 [package]
 name = "tract-tensorflow"
-version = "0.23.0-pre"
+version = "0.23.7-pre"
 authors = ["Mathieu Poumeyrol <kali@zoy.org>"]
 license = "MIT OR Apache-2.0"
 description = "Tiny, no-nonsense, self contained, TensorFlow and ONNX inference"
@@ -22,7 +22,6 @@ log.workspace = true
 memmap2.workspace = true
 prost.workspace = true
 prost-types.workspace = true
-tensorflow = { workspace = true, optional = true }
 tract-hir.workspace = true
 tract-pulse.workspace = true
 
@@ -30,14 +29,9 @@ tract-pulse.workspace = true
 # protobuf-src = "1.0.5+3.19.3"
 # prost-build = "0.14"
 
-[features]
-conform = [ "tensorflow" ]
-
 [dev-dependencies]
 criterion.workspace = true
 env_logger.workspace = true
-proptest.workspace = true
-rand.workspace = true
 
 # [[bench]]
 # name = "conv"

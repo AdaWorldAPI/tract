@@ -13,8 +13,28 @@ pub trait MatMatMulKer: Clone + Debug + Send + Sync + 'static {
     fn mr(&self) -> usize;
     fn nr(&self) -> usize;
 
-    fn quality(&self) -> ImplementationQuality;
-    fn dynamic_boost(&self) -> isize;
+    /// Architecture this kernel is written for, `None` for the generic Rust every target
+    /// builds. Declared by the leading arch ident of the kernel macros, the same ident that
+    /// decides whether this build compiled the body.
+    fn arch(&self) -> Option<crate::isa::Arch> {
+        None
+    }
+
+    /// Whether the kernel computes its accumulator type by converting every operation to
+    /// another type, for a machine whose hardware has none.
+    fn emulated(&self) -> bool {
+        false
+    }
+
+    /// The preference its author spelled out for this kernel, before the instruction-set
+    /// default is added in. Zero for a kernel that claims nothing.
+    fn boost(&self) -> isize;
+
+    /// [`Self::boost`] plus the default owed to the instruction set the kernel was written
+    /// for, [`crate::isa::LEVEL_BOOST`] per level. Selection reads this one.
+    fn preference(&self) -> isize {
+        self.boost() + self.isa().level() as isize * crate::isa::LEVEL_BOOST
+    }
 
     #[allow(clippy::type_complexity)]
     fn packings(&self) -> &[(Box<dyn MMMInputFormat>, Box<dyn MMMInputFormat>)];
@@ -25,9 +45,33 @@ pub trait MatMatMulKer: Clone + Debug + Send + Sync + 'static {
         true
     }
 
-    #[allow(unused_variables)]
-    fn is_supported_here(&self) -> bool {
+    /// Whether a machine with this instruction set can execute the kernel: its architecture is
+    /// the one the kernel is written for (or the kernel is generic), and the set offers every
+    /// feature the kernel declares. Takes the machine rather than reading the host, so one
+    /// predicate serves dispatch and the cross-architecture audits.
+    fn runnable_on(&self, isa: &crate::isa::IsaSet) -> bool {
+        self.arch().is_none_or(|a| Some(a) == isa.arch()) && self.isa().satisfied_by(*isa)
+    }
+
+    fn runnable(&self) -> bool {
+        self.built() && self.runnable_on(&crate::isa::native())
+    }
+
+    /// Whether this build compiled the kernel's body at all.
+    fn built(&self) -> bool {
         true
+    }
+
+    /// What the instruction set must offer for this kernel to run here.
+    fn isa(&self) -> crate::isa::IsaReq {
+        crate::isa::IsaReq::ANY
+    }
+
+    /// Whether the border-tile store scratch should be laid out row-major
+    /// (n contiguous) instead of the default column-major (mr contiguous).
+    /// Set by kernels whose store has an aligned row-major bulk path.
+    fn stores_row_major_tile(&self) -> bool {
+        false
     }
 }
 
@@ -37,12 +81,23 @@ type Kernel<Acc> = unsafe fn(&[FusedKerSpec<Acc>]) -> isize;
 pub struct DynKernel<const MR: usize, const NR: usize, Acc: LADatum> {
     pub name: String,
     pub kernel: Kernel<Acc>,
-    pub quality: ImplementationQuality,
+    /// Arch this kernel is written for, `None` for the generic Rust every target builds.
+    pub arch: Option<crate::isa::Arch>,
+    /// Reads true when the kernel emulates its accumulator type op by op, which is a fact
+    /// about the running machine rather than the declaration: the generic f16 kernels are a
+    /// real implementation on hardware that has f16 and an emulation on hardware that does not.
+    pub emulated: fn() -> bool,
     pub packings: Vec<(Box<dyn MMMInputFormat>, Box<dyn MMMInputFormat>)>,
     pub stores: Vec<DatumType>,
-    pub supported_predicate: fn() -> bool,
+    /// False when this build did not assemble the kernel's asm, its arch not being the one the
+    /// kernel was written for. The kernel struct still exists, so it stays introspectable, but
+    /// it is never runnable here and calling it bails.
+    pub built: bool,
+    /// What the instruction set must offer for this kernel to run here at all.
+    pub isa: crate::isa::IsaReq,
     pub boost: fn() -> isize,
     pub can_fuse: fn(&FusedSpec) -> bool,
+    pub row_major_store: bool,
 }
 
 impl<const MR: usize, const NR: usize, Acc: LADatum> DynKernel<MR, NR, Acc> {
@@ -51,26 +106,33 @@ impl<const MR: usize, const NR: usize, Acc: LADatum> DynKernel<MR, NR, Acc> {
         kernel: Kernel<Acc>,
         packing_a: PackedFormat,
         packing_b: PackedFormat,
-        quality: ImplementationQuality,
     ) -> Self {
         let kernel = DynKernel {
             name: name.to_string(),
             kernel,
-            quality,
+            arch: None,
+            emulated: || false,
             packings: vec![],
             stores: vec![Acc::datum_type()],
-            supported_predicate: || true,
+            built: true,
+            isa: crate::isa::IsaReq::ANY,
             boost: || 0,
             can_fuse: |_| true,
+            row_major_store: false,
         };
         kernel.with_packing(packing_a, packing_b)
     }
 
-    pub fn with_platform_condition(mut self, f: fn() -> bool) -> Self {
-        self.supported_predicate = f;
+    /// Sets what the instruction set must offer for this kernel to run here — the `isa(..)` of
+    /// the kernel macros. Runnability only, and it is a set of declared tokens, nothing runtime:
+    /// a preference spelled here would also skip the kernel's tests. Use [`Self::with_boost`].
+    pub fn with_isa(mut self, isa: crate::isa::IsaReq) -> Self {
+        self.isa = isa;
         self
     }
 
+    /// Sets the tie-break behind [`MatMatMulKer::preference`] — the `boost(..)` of the kernel
+    /// macros, and the one place a runtime preference belongs.
     pub fn with_boost(mut self, f: fn() -> isize) -> Self {
         self.boost = f;
         self
@@ -128,12 +190,20 @@ impl<const MR: usize, const NR: usize, Acc: LADatum> MatMatMulKer for DynKernel<
         NR
     }
 
-    fn quality(&self) -> ImplementationQuality {
-        self.quality
+    fn arch(&self) -> Option<crate::isa::Arch> {
+        self.arch
     }
 
-    fn is_supported_here(&self) -> bool {
-        (self.supported_predicate)()
+    fn emulated(&self) -> bool {
+        (self.emulated)()
+    }
+
+    fn built(&self) -> bool {
+        self.built
+    }
+
+    fn isa(&self) -> crate::isa::IsaReq {
+        self.isa
     }
 
     fn can_fuse(&self, spec: &FusedSpec) -> bool {
@@ -153,7 +223,11 @@ impl<const MR: usize, const NR: usize, Acc: LADatum> MatMatMulKer for DynKernel<
         Cow::Borrowed(&self.stores)
     }
 
-    fn dynamic_boost(&self) -> isize {
+    fn boost(&self) -> isize {
         (self.boost)()
+    }
+
+    fn stores_row_major_tile(&self) -> bool {
+        self.row_major_store
     }
 }

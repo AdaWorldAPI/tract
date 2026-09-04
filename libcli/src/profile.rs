@@ -45,6 +45,59 @@ impl Default for BenchLimits {
     }
 }
 
+/// Structured output of a single bench run: named metrics (e.g. ("evaltime", secs),
+/// ("pp512", tok/s)) plus the loop iteration count for the human report line. The
+/// `bench`/`llm-bench` runners return this so callers — the interactive subcommand or
+/// the bench suite — consume data instead of parsing stdout.
+#[derive(Clone, Debug, Default)]
+pub struct BenchResult {
+    pub metrics: Vec<(String, f64)>,
+    pub iters: usize,
+}
+
+impl BenchResult {
+    /// Emit each metric as a `{"metric":<name>,"value":<f64>}` JSON line on stdout.
+    /// This is the bench-suite child→orchestrator contract: stdout is pure JSONL
+    /// (logs go to stderr), so the orchestrator can validate every line and treat
+    /// anything that does not parse as a hard failure.
+    pub fn emit_jsonl(&self) {
+        for (k, v) in &self.metrics {
+            println!(r#"{{"metric":{k:?},"value":{v}}}"#);
+        }
+    }
+}
+
+/// Load-pipeline checkpoints whose readings the bench suite tracks: the dotted
+/// pattern matched against a normalized event label, and the metric-name fragment.
+/// The probe writes spaces and dashes as underscores, so `model.ready` matches the
+/// `model_ready` line and `before.optimize` matches `after_"before-optimize"`.
+const READINGS_STAGES: &[(&str, &str)] =
+    &[("model.ready", "model_ready"), ("before.optimize", "before_optimize")];
+
+/// Extract the load-time readings the bench suite reports from a readings-probe
+/// output file. For each tracked checkpoint, emit `time_to_<stage>` (elapsed
+/// seconds), `rsz_at_<stage>` (resident bytes) and `active_at_<stage>` (alloc −
+/// free bytes). A missing file or absent checkpoint is skipped; the orchestrator
+/// decides which metrics are required.
+pub fn stage_metrics_from_readings(path: impl AsRef<std::path::Path>) -> Vec<(String, f64)> {
+    let Ok(content) = std::fs::read_to_string(path) else { return vec![] };
+    let normalize = |l: &str| l.replace(['_', '-'], ".");
+    let mut out = vec![];
+    for (pattern, name) in READINGS_STAGES {
+        let Some(line) = content.lines().find(|l| normalize(l).contains(pattern)) else { continue };
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let parse = |i: usize| f.get(i).and_then(|s| s.parse::<f64>().ok());
+        if let (Some(time), Some(rsz), Some(alloc), Some(free)) =
+            (parse(0), parse(3), parse(9), parse(10))
+        {
+            out.push((format!("time_to_{name}"), time));
+            out.push((format!("rsz_at_{name}"), rsz));
+            out.push((format!("active_at_{name}"), alloc - free));
+        }
+    }
+    out
+}
+
 impl BenchLimits {
     pub fn warmup(&self, runnable: &Arc<dyn Runnable>, inputs: &RunTensors) -> TractResult<()> {
         if self.warmup_time.is_zero() && self.warmup_loops.is_zero() {
@@ -169,6 +222,7 @@ pub fn profile(
     Ok(())
 }
 
+#[allow(clippy::type_complexity)]
 pub fn profile_gpu(
     runnable: &Arc<dyn Runnable>,
     bench_limits: &BenchLimits,
@@ -236,25 +290,17 @@ pub fn rec_profiler_gpu(
     prefix: &[(usize, String)],
     before_node: &dyn Fn(usize),
 ) -> TractResult<TVec<TValue>> {
-    let r = state.run_plan_with_eval(
-        inputs.clone(),
-        |session_state, mut node_state, node, input| {
-            before_node(node.id);
-            // Profile node
-            let start = crate::time::now();
-            let res = tract_core::plan::eval(
-                session_state,
-                node_state.as_deref_mut(),
-                node,
-                input.clone(),
-            );
-            let elapsed = start.elapsed();
-            let node_id = NodeQId(prefix.into(), node.id);
-            *dg.node_mut(node_id).profile.get_or_insert(Duration::default()) += elapsed;
+    let r = state.run_plan_with_eval(inputs.clone(), |turn, mut node_state, node, input| {
+        before_node(node.id);
+        // Profile node
+        let start = crate::time::now();
+        let res = tract_core::plan::eval(turn, node_state.as_deref_mut(), node, input.clone());
+        let elapsed = start.elapsed();
+        let node_id = NodeQId(prefix.into(), node.id);
+        *dg.node_mut(node_id).profile.get_or_insert(Duration::default()) += elapsed;
 
-            res
-        },
-    )?;
+        res
+    })?;
 
     Ok(r)
 }
@@ -270,55 +316,50 @@ pub fn rec_profiler(
     time_accounted_by_inner_nodes: &mut Duration,
     folded: bool,
 ) -> TractResult<TVec<TValue>> {
-    let r = state.run_plan_with_eval(
-        inputs.clone(),
-        |session_state, mut node_state, node, input| {
-            // Profile node
+    let r = state.run_plan_with_eval(inputs.clone(), |turn, mut node_state, node, input| {
+        // Keep a copy of the inputs only when a nested submodel will need them
+        // for recursive profiling. Otherwise move them straight into eval: an
+        // extra clone here holds a second Arc ref to each input and forces
+        // in-place ops (reshape, by-scalar/unicast bias add, ...) down their
+        // copy-on-shared path, inflating their measured time versus production.
+        let saved_input = (!folded && node_state.is_some()).then(|| input.clone());
+        // Profile node
+        let start = crate::time::now();
+        let res = tract_core::plan::eval(turn, node_state.as_deref_mut(), node, input);
+        let elapsed = start.elapsed().mul_f32(multiplier.unwrap_or(1) as _);
+        let node_id = NodeQId(prefix.into(), node.id);
+        *dg.node_mut(node_id).profile.get_or_insert(Duration::default()) += elapsed;
+
+        if let Some(saved_input) = saved_input {
             let start = crate::time::now();
-            let res = tract_core::plan::eval(
-                session_state,
-                node_state.as_deref_mut(),
+            profile_submodel(
                 node,
-                input.clone(),
+                node_state,
+                saved_input,
+                dg,
+                profilers,
+                prefix,
+                time_accounted_by_inner_nodes,
+            )?;
+            *time_accounted_by_inner_nodes += start.elapsed();
+        }
+
+        // Update parent nodes if any (childs timings are deducted from parents)
+        let prefix_vec = prefix.to_vec();
+        if !prefix_vec.is_empty() {
+            (1..prefix_vec.len() + 1).map(|idx| prefix_vec[..idx].to_vec()).for_each(
+                |parent_path| {
+                    let parent_node = parent_path.last().map(|it| it.0).unwrap();
+                    let parent = dg
+                        .node_mut(NodeQId(parent_path[..parent_path.len() - 1].into(), parent_node))
+                        .profile
+                        .get_or_insert(Duration::default());
+                    *parent -= elapsed.min(*parent);
+                },
             );
-            let elapsed = start.elapsed().mul_f32(multiplier.unwrap_or(1) as _);
-            let node_id = NodeQId(prefix.into(), node.id);
-            *dg.node_mut(node_id).profile.get_or_insert(Duration::default()) += elapsed;
-
-            if !folded {
-                let start = crate::time::now();
-                profile_submodel(
-                    node,
-                    node_state,
-                    input,
-                    dg,
-                    profilers,
-                    prefix,
-                    time_accounted_by_inner_nodes,
-                )?;
-                *time_accounted_by_inner_nodes += start.elapsed();
-            }
-
-            // Update parent nodes if any (childs timings are deducted from parents)
-            let prefix_vec = prefix.to_vec();
-            if !prefix_vec.is_empty() {
-                (1..prefix_vec.len() + 1).map(|idx| prefix_vec[..idx].to_vec()).for_each(
-                    |parent_path| {
-                        let parent_node = parent_path.last().map(|it| it.0).unwrap();
-                        let parent = dg
-                            .node_mut(NodeQId(
-                                parent_path[..parent_path.len() - 1].into(),
-                                parent_node,
-                            ))
-                            .profile
-                            .get_or_insert(Duration::default());
-                        *parent -= elapsed.min(*parent);
-                    },
-                );
-            }
-            res
-        },
-    )?;
+        }
+        res
+    })?;
     Ok(r)
 }
 

@@ -1,18 +1,17 @@
 #![allow(clippy::type_complexity)]
 
 use dyn_clone::clone_box;
-use dyn_eq::DynEq;
 use tract_itertools::Itertools;
 use tract_linalg::WeightType;
 use tract_linalg::block_quant::BlockQuantFact;
-use tract_linalg::mmm::{ImplementationQuality, MMMInputFormat, MatMatMul, PanelExtractor};
+use tract_linalg::mmm::{MMMInputFormat, Query, Suitable, pick_by_shape, retain_best};
 
 use crate::internal::*;
 use crate::ops::matmul::ModePicker;
 
 use super::einsum_matmul::EinSumMatMul;
 
-pub type Impl = (Box<dyn MatMatMul>, usize, Option<PanelExtractor>);
+pub type Impl = Suitable;
 pub type Strat = (ModePicker, Box<dyn MMMInputFormat>, Vec<Impl>);
 
 fn single_strat(it: Impl) -> Strat {
@@ -20,57 +19,31 @@ fn single_strat(it: Impl) -> Strat {
 }
 
 pub fn strategize(model: &TypedModel, node: &TypedNode, op: &EinSumMatMul) -> TractResult<Strat> {
-    let input_facts = model.node_input_facts(node.id)?;
-    if let (Some(m), Some(k), Some(n)) = (op.m.as_i64(), op.k.as_i64(), op.n.as_i64())
-        && input_facts[0].is_plain()
-        && input_facts[1].is_plain()
-        && op.op.operating_dt == input_facts[0].datum_type
-        && op.op.operating_dt == input_facts[1].datum_type
-        && let Some(mmm) = tract_linalg::ops().mmm(
-            op.operating_dt,
-            Some(m as usize),
-            Some(k as usize),
-            Some(n as usize),
-        )
-        && mmm.quality() == ImplementationQuality::ManuallyOptimized
+    let query = query(model, node, op)?;
+    let mut suitable = tract_linalg::MmmDispatch::native().suitable(&query);
+    ensure!(suitable.len() > 0);
+    // Only with `n` in hand: a symbolic `n` is what the packing-group reasoning below is for,
+    // and it serves both roles at once, which a single pick cannot.
+    if query.n.is_some()
+        && let Some(chosen) = tract_linalg::MmmDispatch::native().preferred(&query, &suitable)
     {
-        return Ok((ModePicker::Single, mmm.packings()[0].0.clone(), vec![(mmm, 0, None)]));
-    };
-
-    let mut impls = list_impls(model, node, op)?;
-    ensure!(impls.len() > 0);
-    fn score(mmm: &dyn MatMatMul) -> isize {
-        -(mmm.quality().cost() as isize * 1000) + mmm.dynamic_boost()
+        return Ok(single_strat(chosen));
     }
-    let wanted_quality = impls.iter().map(|(mmm, _, _)| score(&**mmm)).max().unwrap();
-    impls.retain(|(mmm, _, _)| score(&**mmm) == wanted_quality);
-    if impls.len() == 1 {
-        return Ok(single_strat(impls.remove(0)));
+    retain_best(&mut suitable);
+    if suitable.len() == 1 {
+        return Ok(single_strat(suitable.remove(0)));
     }
-    if op.n.is_one() {
-        let it =
-            impls.into_iter().max_by_key(|(m, _, pe)| (m.nr() == 1, pe.is_none(), m.mr())).unwrap();
-        return Ok(single_strat(it));
-    }
-    if op.n.as_i64().is_some_and(|n| n > 1) {
-        // For a 2D matmul (n > 1) a GEMV kernel (nr == 1) is a poor fit: it
-        // processes one output column per pass. Demote nr == 1 so it never wins
-        // the `nr * mr` tie against a square tile (e.g. i8 64x1 vs 8x8 both have
-        // nr*mr == 64). Ordering among nr > 1 kernels is left untouched.
-        let it = impls
-            .into_iter()
-            .max_by_key(|(m, _, pe)| (pe.is_none(), m.nr() > 1, m.nr() * m.mr()))
-            .unwrap();
-        return Ok(single_strat(it));
+    if let Some(ix) = pick_by_shape(&query, &suitable) {
+        return Ok(single_strat(suitable.swap_remove(ix)));
     }
     let mut grouped_by_left_packing = Vec::<(&dyn MMMInputFormat, Vec<_>)>::new();
-    'mmm: for (m, p, pe) in &impls {
+    'mmm: for (m, p, pe) in &suitable {
         let left_packing: &dyn MMMInputFormat =
             pe.as_ref().map(|pe| &*pe.from).unwrap_or(&*m.packings()[*p].0);
-        for kit in &mut grouped_by_left_packing {
-            if let Some(merged) = kit.0.merge_with(left_packing) {
-                kit.0 = merged;
-                kit.1.push((m, p, pe));
+        for group in &mut grouped_by_left_packing {
+            if let Some(merged) = group.0.merge_with(left_packing) {
+                group.0 = merged;
+                group.1.push((m, p, pe));
                 continue 'mmm;
             }
         }
@@ -78,10 +51,10 @@ pub fn strategize(model: &TypedModel, node: &TypedNode, op: &EinSumMatMul) -> Tr
     }
     let (p, mmv, mmm) = grouped_by_left_packing
         .iter()
-        .map(|(p, kit)| {
+        .map(|(p, group)| {
             let best_for_mmv =
-                kit.iter().max_by_key(|(m, _, pe)| (m.nr() == 1, pe.is_none())).unwrap();
-            let best_for_mmm = kit.iter().max_by_key(|(m, _, _)| m.nr()).unwrap();
+                group.iter().max_by_key(|(m, _, pe)| (m.nr() == 1, pe.is_none())).unwrap();
+            let best_for_mmm = group.iter().max_by_key(|(m, _, _)| m.nr()).unwrap();
             (p, best_for_mmv, best_for_mmm)
         })
         .max_by_key(|(_, mmv, mmm)| {
@@ -114,11 +87,9 @@ pub fn strategize(model: &TypedModel, node: &TypedNode, op: &EinSumMatMul) -> Tr
     }
 }
 
-pub fn list_impls(
-    model: &TypedModel,
-    node: &TypedNode,
-    op: &EinSumMatMul,
-) -> TractResult<Vec<Impl>> {
+/// The node's matmul as kernel selection sees it: operand types from the input facts, dims
+/// wherever they are already concrete.
+pub fn query(model: &TypedModel, node: &TypedNode, op: &EinSumMatMul) -> TractResult<Query> {
     let (a_fact, b_fact) = model.node_input_facts(node.id)?.into_iter().collect_tuple().unwrap();
     let a_dt = a_fact.datum_type;
     let b_dt = b_fact.datum_type;
@@ -133,34 +104,14 @@ pub fn list_impls(
         a_dt.into()
     };
 
-    let impls = tract_linalg::ops()
-        .mmm_impls()
-        .iter()
-        .filter(|mmm| {
-            // Only consider kernels runnable on this CPU: e.g. the SDOT i8 kernel
-            // carries a FEAT_DotProd platform predicate, and must not be selected on
-            // a CPU that would trap on the instruction.
-            mmm.is_supported_here()
-                && op.acceptable_accumulators().contains(&mmm.internal_type())
-                && mmm.stores().contains(&op.operating_dt.unquantized())
-        })
-        .flat_map(move |mmm| {
-            mmm.packings().iter().enumerate().map(|(ix, p)| (mmm.clone(), ix, &p.0, &p.1))
-        })
-        .filter_map(|(m, p, pa, pb)| {
-            if pb.precursor().as_dt().is_none_or(|dt| dt != b_dt.unquantized()) {
-                return None;
-            }
-            if pa.precursor() == a_weight {
-                Some((m, p, None))
-            } else {
-                tract_linalg::ops()
-                    .panel_extractors()
-                    .iter()
-                    .find(|pe| pe.from.precursor() == a_weight && pe.to.dyn_eq(&**pa))
-                    .map(|pe| (m, p, Some(pe.clone())))
-            }
-        })
-        .collect_vec();
-    Ok(impls)
+    Ok(Query {
+        weight: a_weight,
+        activation: b_dt,
+        accumulators: op.acceptable_accumulators(),
+        store: Some(op.operating_dt.unquantized()),
+        allow_extractor: true,
+        m: op.m.as_i64().map(|d| d as usize),
+        k: op.k.as_i64().map(|d| d as usize),
+        n: op.n.as_i64().map(|d| d as usize),
+    })
 }

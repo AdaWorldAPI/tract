@@ -6,8 +6,16 @@ on:
     - cron:  '0 3 * * *'
   workflow_dispatch:
 
+concurrency:
+  # cancel superseded PR pushes; schedule/dispatch key on run_id so they never cancel
+  group: crates-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_INCREMENTAL: false
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_MULTIPLEXING: false
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE20: true
 
 permissions:
@@ -19,20 +27,26 @@ jobs:
     outputs:
       os: ${{steps.set-matrix.outputs.os}}
       rust: ${{steps.set-matrix.outputs.rust}}
+      msrv: ${{steps.set-matrix.outputs.msrv}}
 
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - id: set-matrix
         env:
           FULL: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
         run: |
+          msrv=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "msrv=$msrv" >> $GITHUB_OUTPUT
           if [ "$FULL" == "true" ]
           then
             echo 'os=["ubuntu-latest", "macos-latest"]' >> $GITHUB_OUTPUT
-            echo 'rust=["1.91.0", "stable", "beta", "nightly"]' >> $GITHUB_OUTPUT
+            echo "rust=[\"$msrv\", \"stable\", \"beta\", \"nightly\"]" >> $GITHUB_OUTPUT
           else
             echo ::notice::Skipping macOS checks on PR and commit. Dispatch workflow manually if needed.
             echo 'os=["ubuntu-latest"]' >> $GITHUB_OUTPUT
-            echo 'rust=["1.91.0"]' >> $GITHUB_OUTPUT
+            echo "rust=[\"$msrv\"]" >> $GITHUB_OUTPUT
           fi
 
   crates:
@@ -44,7 +58,7 @@ jobs:
         rust: ${{fromJson(needs.prepare-matrix.outputs.rust)}}
         crate: [  tract-data, tract-linalg, tract-core, tract-nnef, tract-hir, tract-onnx,
                   tract-pulse, tract-onnx-opl, tract-pulse-opl, tract,
-                  test-unit-core, test-onnx-core, test-nnef-cycle, test-f16,
+                  test-unit-core, test-pulse-core, test-onnx-core, test-nnef-cycle, test-f16,
                ]
       fail-fast: false
 
@@ -53,12 +67,25 @@ jobs:
       RUSTUP_TOOLCHAIN: ${{matrix.rust}}
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # beta/nightly change too often to cache usefully and just evict the stable
+      # entries under the 10 GB/repo cap; and only main should save, so PR runs
+      # restore without adding transient caches that push main's out.
+      if: matrix.rust != 'beta' && matrix.rust != 'nightly'
+      with:
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - name: CPU features
+      run: .travis/cpu-features.sh
+
     - name: Cargo test
-      run: cargo test -p ${{matrix.crate}}
+      # tract-linalg and the test-rt suites run thousands of tiny cases; -q
+      # collapses the per-test lines to dots so the CI log stays readable.
+      run: cargo test ${{ (matrix.crate == 'tract-linalg' || startsWith(matrix.crate, 'test-')) && '-q' || '' }} -p ${{matrix.crate}}
 
   cuda:
     runs-on: cuda-lovelace
@@ -70,24 +97,26 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: ${{matrix.rust}}
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
     - name: Cargo test
-      run: cargo test -p tract-cuda -p test-cuda
+      run: cargo test -q -p tract-gpu -p tract-cuda -p test-cuda
 
   cuda-minimum-deploy:
     # Validates the BOM documented in cuda/src/context.rs. Builds tract-cli
     # on the runner (full toolkit available) then runs it against a tiny
     # model inside a container that only has the minimum runtime packages
     # pinned in harness/cuda-minimum-deploy/Dockerfile.
+    # Daily only: keeps this off the cuda-lovelace runner on every PR.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: cuda-lovelace
     needs: prepare-matrix
     env:
-      RUSTUP_TOOLCHAIN: "1.91.0"
+      RUSTUP_TOOLCHAIN: ${{ needs.prepare-matrix.outputs.msrv }}
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
     - name: Minimum-BOM GPU smoke
@@ -103,12 +132,12 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: ${{matrix.rust}}
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
     - name: Cargo test
-      run: cargo test -p tract-metal -p test-metal
+      run: cargo test -q -p tract-gpu -p tract-metal -p test-metal
    
   pedantic:
     name: fmt, clippy, etc (${{matrix.os}} / ${{matrix.rust}})
@@ -122,16 +151,26 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: ${{matrix.rust}}
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
-    - run: rustup component add clippy && cargo clippy
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      if: matrix.rust != 'beta' && matrix.rust != 'nightly'
+      with:
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - run: rustup component add clippy && cargo clippy --all-targets
+    - name: clippy (bench-suite feature)
+      run: cargo clippy -p tract-cli --features bench-suite
+    - name: test (bench-suite feature)
+      run: cargo test -p tract-cli --features bench-suite --bin tract bench_
     - name: fmt
-      run: rustup component add rustfmt && cargo fmt --check
+      run: rustup component add rustfmt --toolchain stable && cargo +stable fmt --check
     - name: Warnings
       env:
         RUSTFLAGS: -D warnings
-      run: cargo check
+      run: cargo check --all-targets
 
   cargo-deny:
     strategy:
@@ -140,7 +179,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
     - name: Install cargo-deny

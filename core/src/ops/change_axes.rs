@@ -366,7 +366,12 @@ impl AxisOp {
 
     pub fn change_shape(&self, shape: &mut ShapeFact, broadcasting: bool) -> TractResult<()> {
         match self.canonical().as_ref() {
-            Add(ix) => shape.insert_axis(*ix),
+            Add(ix) => {
+                if *ix > shape.rank() {
+                    bail!("Attempt to insert axis #{} on shape {:?}", ix, shape);
+                }
+                shape.insert_axis(*ix)
+            }
             Rm(ix) => {
                 if shape.rank() <= *ix {
                     bail!("Attempt to remove axis #{} on shape {:?}", ix, shape);
@@ -541,6 +546,19 @@ impl AxisOp {
         }
     }
 
+    /// The same op on wires that gained `prefix` axes in front: every axis it
+    /// names moves right by as much, so none of them can land ahead of the new
+    /// axes. Inverse of [`AxisOp::trim_left`], and infallible where that one can
+    /// refuse.
+    pub fn pad_left(&self, prefix: usize) -> AxisOp {
+        match self {
+            Rm(r) => Rm(r + prefix),
+            Add(a) => Add(a + prefix),
+            Reshape(at, from, to) => Reshape(at + prefix, from.clone(), to.clone()),
+            Move(from, to) => Move(from + prefix, to + prefix),
+        }
+    }
+
     pub fn trim_left(&self, prefix: usize) -> TractResult<AxisOp> {
         Ok(match self {
             Rm(r) if *r >= prefix => Rm(r - prefix),
@@ -642,21 +660,14 @@ impl Op for AxisOp {
 }
 
 impl EvalOp for AxisOp {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        _node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let mut input = args_1!(inputs).into_tensor();
         match self {
             AxisOp::Reshape(skip, from, to) => {
-                let from = from.iter().map(|d| d.eval(&session.resolved_symbols)).collect();
-                let to = to.iter().map(|d| d.eval(&session.resolved_symbols)).collect();
+                let from = from.iter().map(|d| d.eval(ctx.symbols)).collect();
+                let to = to.iter().map(|d| d.eval(ctx.symbols)).collect();
                 AxisOp::Reshape(*skip, from, to).change_tensor(&mut input, false)?
             }
             _ => self.change_tensor(&mut input, false)?,
@@ -708,8 +719,8 @@ fn remap_uniform_tdim(expr: &TDim, axis_op: &AxisOp) -> Option<TDim> {
                         let mut stride = TDim::Val(1);
                         for i in (0..k_to).rev() {
                             let new_sym = scope.coord_sym(*at + i);
-                            sum = sum + TDim::Sym(new_sym) * stride.clone();
-                            stride = stride * to_dims[i].clone();
+                            sum += TDim::Sym(new_sym) * stride.clone();
+                            stride *= to_dims[i].clone();
                         }
                         sum
                     } else {
@@ -906,7 +917,7 @@ impl TypedOp for AxisOp {
         Ok(Some(op))
     }
 
-    fn substitute_symbols(
+    fn set_symbols(
         &self,
         _source: &TypedModel,
         node: &TypedNode,
@@ -1034,21 +1045,56 @@ pub fn perm_to_ops(input: &[usize]) -> TVec<AxisOp> {
 }
 
 pub fn compute_shape_with_tf_rules(input: &[TDim], shape_spec: &[TDim]) -> TractResult<TVec<TDim>> {
+    compute_shape_with_onnx_rules(input, shape_spec, false)
+}
+
+/// Resolve a `Reshape` target shape, honouring ONNX's `allowzero`.
+///
+/// With `allowzero` clear, a 0 in the target copies the input dimension at the same position.
+/// This is the TensorFlow rule and the ONNX default, and is what `compute_shape_with_tf_rules`
+/// asks for. With `allowzero` set, ONNX gives a 0 its literal meaning: a zero-length dimension,
+/// "not taken from input tensor". `allowzero` was added in ONNX opset 14.
+pub fn compute_shape_with_onnx_rules(
+    input: &[TDim],
+    shape_spec: &[TDim],
+    allowzero: bool,
+) -> TractResult<TVec<TDim>> {
     let mut shape: TVec<TDim> = shape_spec.into();
-    // Replace 0s with corresponding input dims (positional, per ONNX/TF spec)
-    for (i, s) in shape.iter_mut().enumerate() {
-        if *s == 0.into() {
-            *s = input
-                .get(i)
-                .with_context(|| {
-                    format!("Reshape: 0 at position {i} but input only has {} dims", input.len())
-                })?
-                .clone();
+    if !allowzero {
+        // Replace 0s with corresponding input dims (positional, per TF and ONNX allowzero=0)
+        for (i, s) in shape.iter_mut().enumerate() {
+            if *s == 0.into() {
+                *s = input
+                    .get(i)
+                    .with_context(|| {
+                        format!(
+                            "Reshape: 0 at position {i} but input only has {} dims",
+                            input.len()
+                        )
+                    })?
+                    .clone();
+            }
         }
     }
     let input_vol: TDim = input.iter().product();
     if let Some(pos) = shape.iter().position(|d| *d == (-1).into()) {
+        // ONNX: "If the attribute 'allowzero' is set, it is invalid for the specified shape to
+        // contain both a zero value and -1, as the value of the dimension corresponding to -1
+        // cannot be determined uniquely."
+        if allowzero && shape.iter().any(|d| *d == 0.into()) {
+            bail!(
+                "Reshape: allowzero is set, so the target shape {shape_spec:?} may not contain both 0 and -1"
+            )
+        }
         let shape_vol: TDim = shape.iter().filter(|d| **d != (-1).into()).product();
+        // Dividing by a zero remainder leaves -1 undetermined rather than wrong: every value
+        // satisfies the element count.
+        if shape_vol == 0.into() {
+            bail!(
+                "Reshape: -1 in target shape {shape_spec:?} cannot be inferred, because the other \
+                 dimensions of {shape:?} leave a volume of zero"
+            )
+        }
         let div = input_vol.maybe_div(&shape_vol)?;
         if div.1 != 1 {
             bail!("invalid")
@@ -1062,6 +1108,14 @@ pub fn compute_shape_with_tf_rules(input: &[TDim], shape_spec: &[TDim]) -> Tract
             );
         }
     }
+    // Neither branch above rules a negative out: -1 resolves only the first, and comparing
+    // volumes accepts one when a dimension is zero, as -2 * 0 == 3 * 0.
+    if let Some(bad) = shape.iter().position(|d| d.as_i64().map(|d| d < 0).unwrap_or(false)) {
+        bail!(
+            "Reshape: dimension {bad} of target shape {shape_spec:?} is still negative after \
+             inference (resolved to {shape:?}); at most one dimension may be -1"
+        )
+    }
     Ok(shape)
 }
 
@@ -1069,7 +1123,26 @@ pub fn to_axis_ops_with_tf_rules(
     input_orig: &[TDim],
     output_spec: &[TDim],
 ) -> TractResult<TVec<AxisOp>> {
-    let final_output = compute_shape_with_tf_rules(input_orig, output_spec)?;
+    to_axis_ops_with_onnx_rules(input_orig, output_spec, false)
+}
+
+/// As `to_axis_ops_with_tf_rules`, but honouring ONNX's `allowzero`.
+pub fn to_axis_ops_with_onnx_rules(
+    input_orig: &[TDim],
+    output_spec: &[TDim],
+    allowzero: bool,
+) -> TractResult<TVec<AxisOp>> {
+    let final_output = compute_shape_with_onnx_rules(input_orig, output_spec, allowzero)?;
+    // A zero-length dimension makes every group volume zero, so the greedy volume matching below
+    // finds spurious partial matches and builds an incoherent stack. There are no elements to
+    // move, so the whole reshape is one unambiguous operation.
+    if final_output.iter().chain(input_orig.iter()).any(|d| *d == 0.into()) {
+        return Ok(if *input_orig == *final_output {
+            tvec!()
+        } else {
+            tvec!(AxisOp::Reshape(0, input_orig.into(), final_output.clone()))
+        });
+    }
     let mut stack: TVec<AxisOp> = tvec!();
     'top: loop {
         let current_input =
@@ -1135,11 +1208,9 @@ impl Op for IntoShape {
 }
 
 impl EvalOp for IntoShape {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let mut input = args_1!(inputs).into_tensor();
         ensure!(input.len() == self.len);
         unsafe { input.set_geometry_unchecked(&self.dims, &self.strides) };
@@ -1663,6 +1734,85 @@ mod proptests {
     #[test]
     fn compute_with_trailing_zero() {
         assert_eq!(&*compute_shape_with_tf_rules(s![3, 4, 5], s!(3, -1, 0)).unwrap(), s![3, 4, 5])
+    }
+
+    // ONNX allowzero. A 0 in the target is literal rather than copied from the input, which is
+    // only reachable through the ONNX frontend: TensorFlow has no such attribute and always
+    // takes the copy rule above.
+
+    #[test]
+    fn compute_allowzero_keeps_a_literal_zero() {
+        assert_eq!(&*compute_shape_with_onnx_rules(s![3, 0], s!(0), true).unwrap(), s![0])
+    }
+
+    #[test]
+    fn compute_without_allowzero_copies_the_input_dim() {
+        // Same model, attribute clear: the 0 becomes the input's dim 0, so 3 elements are asked
+        // of a tensor holding none.
+        assert!(compute_shape_with_onnx_rules(s![3, 0], s!(0), false).is_err())
+    }
+
+    #[test]
+    fn compute_allowzero_reordered() {
+        // ONNX's own test_reshape_allowzero_reordered case.
+        assert_eq!(
+            &*compute_shape_with_onnx_rules(s![0, 3, 4], s!(3, 4, 0), true).unwrap(),
+            s![3, 4, 0]
+        )
+    }
+
+    #[test]
+    fn compute_rejects_two_inferred_dims() {
+        assert!(compute_shape_with_tf_rules(s![2, 3, 4], s!(-1, -1)).is_err())
+    }
+
+    #[test]
+    fn compute_rejects_three_inferred_dims() {
+        assert!(compute_shape_with_tf_rules(s![2, 3, 4], s!(-1, -1, -1)).is_err())
+    }
+
+    #[test]
+    fn compute_rejects_inferred_dim_beside_other_negative() {
+        assert!(compute_shape_with_tf_rules(s![2, 3, 4], s!(-1, -2)).is_err());
+        assert!(compute_shape_with_tf_rules(s![2, 3, 4], s!(-2, -1)).is_err())
+    }
+
+    #[test]
+    fn compute_rejects_negative_that_survives_the_volume_check() {
+        assert!(compute_shape_with_tf_rules(s![3, 0], s!(-2, 0)).is_err())
+    }
+
+    #[test]
+    fn compute_rejects_inferred_dim_with_zero_volume_remainder() {
+        assert!(compute_shape_with_tf_rules(s![3, 0], s!(-1, 0)).is_err());
+        assert!(compute_shape_with_tf_rules(s![0, 3], s!(0, -1)).is_err())
+    }
+
+    #[test]
+    fn compute_still_infers_a_single_dim() {
+        assert_eq!(&*compute_shape_with_tf_rules(s![2, 3, 4], s!(-1)).unwrap(), s![24]);
+        assert_eq!(&*compute_shape_with_tf_rules(s![2, 3, 4], s!(2, -1)).unwrap(), s![2, 12]);
+        assert_eq!(&*compute_shape_with_tf_rules(s![3, 0], s!(-1)).unwrap(), s![0]);
+    }
+
+    #[test]
+    fn compute_leaves_symbolic_dims_alone() {
+        let table = SymbolScope::default();
+        let s = table.new_with_prefix("S");
+        assert_eq!(&*compute_shape_with_tf_rules(s![s, 2, 128], s!(0, -1)).unwrap(), s![s, 256]);
+    }
+
+    #[test]
+    fn compute_allowzero_rejects_zero_beside_minus_one() {
+        // "it is invalid for the specified shape to contain both a zero value and -1, as the
+        // value of the dimension corresponding to -1 cannot be determined uniquely."
+        assert!(compute_shape_with_onnx_rules(s![2, 3], s!(0, -1), true).is_err())
+    }
+
+    #[test]
+    fn to_axis_ops_allowzero_keeps_a_literal_zero() {
+        // The wiring path resolves the shape the same way, so it must agree with the rules path.
+        assert!(to_axis_ops_with_onnx_rules(s![3, 0], s!(0), true).is_ok())
     }
 
     #[test]

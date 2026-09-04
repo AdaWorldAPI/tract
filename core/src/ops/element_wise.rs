@@ -88,11 +88,9 @@ impl Op for ElementWiseOp {
 }
 
 impl EvalOp for ElementWiseOp {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, mut inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, mut inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         if let Some(_dt) = self.0.output_type(inputs[0].datum_type()) {
             Ok(tvec!(self.0.eval_out_of_place(&inputs[0], self.1)?.into_tvalue()))
         } else {
@@ -258,7 +256,8 @@ macro_rules! element_wise {
                         let mut t_plain = t.try_as_plain_mut()?;
                         let t: &mut[$typ] = t_plain.as_slice_mut::<$typ>()?;
                         let f: fn(&Self, &mut[$typ]) -> TractResult<()> = $f;
-                        f(self, t)?;
+                        let len = t.len();
+                        tract_linalg::multithread::par_chunks_mut(t, 1, len, |_, chunk| f(self, chunk))?;
                         return Ok(())
                     }
                     )*
@@ -290,7 +289,8 @@ macro_rules! element_wise {
                                });
                                Ok(())
                            };
-                           f(self, t, input_dt, sout_dt)?;
+                           let len = t.len();
+                           tract_linalg::multithread::par_chunks_mut(t, 1, len, |_, chunk| f(self, chunk, input_dt, sout_dt))?;
                            return Ok(())
                        }
                        )*
@@ -382,8 +382,14 @@ macro_rules! element_wise_oop {
                     let mut dst = unsafe { Tensor::uninitialized_dt(<$typ_dst>::datum_type(), &t.shape())? };
                     $(if t.datum_type() == $typ::datum_type() {
                         let f: fn(&Self, &[$typ], &mut[$typ_dst]) -> TractResult<()> = $f;
+                        let t_plain = t.try_as_plain()?;
+                        let in_slice: &[$typ] = t_plain.as_slice::<$typ>()?;
                         let mut dst_plain = dst.try_as_plain_mut()?;
-                        f(self, t.try_as_plain()?.as_slice::<$typ>()?, dst_plain.as_slice_mut::<$typ_dst>()?)?;
+                        let dst_slice: &mut[$typ_dst] = dst_plain.as_slice_mut::<$typ_dst>()?;
+                        let len = dst_slice.len();
+                        tract_linalg::multithread::par_chunks_mut(dst_slice, 1, len, |first_row, chunk| {
+                            f(self, &in_slice[first_row..first_row + chunk.len()], chunk)
+                        })?;
                         return Ok(dst)
                     }
                     )*

@@ -22,7 +22,12 @@ fn do_download() -> TractResult<()> {
 }
 
 fn cachedir() -> path::PathBuf {
-    ::std::env::var("CACHEDIR").ok().unwrap_or_else(|| "../../.cached".to_string()).into()
+    ::std::env::var("CACHEDIR")
+        .ok()
+        .unwrap_or_else(|| {
+            format!("{}/.cache/tract-test-assets", std::env::var("HOME").unwrap_or_default())
+        })
+        .into()
 }
 
 pub fn load_labels() -> Vec<String> {
@@ -51,7 +56,6 @@ pub fn load_image<P: AsRef<path::Path>>(p: P) -> Tensor {
 #[cfg(test)]
 mod tests {
     extern crate dinghy_test;
-    use tract_tensorflow::prelude::*;
 
     use super::*;
 

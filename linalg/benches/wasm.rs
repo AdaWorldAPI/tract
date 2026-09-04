@@ -35,11 +35,19 @@ fn main() {
     eprintln!("=== int8 (i8->i32) 4x4 GEMM: wasm SIMD vs generic scalar ({target}) ===");
     bench_i8_4x4::run();
 
+    eprintln!();
+    eprintln!("=== int8 matvec (n=1): wasm_i32_4x4 vs generic_i32_4x1 ({target}) ===");
+    bench_i8_matvec::run();
+
     #[cfg(target_feature = "relaxed-simd")]
     {
         eprintln!();
         eprintln!("=== int8 relaxed-dot prototype: relaxed_dot vs widening (4x4 tile) ===");
         bench_relaxed_dot::run();
+
+        eprintln!();
+        eprintln!("=== sigmoid/tanh: wasm relaxed-SIMD vs generic scalar ===");
+        bench_activations::run();
     }
     #[cfg(not(target_feature = "relaxed-simd"))]
     eprintln!("\n(int8 relaxed-dot prototype skipped — rebuild with +relaxed-simd)");
@@ -110,19 +118,8 @@ mod bench_8x8 {
         elapsed.as_secs_f64() / iters as f64 * 1e9
     }
 
-    fn pick(name: &str) -> Box<dyn tract_linalg::mmm::MatMatMul> {
-        let mut ops = tract_linalg::generic();
-        tract_linalg::wasm::plug(&mut ops);
-        for impl_ in ops.mmm_impls() {
-            if impl_.name() == name {
-                return impl_.clone();
-            }
-        }
-        panic!("kernel {name} not registered")
-    }
-
     fn bench_shape(label: &str, m: usize, k: usize, n: usize, iters: usize) {
-        let k88 = pick("wasm_f32_8x8");
+        let k88 = crate::util::pick("wasm_f32_8x8");
         let ns = run_one(&*k88, m, k, n, iters);
         let m_tiles = m.div_ceil(8);
         let n_tiles = n.div_ceil(8);
@@ -212,19 +209,8 @@ mod bench_32x1 {
         elapsed.as_secs_f64() / iters as f64 * 1e9
     }
 
-    fn pick(name: &str) -> Box<dyn tract_linalg::mmm::MatMatMul> {
-        let mut ops = tract_linalg::generic();
-        tract_linalg::wasm::plug(&mut ops);
-        for impl_ in ops.mmm_impls() {
-            if impl_.name() == name {
-                return impl_.clone();
-            }
-        }
-        panic!("kernel {name} not registered")
-    }
-
     fn bench_min_of_n(label: &str, m: usize, k: usize, iters: usize, repetitions: usize) {
-        let kernel = pick("wasm_f32_32x1");
+        let kernel = crate::util::pick("wasm_f32_32x1");
         let mut samples: Vec<f64> = Vec::with_capacity(repetitions);
         for _ in 0..repetitions {
             samples.push(run_one(&*kernel, m, k, iters));
@@ -314,19 +300,8 @@ mod bench_16x1 {
         elapsed.as_secs_f64() / iters as f64 * 1e9
     }
 
-    fn pick(name: &str) -> Box<dyn tract_linalg::mmm::MatMatMul> {
-        let mut ops = tract_linalg::generic();
-        tract_linalg::wasm::plug(&mut ops);
-        for impl_ in ops.mmm_impls() {
-            if impl_.name() == name {
-                return impl_.clone();
-            }
-        }
-        panic!("kernel {name} not registered")
-    }
-
     fn bench_min_of_n(label: &str, m: usize, k: usize, iters: usize, repetitions: usize) {
-        let kernel = pick("wasm_f32_16x1");
+        let kernel = crate::util::pick("wasm_f32_16x1");
         let mut samples: Vec<f64> = Vec::with_capacity(repetitions);
         for _ in 0..repetitions {
             samples.push(run_one(&*kernel, m, k, iters));
@@ -343,7 +318,7 @@ mod bench_16x1 {
     }
 
     pub fn run() {
-        // 16x1's natural band per plug()'s mmv_f32 closure: M ∈ 9..=16
+        // 16x1's natural band as the mmv tiers rank it: M ∈ 9..=16
         bench_min_of_n("M=9 k=256", 9, 256, 30_000, 10);
         bench_min_of_n("M=12 k=256", 12, 256, 30_000, 10);
         bench_min_of_n("M=16 k=96", 16, 96, 30_000, 10);
@@ -420,17 +395,6 @@ mod bench_i8_4x4 {
         elapsed.as_secs_f64() / iters as f64 * 1e9
     }
 
-    fn pick(name: &str) -> Box<dyn MatMatMul> {
-        let mut ops = tract_linalg::generic();
-        tract_linalg::wasm::plug(&mut ops);
-        for impl_ in ops.mmm_impls() {
-            if impl_.name() == name {
-                return impl_.clone();
-            }
-        }
-        panic!("kernel {name} not registered")
-    }
-
     fn min_of_n(
         kernel: &dyn MatMatMul,
         m: usize,
@@ -445,8 +409,8 @@ mod bench_i8_4x4 {
     }
 
     fn bench(label: &str, m: usize, k: usize, n: usize, iters: usize, reps: usize) {
-        let wasm = pick("wasm_i32_4x4");
-        let generic = pick("generic_i32_4x4");
+        let wasm = crate::util::pick("wasm_i32_4x4");
+        let generic = crate::util::pick("generic_i32_4x4");
         let w = min_of_n(&*wasm, m, k, n, iters, reps);
         let g = min_of_n(&*generic, m, k, n, iters, reps);
         let tiles = m.div_ceil(4) * n.div_ceil(4);
@@ -680,5 +644,146 @@ mod bench_relaxed_dot {
         bench(256, 50_000, 8);
         bench(1024, 10_000, 8);
         bench(1536, 8_000, 8);
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "relaxed-simd"))]
+mod bench_activations {
+    //! Microbench: WASM SIMD sigmoid/tanh vs the generic scalar fallback.
+    //! Sizes mirror typical RNN/transformer hidden dims (256, 512, 1024).
+    //! Requires `+relaxed-simd`; without it the slots hold the scalar
+    //! polynomial and the comparison is vacuous.
+
+    use std::time::Instant;
+    use tract_linalg::element_wise::ElementWiseKer;
+
+    fn ns_per_call<K: ElementWiseKer<f32>>(buf: &mut [f32], iters: usize) -> f64 {
+        // Warmup
+        for _ in 0..50 {
+            K::run(buf, ());
+        }
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            K::run(buf, ());
+        }
+        let elapsed = t0.elapsed();
+        elapsed.as_secs_f64() / iters as f64 * 1e9
+    }
+
+    fn bench(label: &str, n: usize, iters: usize) {
+        // Same input for both kernels — rebuild between to avoid post-clamp
+        // saturation mucking up the measurement.
+        let make = || (0..n).map(|i| ((i % 37) as f32 - 18.0) * 0.5).collect::<Vec<f32>>();
+
+        let mut buf = make();
+        let scalar_sig =
+            ns_per_call::<tract_linalg::generic::sigmoid::generic_sigmoid_f32_4n>(&mut buf, iters);
+        let mut buf = make();
+        let simd_sig = ns_per_call::<tract_linalg::wasm::WasmSigmoid4Relaxed>(&mut buf, iters);
+        let mut buf = make();
+        let scalar_tanh =
+            ns_per_call::<tract_linalg::generic::tanh::generic_tanh_f32_4n>(&mut buf, iters);
+        let mut buf = make();
+        let simd_tanh = ns_per_call::<tract_linalg::wasm::WasmTanh4Relaxed>(&mut buf, iters);
+
+        eprintln!(
+            "{label} n={n} iters={iters}: \
+             sigmoid scalar={scalar_sig:.0} ns simd={simd_sig:.0} ns ({:.2}x); \
+             tanh scalar={scalar_tanh:.0} ns simd={simd_tanh:.0} ns ({:.2}x)",
+            scalar_sig / simd_sig,
+            scalar_tanh / simd_tanh,
+        );
+    }
+    pub fn run() {
+        bench("hidden=256", 256, 5_000);
+        bench("hidden=512", 512, 3_000);
+        bench("hidden=1024", 1024, 2_000);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+mod util {
+    use tract_linalg::mmm::MatMatMul;
+
+    pub fn pick(name: &str) -> Box<dyn MatMatMul> {
+        let ops = tract_linalg::MmmDispatch::native();
+        for impl_ in ops.runnable() {
+            if impl_.name() == name {
+                return impl_.clone();
+            }
+        }
+        panic!("kernel {name} not registered")
+    }
+}
+
+// int8 matrix-VECTOR (n=1): `wasm_i32_4x4` pays a 4x N-padding to use its SIMD tile, while
+// `generic_i32_4x1` is a scalar loop with no waste. Both expose the i8i8 packing (index 1) and
+// share a packing group, so a caller with a symbolic `n` picks between exactly these two.
+#[cfg(target_arch = "wasm32")]
+mod bench_i8_matvec {
+    use std::time::Instant;
+    use tract_data::internal::*;
+    use tract_linalg::mmm::{AsInputValue, FusedSpec, MatMatMul};
+
+    const I8I8: usize = 1;
+
+    fn run_one(kernel: &dyn MatMatMul, m: usize, k: usize, n: usize, iters: usize) -> f64 {
+        let packing = &kernel.packings()[I8I8];
+        let a = Tensor::zero::<i8>(&[m, k]).unwrap();
+        let pa = packing.0.prepare_one(&a, 1, 0).unwrap();
+        let b = Tensor::zero::<i8>(&[k, n]).unwrap();
+        let pb = packing.1.prepare_one(&b, 0, 1).unwrap();
+        let mut c = Tensor::zero::<i32>(&[m, n]).unwrap();
+        let mut go = || unsafe {
+            kernel
+                .run(
+                    m,
+                    n,
+                    &[
+                        FusedSpec::AddMatMul {
+                            a: AsInputValue::Borrowed(&*pa),
+                            b: AsInputValue::Borrowed(&*pb),
+                            packing: I8I8,
+                        },
+                        FusedSpec::Store(kernel.c_view(Some(0), Some(1)).wrap(&c.view_mut())),
+                    ],
+                )
+                .unwrap();
+        };
+        for _ in 0..50 {
+            go();
+        }
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            go();
+        }
+        t0.elapsed().as_secs_f64() / iters as f64 * 1e9
+    }
+
+    fn min_of_n(k: &dyn MatMatMul, m: usize, kk: usize, n: usize, i: usize, reps: usize) -> f64 {
+        let mut s: Vec<f64> = (0..reps).map(|_| run_one(k, m, kk, n, i)).collect();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        s[0]
+    }
+
+    fn bench(m: usize, k: usize, iters: usize) {
+        let wasm = crate::util::pick("wasm_i32_4x4");
+        let generic = crate::util::pick("generic_i32_4x1");
+        let w = min_of_n(&*wasm, m, k, 1, iters, 8);
+        let g = min_of_n(&*generic, m, k, 1, iters, 8);
+        eprintln!(
+            "m={m:<5} k={k:<5} n=1: wasm_i32_4x4={w:>9.0} generic_i32_4x1={g:>9.0} ns/call  \
+             the 4x4 costs {:.2}x the generic",
+            w / g
+        );
+    }
+
+    pub fn run() {
+        bench(16, 96, 20_000);
+        bench(64, 64, 20_000);
+        bench(64, 256, 5_000);
+        bench(256, 256, 2_000);
+        bench(256, 1536, 300);
+        bench(1024, 256, 300);
     }
 }

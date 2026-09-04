@@ -61,12 +61,14 @@ impl Header {
 pub fn read_tensor(mut reader: impl Read) -> TractResult<Tensor> {
     let header = Header::read(&mut reader)?;
     let shape: TVec<usize> = header.dims[0..header.rank as usize].iter().map(|d| *d as _).collect();
-    let len = shape.iter().product::<usize>();
+    let Some(len) = shape.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d)) else {
+        bail!("Tensor shape product overflows usize: {:?}", shape);
+    };
 
     if header.item_type == 5 {
-        let expected_bit_size = len * header.bits_per_item as usize;
+        let expected_bit_size = len.checked_mul(header.bits_per_item as usize);
         let real_bit_size = header.data_size_bytes as usize * 8;
-        if !(real_bit_size - 8 <= expected_bit_size && expected_bit_size <= real_bit_size) {
+        if expected_bit_size.is_none_or(|e| !(real_bit_size - 8 <= e && e <= real_bit_size)) {
             bail!(
                 "Shape and len mismatch: shape:{:?}, bits_per_item:{}, bytes:{} ",
                 shape,
@@ -75,7 +77,8 @@ pub fn read_tensor(mut reader: impl Read) -> TractResult<Tensor> {
             );
         }
     } else if header.bits_per_item != u32::MAX
-        && len * (header.bits_per_item as usize / 8) != header.data_size_bytes as usize
+        && len.checked_mul(header.bits_per_item as usize / 8)
+            != Some(header.data_size_bytes as usize)
     {
         bail!(
             "Shape and len mismatch: shape:{:?}, bits_per_item:{}, bytes:{} ",
@@ -173,12 +176,17 @@ pub fn read_tensor(mut reader: impl Read) -> TractResult<Tensor> {
         let mut plain = tensor.try_as_plain_mut()?;
         for item in plain.as_slice_mut::<String>()? {
             let len: u32 = reader.read_u32::<LE>()?;
-            let mut bytes = Vec::with_capacity(len as usize);
-            #[allow(clippy::uninit_vec)]
-            unsafe {
-                bytes.set_len(len as usize);
-            };
-            reader.read_exact(&mut bytes)?;
+            // SECURITY: `len` is read from the (untrusted) NNEF file. Do NOT pre-allocate or
+            // `set_len` an unbounded buffer from it (CWE-770): a malicious file advertising a
+            // multi-gigabyte string length forces a huge *upfront* allocation (abort on OOM, or
+            // memory exhaustion) before any byte is read, and the previous `unsafe set_len` also
+            // left the buffer uninitialized. Read at most `len` bytes, growing the buffer from what
+            // actually arrives, then verify the real length matches the declaration.
+            let mut bytes = Vec::new();
+            (&mut reader).take(len as u64).read_to_end(&mut bytes)?;
+            if bytes.len() != len as usize {
+                bail!("NNEF string item declared {len} bytes but only {} readable", bytes.len());
+            }
             *item = String::from_utf8(bytes)?;
         }
         Ok(tensor)
@@ -281,9 +289,15 @@ fn read_block_quant_value(r: &mut impl Read, header: &Header) -> TractResult<Ten
     let shape: TVec<_> =
         header.dims.iter().take(header.rank as usize).map(|d| *d as usize).collect();
     let q_m = shape[0];
-    let q_k = shape.iter().skip(1).product::<usize>();
+    let Some(q_k) = shape.iter().skip(1).try_fold(1usize, |a, &d| a.checked_mul(d)) else {
+        bail!("Block-quant shape product overflows usize: {:?}", shape);
+    };
     ensure!(q_k % format.block_len() == 0);
-    let expected_len = (q_m * q_k) / format.block_len() * format.block_bytes();
+    let Some(expected_len) =
+        q_m.checked_mul(q_k).map(|n| n / format.block_len() * format.block_bytes())
+    else {
+        bail!("Block-quant length overflows usize: {:?}", shape);
+    };
     ensure!(expected_len == header.data_size_bytes as usize);
     let mut blob = unsafe { Blob::new_for_size_and_align(expected_len, 128) };
     r.read_exact(&mut blob)?;

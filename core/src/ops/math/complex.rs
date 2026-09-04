@@ -14,11 +14,9 @@ impl Op for InnerDimToComplex {
 }
 
 impl EvalOp for InnerDimToComplex {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, mut inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, mut inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         Ok(tvec!(reinterpret_inner_dim_as_complex(inputs.remove(0).into_tensor())?.into_tvalue()))
     }
 }
@@ -50,11 +48,9 @@ impl Op for ComplexToInnerDim {
 }
 
 impl EvalOp for ComplexToInnerDim {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, mut inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, mut inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         Ok(tvec!(reinterpret_complex_as_inner_dim(inputs.remove(0).into_tensor())?.into_tvalue()))
     }
 }

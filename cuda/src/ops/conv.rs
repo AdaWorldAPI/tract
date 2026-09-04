@@ -1,7 +1,8 @@
 use crate::kernels::conv::{ConvGeneric, ConvKernel, ConvKernelScratch};
 use crate::kernels::conv_cudnn::ConvCudnn;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use tract_core::internal::*;
-use tract_core::ops::OpStateFreeze;
 use tract_core::ops::cnn::Conv;
 use tract_gpu::ops::change_axes::GpuAxisOp;
 use tract_gpu::tensor::DeviceTensorExt;
@@ -78,16 +79,6 @@ impl Op for CudaConv {
     op_as_typed_op!();
 }
 
-impl EvalOp for CudaConv {
-    fn is_stateless(&self) -> bool {
-        false
-    }
-
-    fn state(&self, _session: &TurnState, node_id: usize) -> TractResult<Option<Box<dyn OpState>>> {
-        Ok(Some(Box::new(CudaConvState(node_id, None))))
-    }
-}
-
 impl TypedOp for CudaConv {
     as_op!();
 
@@ -104,66 +95,50 @@ impl TypedOp for CudaConv {
     }
 }
 
-#[derive(Debug)]
-struct CudaConvState(usize, Option<Box<dyn ConvKernelScratch>>);
-
-impl Clone for CudaConvState {
-    fn clone(&self) -> Self {
-        CudaConvState(self.0, None)
-    }
+// cudnn descriptors are not Send and carry no meaning the model depends on, so
+// they are scratch the op keeps itself: a thread-local keyed by the session and
+// node the EvalContext names, emptied for a session in `drop_session`.
+thread_local! {
+    static CUDA_CONV_SCRATCH: RefCell<HashMap<(SessionId, usize), Box<dyn ConvKernelScratch>>> =
+        RefCell::new(HashMap::new());
 }
 
-impl OpState for CudaConvState {
-    fn eval(
-        &mut self,
-        session: &mut TurnState,
-        op: &dyn Op,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
-        let op: &CudaConv = op.downcast_ref().context("Wrong op")?;
+impl EvalOp for CudaConv {
+    not_out_of_plan!();
+
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let inputs =
             inputs.iter().map(|it| it.to_device_tensor()).collect::<TractResult<TVec<_>>>()?;
-        let output_shape = op.op.pool_spec.output_shape(inputs[0].shape())?;
-        let output = tract_gpu::session_handler::make_tensor_for_node(
-            session,
-            self.0,
+        let output_shape = self.op.pool_spec.output_shape(inputs[0].shape())?;
+        let output = tract_gpu::turn_handler::make_tensor_for_node(
+            ctx,
             inputs[0].datum_type(),
             &output_shape.shape,
         )?;
 
-        if self.1.is_none() {
-            self.1 = Some(op.kernel.state());
-        }
-
         if output.len() > 0 {
             crate::with_cuda_stream(|stream| {
-                op.kernel.dispatch(
-                    &mut **self.1.as_mut().unwrap(),
-                    self.0,
-                    &op.op,
-                    stream,
-                    inputs[0],
-                    inputs[1],
-                    inputs.get(2).cloned(),
-                    &output,
-                )
+                CUDA_CONV_SCRATCH.with_borrow_mut(|cache| {
+                    let scratch = cache
+                        .entry((ctx.session, ctx.node_id))
+                        .or_insert_with(|| self.kernel.state());
+                    self.kernel.dispatch(
+                        &mut **scratch,
+                        ctx.node_id,
+                        &self.op,
+                        stream,
+                        inputs[0],
+                        inputs[1],
+                        inputs.get(2).cloned(),
+                        &output,
+                    )
+                })
             })?;
         }
         Ok(tvec!(output.into_tensor().into_tvalue()))
     }
-}
 
-#[derive(Debug, Clone)]
-struct FrozenCudaConvState(usize);
-
-impl OpStateFreeze for CudaConvState {
-    fn freeze(&self) -> Box<dyn FrozenOpState> {
-        Box::new(FrozenCudaConvState(self.0))
-    }
-}
-
-impl FrozenOpState for FrozenCudaConvState {
-    fn unfreeze(&self) -> Box<dyn OpState> {
-        Box::new(CudaConvState(self.0, None))
+    fn drop_session(&self, session: SessionId, node_id: usize) {
+        CUDA_CONV_SCRATCH.with_borrow_mut(|cache| cache.remove(&(session, node_id)));
     }
 }

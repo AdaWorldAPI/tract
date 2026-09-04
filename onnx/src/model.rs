@@ -175,12 +175,12 @@ impl ParsingContext<'_> {
         let mut outputs = vec![];
         for output in graph.output.iter() {
             let mut fact = InferenceFact::default();
-            if self.framework.use_output_shapes {
-                if let Some(f) = output.r#type.as_ref().and_then(|t| t.value.as_ref()) {
-                    let pb::type_proto::Value::TensorType(f) = f;
-                    fact = translate_inference_fact(&ctx, f, false)?
-                };
-            }
+            if self.framework.use_output_shapes
+                && let Some(f) = output.r#type.as_ref().and_then(|t| t.value.as_ref())
+            {
+                let pb::type_proto::Value::TensorType(f) = f;
+                fact = translate_inference_fact(&ctx, f, false)?
+            };
             if self.framework.ignore_output_types {
                 fact = fact.without_datum_type();
             }
@@ -192,15 +192,15 @@ impl ParsingContext<'_> {
         model.select_output_outlets(&outputs)?;
         if !self.framework.ignore_value_info {
             for info in &graph.value_info {
-                if let Some(TypeProto { value: Some(Value::TensorType(t)), .. }) = &info.r#type {
-                    if let Some(outlet) = outlets_by_name.get(&info.name) {
-                        let mut pbfact = translate_inference_fact(&ctx, t, false)?;
-                        // be conservative, these are likely to be TDim
-                        if pbfact.datum_type() == Some(i64::datum_type()) {
-                            pbfact = pbfact.without_datum_type();
-                        }
-                        model.set_outlet_fact(*outlet, pbfact)?;
+                if let Some(TypeProto { value: Some(Value::TensorType(t)), .. }) = &info.r#type
+                    && let Some(outlet) = outlets_by_name.get(&info.name)
+                {
+                    let mut pbfact = translate_inference_fact(&ctx, t, false)?;
+                    // be conservative, these are likely to be TDim
+                    if pbfact.datum_type() == Some(i64::datum_type()) {
+                        pbfact = pbfact.without_datum_type();
                     }
+                    model.set_outlet_fact(*outlet, pbfact)?;
                 }
             }
         }
@@ -276,7 +276,44 @@ impl Onnx {
             template,
         };
         trace!("created ParsingContext");
-        ctx.parse_graph(graph)
+        let mut result = ctx.parse_graph(graph)?;
+        if !proto.producer_name.is_empty() {
+            result
+                .model
+                .properties
+                .insert("onnx.producer_name".into(), rctensor0(proto.producer_name.clone()));
+        }
+        if !proto.producer_version.is_empty() {
+            result
+                .model
+                .properties
+                .insert("onnx.producer_version".into(), rctensor0(proto.producer_version.clone()));
+        }
+        if !proto.domain.is_empty() {
+            result.model.properties.insert("onnx.domain".into(), rctensor0(proto.domain.clone()));
+        }
+        if proto.model_version != 0 {
+            result
+                .model
+                .properties
+                .insert("onnx.model_version".into(), rctensor0(proto.model_version));
+        }
+        if proto.ir_version != 0 {
+            result.model.properties.insert("onnx.ir_version".into(), rctensor0(proto.ir_version));
+        }
+        if !proto.doc_string.is_empty() {
+            result
+                .model
+                .properties
+                .insert("onnx.doc_string".into(), rctensor0(proto.doc_string.clone()));
+        }
+        for entry in &proto.metadata_props {
+            result.model.properties.insert(
+                format!("onnx.metadata_props.{}", entry.key),
+                rctensor0(entry.value.clone()),
+            );
+        }
+        Ok(result)
     }
 
     pub fn with_ignore_output_shapes(self, ignore: bool) -> Onnx {
@@ -294,10 +331,10 @@ impl Onnx {
     pub fn determinize(model: &mut InferenceModel) -> TractResult<()> {
         use crate::ops::multinomial::Multinomial;
         for node in model.nodes_mut() {
-            if let Some(op) = node.op_as_mut::<Box<dyn Expansion>>() {
-                if let Some(op) = op.as_any_mut().downcast_mut::<Multinomial>() {
-                    op.seed.get_or_insert(1.0);
-                }
+            if let Some(op) = node.op_as_mut::<Box<dyn Expansion>>()
+                && let Some(op) = op.as_any_mut().downcast_mut::<Multinomial>()
+            {
+                op.seed.get_or_insert(1.0);
             }
         }
         Ok(())
@@ -359,5 +396,24 @@ impl Framework<pb::ModelProto, InferenceModel> for Onnx {
     fn model_for_read(&self, r: &mut dyn std::io::Read) -> TractResult<InferenceModel> {
         let proto_model = self.proto_model_for_read(r).context("Reading proto model")?;
         self.model_for_proto_model(&proto_model).context("Translating proto model to model")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn onnx_metadata_is_carried() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let model_path = dir.join("test_cases").join("linear_regressor").join("model.onnx");
+        let model = Onnx::default().model_for_path(&model_path).unwrap();
+        assert!(
+            model.properties.contains_key("onnx.producer_name"),
+            "expected onnx.producer_name in properties, got: {:?}",
+            model.properties.keys().collect::<Vec<_>>()
+        );
+        assert!(model.properties.contains_key("onnx.domain"), "expected onnx.domain in properties");
     }
 }

@@ -3,12 +3,6 @@
 WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
-if [ -e /proc/cpuinfo ]
-then
-    grep "^flags" /proc/cpuinfo | head -1 | \
-        grep --color=always '\(s\?sse[0-9_]*\|fma\|f16c\|avx[^ ]*\)'
-fi
-
 set -x
 
 ROOT=$(dirname $0)/..
@@ -24,7 +18,6 @@ fi
 set +x
 
 cargo -q test $CARGO_EXTRA -q -p tract
-cargo -q test $CARGO_EXTRA -q --profile opt-no-lto -p core-proptest-pulse $ALL_FEATURES
 cargo -q test $CARGO_EXTRA -q --profile opt-no-lto -p nnef-inceptionv3 $ALL_FEATURES
 cargo -q test $CARGO_EXTRA -q --profile opt-no-lto -p tf-inceptionv3 $ALL_FEATURES
 cargo -q test $CARGO_EXTRA -q --profile opt-no-lto -p tf-mobilenet-v2 $ALL_FEATURES

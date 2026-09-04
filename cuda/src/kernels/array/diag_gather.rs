@@ -104,7 +104,7 @@ impl DiagGather {
 
         // Grid: x = out_len cols, y = T_q rows, z = batch.  Threads per block
         // along x = min(out_len, 256) rounded down to multiple of 32.
-        let block_x = out_len.min(MAX_THREADS).max(32);
+        let block_x = out_len.clamp(32, MAX_THREADS);
         let grid_x = out_len.div_ceil(block_x);
         let cfg = LaunchConfig {
             grid_dim: (grid_x as _, t_q as _, batch as _),
@@ -151,13 +151,11 @@ mod tests {
             let cpu_in = Tensor::from_shape(shape, &data)?;
             let cuda_in = cpu_in.clone().into_device()?;
 
-            // CPU DiagGather only implements eval_with_session (it resolves
-            // TDims against the session's resolved_symbols); pass an empty
+            // CPU DiagGather only implements eval_with_turn (it resolves
+            // TDims against the turn's resolved_symbols); pass an empty
             // TurnState since the TDims here are already concrete.
-            let cpu_op =
-                cpu_dg::DiagGather { offset: (offset as i64).to_dim(), out_len: out_len.to_dim() };
-            let session = TurnState::default();
-            let cpu_out = cpu_op.eval_with_session(0, &session, tvec![cpu_in.into_tvalue()])?[0]
+            let cpu_op = cpu_dg::DiagGather { offset: offset.to_dim(), out_len: out_len.to_dim() };
+            let cpu_out = cpu_op.eval(&EvalContext::out_of_plan(), tvec![cpu_in.into_tvalue()])?[0]
                 .clone()
                 .into_tensor();
             let cuda_out = DiagGather.eval(stream, &cuda_in, offset, out_len)?;

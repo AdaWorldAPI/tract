@@ -6,7 +6,6 @@ use rand_distr::StandardNormal;
 use rand_distr::num_traits::Float;
 use tract_nnef::internal::*;
 use tract_nnef::ser::{array, tdims};
-use tract_nnef::tract_core::trivial_op_state_freeze;
 
 pub fn register(registry: &mut Registry) {
     registry.register_primitive(
@@ -104,15 +103,9 @@ impl TypedOp for Random {
 }
 
 impl EvalOp for Random {
-    fn is_stateless(&self) -> bool {
-        false
-    }
+    not_out_of_plan!();
 
-    fn state(
-        &self,
-        _session: &TurnState,
-        _node_id: usize,
-    ) -> TractResult<Option<Box<dyn OpState>>> {
+    fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         let rng = self.seed.map(SmallRng::seed_from_u64).unwrap_or_else(rand::make_rng);
         Ok(Some(Box::new(RandomState(rng))))
     }
@@ -124,7 +117,7 @@ struct RandomState(SmallRng);
 impl OpState for RandomState {
     fn eval(
         &mut self,
-        session: &mut TurnState,
+        ctx: &EvalContext,
         op: &dyn Op,
         _inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>> {
@@ -132,7 +125,7 @@ impl OpState for RandomState {
         let mut tensor = unsafe {
             Tensor::uninitialized_dt(
                 op.fact.datum_type,
-                &op.fact.shape.eval_to_usize(&session.resolved_symbols)?,
+                &op.fact.shape.eval_to_usize(ctx.symbols)?,
             )?
         };
         match &op.dist {
@@ -157,9 +150,11 @@ impl OpState for RandomState {
         }
         Ok(tvec!(tensor.into_tvalue()))
     }
-}
 
-trivial_op_state_freeze!(RandomState);
+    fn reset_lanes(&mut self, _lanes: &[LaneId]) -> TractResult<()> {
+        bail!("Random is not lane-aware: one generator cannot serve several streams")
+    }
+}
 
 fn sample_uniform<T: Datum + SampleUniform + Copy>(
     t: &mut Tensor,

@@ -1,5 +1,3 @@
-use crate::ops::OpStateFreeze;
-
 use super::*;
 use tract_data::internal::*;
 
@@ -55,15 +53,9 @@ impl Op for OptScan {
 }
 
 impl EvalOp for OptScan {
-    fn is_stateless(&self) -> bool {
-        false
-    }
+    not_out_of_plan!();
 
-    fn state(
-        &self,
-        _session: &TurnState,
-        _node_id: usize,
-    ) -> TractResult<Option<Box<dyn OpState>>> {
+    fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(Some(Box::new(State {
             position: 0,
             hidden_state: tvec!(),
@@ -79,45 +71,6 @@ pub struct State {
     position: usize,
     hidden_state: TVec<TValue>,
     pub model_state: TypedSimpleState,
-}
-
-#[derive(Debug, Clone)]
-struct FrozenState {
-    op: Arc<ScanOpParams>,
-    position: usize,
-    hidden_state: TVec<Tensor>,
-    model_state: TypedFrozenSimpleState,
-}
-
-impl OpStateFreeze for State {
-    fn freeze(&self) -> Box<dyn FrozenOpState> {
-        Box::new(FrozenState {
-            op: self.op.clone(),
-            position: self.position,
-            hidden_state: self.hidden_state.iter().map(|t| t.clone().into_tensor()).collect(),
-            model_state: self.model_state.freeze(),
-        })
-    }
-
-    fn freeze_into(self: Box<Self>) -> Box<dyn FrozenOpState> {
-        Box::new(FrozenState {
-            op: self.op,
-            position: self.position,
-            hidden_state: self.hidden_state.into_iter().map(|t| t.into_tensor()).collect(),
-            model_state: self.model_state.freeze_into(),
-        })
-    }
-}
-
-impl FrozenOpState for FrozenState {
-    fn unfreeze(&self) -> Box<dyn OpState> {
-        Box::new(State {
-            op: self.op.clone(),
-            position: self.position,
-            hidden_state: self.hidden_state.iter().map(|t| t.clone().into_tvalue()).collect(),
-            model_state: self.model_state.unfreeze(),
-        })
-    }
 }
 
 impl State {
@@ -190,7 +143,7 @@ impl State {
 impl OpState for State {
     fn eval(
         &mut self,
-        session: &mut TurnState,
+        ctx: &EvalContext,
         _op: &dyn Op,
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>> {
@@ -211,27 +164,47 @@ impl OpState for State {
             }
         }
 
+        // One full-coverage iteration yields each scan output as-is, so the body
+        // tensor is handed through instead of copied into a preallocation. Warm-up
+        // calls (position <= skip) leave outputs unassigned and need the general path.
+        let runs_now = *position + 1 > op.skip;
+        let mut single_shot: TVec<bool> = tvec!();
         let mut outputs = tvec!();
         for (ix, output) in op.output_mapping.iter().enumerate() {
+            let mut one_shot = false;
             if let Some((slot, info)) = output.scan {
                 let fact = op.plan.model().output_fact(ix)?;
-                let mut shape: TVec<usize> =
-                    fact.shape.eval_to_usize(&session.resolved_symbols)?.into_owned();
+                let mut shape: TVec<usize> = fact.shape.eval_to_usize(ctx.symbols)?.into_owned();
                 let scanning_dim = output
                     .full_dim_hint
                     .as_ref()
-                    .and_then(|d| d.to_usize().ok())
+                    .and_then(|d| d.as_usize())
                     .unwrap_or(shape[info.axis] * iters);
+                one_shot = iters == 1 && runs_now && scanning_dim == shape[info.axis];
                 shape[info.axis] = scanning_dim;
-                let t = unsafe { Tensor::uninitialized_dt(fact.datum_type, &shape)? };
+                let t = if one_shot {
+                    Tensor::default()
+                } else {
+                    unsafe { Tensor::uninitialized_dt(fact.datum_type, &shape)? }
+                };
                 outputs.push((slot, t));
             }
+            single_shot.push(one_shot);
             if let Some(slot) = output.last_value_slot {
                 outputs.push((slot, Tensor::default()));
             }
         }
         outputs.sort_by_key(|a| a.0);
         let mut outputs: TVec<Tensor> = outputs.into_iter().map(|(_slot, v)| v).collect();
+
+        // The body runs the SAME plan with the SAME shapes every iteration, so
+        // resolve its symbols once and keep them across iters (light per-iter
+        // reset), and reuse one drained input buffer. This avoids the per-timestep
+        // symbol re-resolution + reallocation a plain `model_state.run()` would do.
+        // Cleared up front since the body state persists across outer Scan calls.
+        model_state.clear_resolved_symbols();
+        let mut iter_inputs: TVec<TValue> = tvec!();
+        let mut symbols_resolved = false;
 
         for i in 0..iters {
             *position += 1;
@@ -240,33 +213,48 @@ impl OpState for State {
             }
             hidden_state.reverse();
 
-            let iter_inputs: TVec<TValue> = op
-                .input_mapping
-                .iter()
-                .enumerate()
-                .map(|(slot, m)| {
-                    Ok(match m {
-                        InputMapping::State => Some(hidden_state.pop().unwrap()),
-                        InputMapping::Scan(info) => Some(
-                            Self::slice_input(&inputs[slot], info.axis, i, info.chunk)?
-                                .into_tvalue(),
-                        ),
-                        InputMapping::Full => Some(inputs[slot].clone()),
-                    })
-                })
-                .collect::<TractResult<Vec<_>>>()?
-                .into_iter()
-                .flatten()
-                .collect();
-
+            iter_inputs.clear();
+            for (slot, m) in op.input_mapping.iter().enumerate() {
+                iter_inputs.push(match m {
+                    InputMapping::State => hidden_state.pop().unwrap(),
+                    InputMapping::Scan(info) => {
+                        let input = &inputs[slot];
+                        // A chunk covering the whole axis slices to the input
+                        // itself, forward or backward.
+                        if i == 0 && input.shape()[info.axis] == info.chunk.unsigned_abs() {
+                            input.clone()
+                        } else {
+                            Self::slice_input(input, info.axis, i, info.chunk)?.into_tvalue()
+                        }
+                    }
+                    InputMapping::Full => inputs[slot].clone(),
+                });
+            }
             trace!("iter_inputs #{i}: {iter_inputs:?}");
-            let iter_outputs =
-                model_state.run(iter_inputs).with_context(|| "Evaluating inner body")?;
+
+            // Lighter equivalent of `model_state.run(iter_inputs)`: resolve body
+            // symbols only on the first iteration, and reset between iters without
+            // discarding them.
+            model_state.set_inputs_drain(&mut iter_inputs).context("Setting body inputs")?;
+            if !symbols_resolved {
+                model_state.resolve_symbols_with_states()?;
+                symbols_resolved = true;
+            }
+            model_state.exec().with_context(|| "Evaluating inner body")?;
+            let iter_outputs = model_state.outputs()?;
+            model_state.reset_turn_keep_symbols();
             trace!("iter_outputs #{i}: {iter_outputs:?}");
 
-            for (v, mapping) in iter_outputs.into_iter().zip(&op.output_mapping) {
+            for (ix, (v, mapping)) in iter_outputs.into_iter().zip(&op.output_mapping).enumerate() {
                 if let Some((slot, info)) = mapping.scan {
-                    Self::assign_output(&mut outputs[slot], info.axis, &v, i, info.chunk < 0);
+                    if single_shot[ix] && !mapping.state && mapping.last_value_slot.is_none() {
+                        outputs[slot] = v.into_tensor();
+                        continue;
+                    } else if single_shot[ix] {
+                        outputs[slot] = v.clone().into_tensor();
+                    } else {
+                        Self::assign_output(&mut outputs[slot], info.axis, &v, i, info.chunk < 0);
+                    }
                 }
                 if i == iters - 1
                     && let Some(slot) = mapping.last_value_slot
@@ -280,6 +268,10 @@ impl OpState for State {
         }
 
         Ok(outputs.into_iter().map(|t| t.into_tvalue()).collect())
+    }
+
+    fn reset_lanes(&mut self, _lanes: &[LaneId]) -> TractResult<()> {
+        bail!("Scan is not lane-aware: its body is a nested state")
     }
 }
 

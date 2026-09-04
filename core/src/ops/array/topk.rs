@@ -21,11 +21,9 @@ impl Op for Topk {
 }
 
 impl EvalOp for Topk {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (input, k) = args_2!(inputs);
         let mut output_shape: TVec<usize> = input.shape().into();
         let k = k.cast_to_scalar::<i64>()? as usize;
@@ -101,6 +99,23 @@ impl TypedOp for Topk {
         fact_indices.shape.set(self.axis, k);
         fact_indices.datum_type = i64::datum_type();
         Ok(tvec!(fact_values, fact_indices))
+    }
+
+    fn set_symbols(
+        &self,
+        _source: &TypedModel,
+        node: &TypedNode,
+        target: &mut TypedModel,
+        mapping: &HashMap<OutletId, OutletId>,
+        subs: &HashMap<Symbol, TDim>,
+    ) -> TractResult<TVec<OutletId>> {
+        let op = Topk {
+            axis: self.axis,
+            largest: self.largest,
+            fallback_k: self.fallback_k.substitute_all(subs)?,
+        };
+        let inputs = node.inputs.iter().map(|i| mapping[i]).collect::<TVec<_>>();
+        target.wire_node(&node.name, op, &inputs)
     }
 
     as_op!();

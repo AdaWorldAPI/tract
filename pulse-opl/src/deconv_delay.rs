@@ -2,7 +2,6 @@ use std::ops::AddAssign;
 
 use tract_ndarray::Axis;
 use tract_nnef::internal::*;
-use tract_nnef::tract_core::ops::OpStateFreeze;
 use tract_num_traits::Zero;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -25,19 +24,13 @@ impl Op for DeconvDelay {
 }
 
 impl EvalOp for DeconvDelay {
-    fn is_stateless(&self) -> bool {
-        false
-    }
+    not_out_of_plan!();
 
-    fn eval(&self, _inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, _inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         unreachable!()
     }
 
-    fn state(
-        &self,
-        _session: &TurnState,
-        _node_id: usize,
-    ) -> TractResult<Option<Box<dyn OpState>>> {
+    fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(Some(Box::new(DeconvDelayState { valid_inputed: -(self.delay as isize), buffer: None })))
     }
 }
@@ -62,7 +55,7 @@ pub struct DeconvDelayState {
 impl OpState for DeconvDelayState {
     fn eval(
         &mut self,
-        session: &mut TurnState,
+        ctx: &EvalContext,
         op: &dyn Op,
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>> {
@@ -73,16 +66,20 @@ impl OpState for DeconvDelayState {
             self.buffer = Some(Tensor::zero_dt(inputs[0].datum_type(), &buffer_size)?);
         }
         let mut input = inputs[0].clone().into_tensor();
-        dispatch_numbers!(Self::eval_t(input.datum_type())(self, session, op, &mut input))?;
+        dispatch_numbers!(Self::eval_t(input.datum_type())(self, ctx, op, &mut input))?;
         let output = input.slice(op.axis, 0, input.shape()[op.axis] - op.overlap)?;
         Ok(tvec!(output.into_tvalue()))
+    }
+
+    fn reset_lanes(&mut self, _lanes: &[LaneId]) -> TractResult<()> {
+        bail!("DeconvDelay is not lane-aware: buffer has no lane axis")
     }
 }
 
 impl DeconvDelayState {
     fn eval_t<T: Datum + AddAssign + Zero>(
         &mut self,
-        session: &TurnState,
+        ctx: &EvalContext,
         op: &DeconvDelay,
         input: &mut Tensor,
     ) -> TractResult<()> {
@@ -94,7 +91,7 @@ impl DeconvDelayState {
         let input_pulse = input.shape()[op.axis];
         let output_pulse = input_pulse - op.overlap;
         self.valid_inputed += output_pulse as isize;
-        if let Ok(input_dim) = op.deconv_input_dim.eval(&session.resolved_symbols).to_isize() {
+        if let Ok(input_dim) = op.deconv_input_dim.eval(ctx.symbols).to_isize() {
             if self.valid_inputed > input_dim {
                 let to_be_zeroed = ((self.valid_inputed - input_dim) as usize).min(input_pulse);
                 let mut zeroed =
@@ -109,36 +106,5 @@ impl DeconvDelayState {
         buffer.assign(&input.slice_axis(Axis(op.axis), (output_pulse..).into()));
 
         Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-struct FrozenDeconvDelayState {
-    valid_inputed: isize,
-    buffer: Option<Arc<Tensor>>,
-}
-
-impl OpStateFreeze for DeconvDelayState {
-    fn freeze(&self) -> Box<dyn FrozenOpState> {
-        Box::new(FrozenDeconvDelayState {
-            valid_inputed: self.valid_inputed,
-            buffer: self.buffer.as_ref().map(|t| t.clone().into_arc_tensor()),
-        })
-    }
-
-    fn freeze_into(self: Box<Self>) -> Box<dyn FrozenOpState> {
-        Box::new(FrozenDeconvDelayState {
-            valid_inputed: self.valid_inputed,
-            buffer: self.buffer.map(|t| t.into_arc_tensor()),
-        })
-    }
-}
-
-impl FrozenOpState for FrozenDeconvDelayState {
-    fn unfreeze(&self) -> Box<dyn OpState> {
-        Box::new(DeconvDelayState {
-            valid_inputed: self.valid_inputed,
-            buffer: self.buffer.as_ref().map(|t| t.clone().into_tensor()),
-        })
     }
 }

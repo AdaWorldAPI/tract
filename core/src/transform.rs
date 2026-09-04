@@ -7,7 +7,7 @@ use std::fmt::Debug;
 use tract_data::TractResult;
 
 use crate::floats::FloatPrecisionTranslator;
-use crate::ops::nn::{Softmax, SoftmaxExp, SoftmaxKind, TypedModel};
+use crate::ops::nn::TypedModel;
 
 #[macro_export]
 macro_rules! rule_if {
@@ -105,26 +105,6 @@ pub trait ModelTransform: Debug {
     fn transform_into(&self, mut model: TypedModel) -> TractResult<TypedModel> {
         self.transform(&mut model)?;
         Ok(model)
-    }
-}
-
-#[derive(Debug)]
-struct SoftmaxFastCompact;
-
-impl ModelTransform for SoftmaxFastCompact {
-    fn name(&self) -> StaticName {
-        "softmax_fast_compact".into()
-    }
-
-    fn transform(&self, model: &mut TypedModel) -> TractResult<()> {
-        for node in &mut model.nodes {
-            if let Some(softmax) = node.op_as_mut::<Softmax>()
-                && let SoftmaxKind::Softmax(kind) = &mut softmax.kind
-            {
-                *kind = SoftmaxExp::FastCompact
-            }
-        }
-        Ok(())
     }
 }
 
@@ -256,16 +236,16 @@ pub enum SymbolValueSpec {
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
-pub struct ConcretizeSymbolsConfig {
+pub struct SetSymbolsConfig {
     pub values: std::collections::HashMap<String, SymbolValueSpec>,
 }
 
 #[derive(Debug)]
-struct ConcretizeSymbolsTransform(ConcretizeSymbolsConfig);
+struct SetSymbolsTransform(SetSymbolsConfig);
 
-impl ModelTransform for ConcretizeSymbolsTransform {
+impl ModelTransform for SetSymbolsTransform {
     fn name(&self) -> StaticName {
-        "concretize_symbols".into()
+        "set_symbols".into()
     }
 
     fn transform(&self, model: &mut TypedModel) -> TractResult<()> {
@@ -281,26 +261,26 @@ impl ModelTransform for ConcretizeSymbolsTransform {
             };
             subs.insert(sym, dim);
         }
-        *model = model.substitute_symbols(&subs)?;
+        *model = model.set_symbols(&subs)?;
         Ok(())
     }
 }
 
-register_model_transform!("concretize_symbols", ConcretizeSymbolsConfig, |config| Ok(Box::new(
-    ConcretizeSymbolsTransform(config)
+register_model_transform!("set_symbols", SetSymbolsConfig, |config| Ok(Box::new(
+    SetSymbolsTransform(config)
 )));
 
 /// Ad-hoc fix-up for NNEF artifacts exported before Scan grew the
-/// `external_state` flag (issue #2157). For every Scan in the model:
-/// 1. Substitute the scan-axis symbol on the Scan input with 1 across the
-///    whole model (caller is bound by the per-call seq=1 contract that
-///    external state management implies).
-/// 2. Set `external_state = true`.
+/// `external_state` flag (issue #2157). Sets `external_state = true` on every
+/// Scan, asserting that the caller plumbs initial state in and reads final
+/// state out each call. Apply only when the loaded model is known to use
+/// external state management, e.g. the parakeet decoder. Cheaper than
+/// re-exporting cached NNEF.
 ///
-/// After this transform, the standard declutter pipeline sees `iters == 1`
-/// on each Scan and `declutter_single_loop` inlines the body. Apply only
-/// when the loaded model is known to use external state management, e.g.
-/// the parakeet decoder. Cheaper than re-exporting cached NNEF.
+/// This does *not* touch the sequence dimension. Inlining the Scan body via
+/// `declutter_single_loop` additionally requires `iters == 1`, which is the
+/// caller's per-call contract — concretize it explicitly (e.g. `--set
+/// TARGETS__TIME=1`), separately from this flag.
 #[derive(Debug)]
 struct ForceScanExternalState;
 
@@ -310,22 +290,7 @@ impl ModelTransform for ForceScanExternalState {
     }
 
     fn transform(&self, model: &mut TypedModel) -> TractResult<()> {
-        use crate::ops::scan::{InputMapping, Scan};
-        let mut subs: HashMap<Symbol, TDim> = HashMap::new();
-        for node in &model.nodes {
-            let Some(scan) = node.op_as::<Scan>() else { continue };
-            for (slot, mapping) in scan.input_mapping.iter().enumerate() {
-                let InputMapping::Scan(info) = mapping else { continue };
-                let outer = node.inputs[slot];
-                let dim = &model.outlet_fact(outer)?.shape[info.axis];
-                if let TDim::Sym(s) = dim {
-                    subs.insert(s.clone(), TDim::Val(1));
-                }
-            }
-        }
-        if !subs.is_empty() {
-            *model = model.substitute_symbols(&subs)?;
-        }
+        use crate::ops::scan::Scan;
         for node in &mut model.nodes {
             if let Some(scan) = node.op_as_mut::<Scan>() {
                 scan.external_state = true;
@@ -337,7 +302,89 @@ impl ModelTransform for ForceScanExternalState {
 
 register_simple_model_transform!("force_scan_external_state", ForceScanExternalState);
 
-register_simple_model_transform!("softmax_fast_compact", SoftmaxFastCompact);
+/// Hands a single-iteration Scan's recurrent state to the caller, so
+/// `declutter_single_loop` can inline the body.
+///
+/// A Scan whose state is seeded by a constant carries that state inside tract
+/// across calls, which `declutter_single_loop` refuses to inline because
+/// inlining would rewire the body's state input back to the seed. This rewires
+/// the state input to a fresh model input and publishes the scan output — which
+/// is the final state when the loop runs once — as a model output, then asserts
+/// `external_state`. The caller must thread the added state pair: pass the
+/// previous value in, feed the returned value back on the next call.
+///
+/// Only Scans that run exactly one iteration, with no warm-up (`skip == 0`),
+/// and are seeded by a constant are touched. A state already fed by a `Source`
+/// belongs to the caller; past one iteration the scan output is the whole
+/// sequence rather than a final value; and a Scan still inside its warm-up
+/// window suppresses body execution in a way an inlined body cannot reproduce.
+/// Model inputs and outputs are appended in Scan node order.
+///
+/// Output is bit-identical to the untransformed model, but the state round-trip
+/// through model I/O is not free: it pays off only where the Scan scaffolding it
+/// removes costs more than the state copy it adds. The profile that benefits is
+/// a pulse-1 streaming graph whose recurrent state is small relative to the
+/// per-frame work — DeepFilterNet3's constant-seeded GRUs are the canonical
+/// case. Models with large recurrent state, or whose remaining Scans are
+/// already cheap, can regress. Measure before adopting.
+#[derive(Debug)]
+struct ExportScanState;
+
+impl ModelTransform for ExportScanState {
+    fn name(&self) -> StaticName {
+        "export_scan_state".into()
+    }
+
+    fn transform(&self, model: &mut TypedModel) -> TractResult<()> {
+        use crate::ops::konst::Const;
+        use crate::ops::scan::{InputMapping, Scan};
+
+        let scans: Vec<usize> =
+            model.nodes().iter().filter(|n| n.op_is::<Scan>()).map(|n| n.id).collect();
+
+        for id in scans {
+            let eligible = {
+                let inputs = model.node_input_facts(id)?;
+                let scan = model.node(id).op_as::<Scan>().unwrap();
+                scan.skip == 0 && scan.iteration_count(&inputs).map(|i| i.is_one()).unwrap_or(false)
+            };
+            if !eligible {
+                continue;
+            }
+
+            let scan = model.node(id).op_as::<Scan>().unwrap();
+            let Some(state_output) =
+                scan.output_mapping.iter().find(|om| om.state).and_then(|om| om.scan.map(|s| s.0))
+            else {
+                continue;
+            };
+            let seeded: Vec<usize> = scan
+                .input_mapping
+                .iter()
+                .enumerate()
+                .filter(|(_, im)| matches!(im, InputMapping::State))
+                .map(|(slot, _)| slot)
+                .filter(|&slot| model.node(model.node(id).inputs[slot].node).op_is::<Const>())
+                .collect();
+            if seeded.is_empty() {
+                continue;
+            }
+
+            for slot in seeded {
+                let fact = model.outlet_fact(model.node(id).inputs[slot])?.clone().without_value();
+                let name = format!("{}.state_in", model.node(id).name);
+                let source = model.add_source(name, fact)?;
+                model.add_edge(source, InletId::new(id, slot))?;
+            }
+            model.outputs.push(OutletId::new(id, state_output));
+            model.node_mut(id).op_as_mut::<Scan>().unwrap().external_state = true;
+        }
+        Ok(())
+    }
+}
+
+register_simple_model_transform!("export_scan_state", ExportScanState);
+
 register_simple_model_transform!("block_quant", BlockQuantTransform);
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -360,6 +407,28 @@ impl ModelTransform for SelectOutputsTransform {
 
 register_model_transform!("select_outputs", SelectOutputsConfig, |config| Ok(Box::new(
     SelectOutputsTransform(config)
+)));
+
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct SelectInputsConfig {
+    pub inputs: Vec<String>,
+}
+
+#[derive(Debug)]
+struct SelectInputsTransform(SelectInputsConfig);
+
+impl ModelTransform for SelectInputsTransform {
+    fn name(&self) -> StaticName {
+        "select_inputs".into()
+    }
+
+    fn transform(&self, model: &mut TypedModel) -> TractResult<()> {
+        model.select_inputs_by_name(self.0.inputs.iter())
+    }
+}
+
+register_model_transform!("select_inputs", SelectInputsConfig, |config| Ok(Box::new(
+    SelectInputsTransform(config)
 )));
 
 inventory::submit! {

@@ -22,13 +22,11 @@ impl Op for MaxPool {
 }
 
 impl EvalOp for MaxPool {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let shape: TVec<TDim> = inputs[0].shape().iter().map(|d| d.to_dim()).collect();
-        self.to_optimized(&shape)?.eval(inputs)
+        self.to_optimized(&shape)?.eval(_ctx, inputs)
     }
 }
 
@@ -70,6 +68,23 @@ impl TypedOp for MaxPool {
         Ok(None)
     }
 
+    /// Lower to `OptMaxPool` with the geometry pre-resolved to `Concrete` when the
+    /// input shape is fixed, so the `Patch` is built once here rather than per eval.
+    /// Symbolic shapes are left as `MaxPool`.
+    fn codegen(
+        &self,
+        model: &TypedModel,
+        node: &TypedNode,
+    ) -> TractResult<Option<TypedModelPatch>> {
+        let fact = model.outlet_fact(node.inputs[0])?;
+        if fact.shape.as_concrete().is_none() {
+            return Ok(None);
+        }
+        let mut op = self.to_optimized(&fact.shape.to_tvec())?;
+        op.geometry = op.geometry.optimize_if(fact.shape.as_concrete())?;
+        Ok(Some(TypedModelPatch::replace_single_op(model, node, &node.inputs, op)?))
+    }
+
     as_op!();
 }
 
@@ -103,11 +118,9 @@ impl Op for OptMaxPool {
 }
 
 impl EvalOp for OptMaxPool {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs);
         let geo = self.geometry.to_concrete(input.shape())?;
         dispatch_numbers!(Self::eval_t(input.datum_type())(self, &*input, geo.as_ref()))
@@ -184,5 +197,55 @@ impl OptMaxPool {
         } else {
             Ok(tvec!(values.into_tvalue()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::cnn::PaddingSpec;
+    use crate::ops::nn::DataFormat;
+
+    fn test_case() -> (TypedModel, TVec<TValue>) {
+        let mut model = TypedModel::default();
+        let source = model.add_source("data", f32::fact([1, 3, 8, 8])).unwrap();
+        let pool_spec = PoolSpec::new(
+            DataFormat::NCHW,
+            tvec![2, 2],
+            PaddingSpec::Valid,
+            None,
+            Some(tvec![2, 2]),
+            3,
+            3,
+        );
+        let op = MaxPool { pool_spec, with_index_outputs: None };
+        let out = model.wire_node("pool", op, &[source]).unwrap();
+        model.select_output_outlets(&out).unwrap();
+        let input = ndarray::Array4::from_shape_fn((1, 3, 8, 8), |(_, c, y, x)| {
+            (c * 64 + y * 8 + x) as f32
+        })
+        .into_tensor()
+        .into_tvalue();
+        (model, tvec!(input))
+    }
+
+    #[test]
+    fn optimized_maxpool_has_concrete_geometry() {
+        let (model, input) = test_case();
+        let plain = model.clone().into_runnable().unwrap().run(input.clone()).unwrap();
+
+        let optimized = model.into_optimized().unwrap();
+        let pool = optimized
+            .nodes
+            .iter()
+            .find_map(|n| n.op_as::<OptMaxPool>())
+            .expect("optimized model should contain an OptMaxPool");
+        assert!(
+            pool.geometry.is_concrete(),
+            "OptMaxPool geometry should be concrete after optimization"
+        );
+
+        let opt = optimized.into_runnable().unwrap().run(input).unwrap();
+        assert_eq!(*opt[0], *plain[0]);
     }
 }

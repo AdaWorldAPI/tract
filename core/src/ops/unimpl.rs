@@ -26,7 +26,5 @@ impl Op for UnimplementedOp {
 }
 
 impl EvalOp for UnimplementedOp {
-    fn is_stateless(&self) -> bool {
-        false
-    }
+    not_out_of_plan!();
 }

@@ -76,7 +76,7 @@ impl ApplyRope {
             (cos.reshaped(padded_shape.clone().into())?, sin.reshaped(padded_shape.into())?);
 
         ensure!(
-            input.shape()[input.rank() - 1] % 2 == 0,
+            input.shape()[input.rank() - 1].is_multiple_of(2),
             "Rotate half required most inner dimension to be a multiple of 2: {:?}",
             input.shape()
         );
@@ -156,11 +156,10 @@ mod tests {
             let metal_sin = sin.clone().into_device()?;
             let metal_cos = cos.clone().into_device()?;
 
-            let cpu_output = apply_rope::ApplyRope.eval(tvec![
-                a.clone().into(),
-                cos.clone().into(),
-                sin.clone().into(),
-            ])?[0]
+            let cpu_output = apply_rope::ApplyRope.eval(
+                &EvalContext::out_of_plan(),
+                tvec![a.clone().into(), cos.clone().into(), sin.clone().into(),],
+            )?[0]
                 .clone()
                 .into_tensor();
             let metal_output = ApplyRope.eval(stream, &metal_a, &metal_cos, &metal_sin)?;

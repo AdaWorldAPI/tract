@@ -9,17 +9,40 @@ use tract::prelude::*;
 tract::impl_ndarray_interop!();
 
 fn argmax(slice: &[f32]) -> Option<usize> {
-    slice.into_iter().position_max_by_key(|x| FloatOrd(**x))
+    slice.iter().position_max_by_key(|x| FloatOrd(**x))
+}
+
+/// One prednet (decoder) step, tolerant of the split-RNNT export shape. t2n>=0.24
+/// emits a `target_length` input and a `prednet_lengths` output, but when the
+/// latter is a pass-through tract prunes both, leaving the older 3-in/3-out
+/// shape. Detect via input count; the two states are always the last outputs.
+fn run_decoder(
+    decoder: &Runnable,
+    wants_length: bool,
+    tokens: Tensor,
+    n_tokens: i32,
+    state_0: Tensor,
+    state_1: Tensor,
+) -> anyhow::Result<(Tensor, Tensor, Tensor)> {
+    let mut inputs = vec![tokens];
+    if wants_length {
+        inputs.push(Tensor::from_slice(&[1], &[n_tokens])?);
+    }
+    inputs.push(state_0);
+    inputs.push(state_1);
+    let out = decoder.run(inputs)?;
+    Ok((out[0].clone(), out[out.len() - 2].clone(), out[out.len() - 1].clone()))
 }
 
 fn concretize_batch(mut model: Model) -> anyhow::Result<Model> {
-    model.transform(ConcretizeSymbols::new().value("BATCH", 1))?;
+    model.transform(SetSymbols::new().value("BATCH", 1))?;
     Ok(model)
 }
 
 fn remove_length_input(mut model: Model) -> anyhow::Result<Model> {
     model
         .transform(r#"{"name":"patch","body":"length = tract_core_shape_of(input_signal)[1];"}"#)?;
+    model.transform(r#"{"name":"select_inputs","inputs":["input_signal"]}"#)?;
     Ok(model)
 }
 
@@ -31,10 +54,8 @@ fn main() -> anyhow::Result<()> {
     let vocab: Vec<&str> = vocab.iter().map(|v| v.as_str().unwrap()).collect();
 
     let nnef = tract::nnef()?.with_tract_transformers()?;
-    let gpu = ["cuda", "metal", "default"]
-        .iter()
-        .find_map(|rt| tract::runtime_for_name(rt).ok())
-        .unwrap();
+    let gpu = tract::runtime_for_name("gpu-or-cpu")?;
+    eprintln!("runtime: {}", gpu.name()?);
 
     let patched_preprocessor =
         remove_length_input(concretize_batch(nnef.load("assets/model/preprocessor.nnef.tgz")?)?)?;
@@ -44,11 +65,15 @@ fn main() -> anyhow::Result<()> {
     )?;
     let preprocessor = patched_preprocessor.into_runnable()?;
 
-    let mut encoder = nnef.load("assets/model/encoder.nnef.tgz")?;
+    let mut encoder = concretize_batch(nnef.load("assets/model/encoder.nnef.tgz")?)?;
     encoder.transform("transformers_detect_all")?;
-    let encoder = gpu.prepare(concretize_batch(encoder)?)?;
+    encoder
+        .transform(r#"{"name":"patch","body":"length = tract_core_shape_of(audio_signal)[2];"}"#)?;
+    encoder.transform(r#"{"name":"select_inputs","inputs":["audio_signal"]}"#)?;
+    let encoder = gpu.prepare(encoder)?;
 
     let decoder = gpu.prepare(concretize_batch(nnef.load("assets/model/decoder.nnef.tgz")?)?)?;
+    let dec_wants_length = decoder.input_count()? == 4;
     let joint = gpu.prepare(concretize_batch(nnef.load("assets/model/joint.nnef.tgz")?)?)?;
 
     // soundfile (Python) normalizes i16 PCM to [-1, 1]; match that here
@@ -58,8 +83,8 @@ fn main() -> anyhow::Result<()> {
         .collect();
     let samples = Tensor::from_slice(&[1, wav.len()], &wav)?;
 
-    let [features, feat_len] = preprocessor.run([samples])?.try_into().unwrap();
-    let [encoded, _lens] = encoder.run([features, feat_len])?.try_into().unwrap();
+    let [features, _feat_len] = preprocessor.run([samples])?.try_into().unwrap();
+    let [encoded, _lens] = encoder.run([features])?.try_into().unwrap();
 
     let encoded: ArrayD<f32> = encoded.ndarray()?.into_owned();
 
@@ -75,8 +100,8 @@ fn main() -> anyhow::Result<()> {
     let warmup_tokens = Tensor::from_slice(&[1, 2], &[blank_id as i32, blank_id as i32])?;
     let state_0 = Array3::<f32>::zeros([2, 1, 640]).tract()?;
     let state_1 = Array3::<f32>::zeros([2, 1, 640]).tract()?;
-    let [warmup_out, mut state_0, mut state_1] =
-        decoder.run([warmup_tokens, state_0, state_1])?.try_into().unwrap();
+    let (warmup_out, mut state_0, mut state_1) =
+        run_decoder(&decoder, dec_wants_length, warmup_tokens, 2, state_0, state_1)?;
     // warmup_out shape: [1, 640, 2] — take last timestep → [1, 640, 1]
     let warmup_out: ArrayD<f32> = warmup_out.ndarray()?.into_owned();
     let mut token = warmup_out.slice_axis(Axis(2), (1..2).into()).to_owned().tract()?;
@@ -90,8 +115,9 @@ fn main() -> anyhow::Result<()> {
             frame_ix += 1;
         } else {
             hyp.push(token_id);
-            token = Tensor::from_slice(&[1, 1], &[token_id as i32])?;
-            [token, state_0, state_1] = decoder.run([token, state_0, state_1])?.try_into().unwrap();
+            let next = Tensor::from_slice(&[1, 1], &[token_id as i32])?;
+            (token, state_0, state_1) =
+                run_decoder(&decoder, dec_wants_length, next, 1, state_0, state_1)?;
         }
     }
 

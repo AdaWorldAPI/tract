@@ -93,11 +93,9 @@ impl TypedOp for StreamedSdpaOp {
 }
 
 impl EvalOp for StreamedSdpaOp {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         ensure!(inputs.len() == 3 || inputs.len() == 4);
         let [q, k, v] = &inputs[0..3] else {
             bail!("Expects 3 or 4 inptus (Q, K, V, optional mask)")

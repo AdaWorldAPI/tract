@@ -137,7 +137,6 @@ mod tests {
     use super::*;
     use crate::utils::with_borrowed_metal_stream;
     use tract_core::internal::Tensor;
-    use tract_core::plan::TurnState;
     use tract_gpu::tensor::IntoDevice;
     use tract_transformers::ops::diag_gather as cpu_dg;
 
@@ -148,10 +147,8 @@ mod tests {
             let cpu_in = Tensor::from_shape(shape, &data)?;
             let metal_in = cpu_in.clone().into_device()?;
 
-            let cpu_op =
-                cpu_dg::DiagGather { offset: (offset as i64).to_dim(), out_len: out_len.to_dim() };
-            let session = TurnState::default();
-            let cpu_out = cpu_op.eval_with_session(0, &session, tvec![cpu_in.into_tvalue()])?[0]
+            let cpu_op = cpu_dg::DiagGather { offset: offset.to_dim(), out_len: out_len.to_dim() };
+            let cpu_out = cpu_op.eval(&EvalContext::out_of_plan(), tvec![cpu_in.into_tvalue()])?[0]
                 .clone()
                 .into_tensor();
             let metal_out = DiagGather.eval(stream, &metal_in, offset, out_len)?;

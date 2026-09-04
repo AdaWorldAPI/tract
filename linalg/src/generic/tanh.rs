@@ -1,10 +1,18 @@
 #![allow(clippy::excessive_precision)]
-use crate::frame::element_wise::ElementWiseKer;
 use tract_data::internal::*;
 
+/// f32 tanh, as a rational minimax fit of `tanh` over `[LOW, HIGH]`.
+///
+/// The clamp keeps the `[-1, 1]` range consumers rely on without an output clamp: the two
+/// Horner chains and the division leave a few ulps of relative error, and the largest
+/// quotient any f32 input produces stays seven f32 steps under 1. It costs the tails their
+/// last few ulps — a saturated input returns `±(1 - 6.1e-7)`, not `±1`. NaN propagates.
+///
+/// Raising the clamp voids this: `1 - tanh(8.18)` is already under the rounding error, so
+/// the quotient crosses 1 at scattered inputs from there up.
 pub fn stanh(x: f32) -> f32 {
-    const LOW: f32 = -8.9;
-    const HIGH: f32 = 8.9;
+    const LOW: f32 = -7.5;
+    const HIGH: f32 = 7.5;
 
     const ALPHA_13: f32 = -8.488492677e-14;
     const ALPHA_11: f32 = 5.277853000e-11;
@@ -40,6 +48,10 @@ pub fn stanh(x: f32) -> f32 {
     p / q
 }
 
+/// f16 tanh, as a rational minimax fit of `tanh` over `[LOW, HIGH]`.
+///
+/// Needs no output clamp, like [`stanh`]: `1 - tanh(3.84)` is `9.3e-4`, about two
+/// f16 steps below 1, so the quotient keeps its margin for every f16 input.
 pub fn htanh(x: f16) -> f16 {
     const LOW: f16 = f16::from_f32_const(-3.84);
     const HIGH: f16 = f16::from_f32_const(3.84);
@@ -66,68 +78,28 @@ pub fn htanh(x: f16) -> f16 {
     p / q
 }
 
-#[derive(Clone, Debug)]
-pub struct STanh4;
-
-impl ElementWiseKer<f32> for STanh4 {
-    fn name() -> &'static str {
-        "generic"
-    }
-
-    fn alignment_items() -> usize {
-        16
-    }
-
-    fn alignment_bytes() -> usize {
-        16
-    }
-
-    fn nr() -> usize {
-        4
-    }
-
+routine_ew_rust!(generic;
+    f32,
+    generic_tanh_f32_4n,
+    4,
+    4,
     fn run(x: &mut [f32], _: ()) {
         debug_assert!(x.len() % Self::nr() == 0);
         debug_assert!(x.as_ptr() as usize % Self::alignment_bytes() == 0);
         x.iter_mut().for_each(|px| *px = stanh(*px))
-    }
-}
+    },
+    func(Tanh)
+);
 
-#[cfg(test)]
-#[macro_use]
-pub mod s {
-    tanh_frame_tests!(true, f32, crate::generic::tanh::STanh4);
-}
-
-#[derive(Clone, Debug)]
-pub struct HTanh8;
-
-impl ElementWiseKer<f16> for HTanh8 {
-    fn name() -> &'static str {
-        "generic"
-    }
-
-    fn alignment_items() -> usize {
-        16
-    }
-
-    fn alignment_bytes() -> usize {
-        16
-    }
-
-    fn nr() -> usize {
-        8
-    }
-
+routine_ew_rust!(generic;
+    f16,
+    generic_tanh_f16_8n,
+    8,
+    8,
     fn run(x: &mut [f16], _: ()) {
         debug_assert!(x.len() % Self::nr() == 0);
         debug_assert!(x.as_ptr() as usize % Self::alignment_bytes() == 0);
         x.iter_mut().for_each(|px| *px = htanh(*px))
-    }
-}
-
-#[cfg(test)]
-#[macro_use]
-pub mod h {
-    tanh_frame_tests!(true, tract_data::internal::f16, crate::generic::tanh::HTanh8);
-}
+    },
+    func(Tanh)
+);

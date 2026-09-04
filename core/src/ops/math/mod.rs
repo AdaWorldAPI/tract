@@ -8,9 +8,8 @@ use crate::internal::*;
 use crate::ops::quant::scale_by;
 use num_traits::bounds::Bounded;
 use num_traits::int::PrimInt;
-use num_traits::{Float, Zero};
+use num_traits::{Float, One, Zero};
 use tract_data::internal::ClampCast;
-use tract_data::itertools::Itertools;
 pub use tract_data::prelude::round_ties_to_even;
 use tract_linalg::{ScaleShiftAndRound, Scaler};
 use tract_num_traits::AsPrimitive;
@@ -19,6 +18,7 @@ use tract_num_traits::AsPrimitive;
 mod complex;
 #[cfg(feature = "complex")]
 pub use complex::{ComplexToInnerDim, InnerDimToComplex};
+use tract_linalg::routines::Func;
 
 bin_to_super_type!(add, Add,
                    linalg: Add,
@@ -219,7 +219,12 @@ out_of_place: |c:&mut Tensor, a:&Tensor, b: &Tensor| -> TractResult<bool> {
         }
 },
 q_op_on_f32: |a: f32, b: f32| a / b,
-[f32, i8, i16, i32, i64, u8, u16, u32, u64, f16, f64] => |c, a, b| *c = a.clone() / b
+// Rust checks division overflow in every profile, not just where overflow-checks is on, so
+// `MIN / -1` panics even in release. Wrap it, as Mul above already does with wrapping_mul, and
+// as onnx.reference and ONNX Runtime both do. A zero divisor still panics; the references
+// disagree on what it should produce, so that is left alone.
+[i8, i16, i32, i64, u8, u16, u32, u64] => |c, a, b| *c = a.wrapping_div(*b),
+[f32, f16, f64] => |c, a, b| *c = a.clone() / b
 );
 
 bin_to_super_type!(rem, Rem,
@@ -255,7 +260,9 @@ bin_to_super_type!(rem, Rem,
                                                   Ok(false)
                                               }
                                       },
-                                      [f32, i8, i16, i32, i64, u8, u16, u32, u64, f16, f64] => |c, a, b| *c = a.clone() % b);
+                                      // As for Div: `MIN % -1` panics in every profile without this.
+                                      [i8, i16, i32, i64, u8, u16, u32, u64] => |c, a, b| *c = a.wrapping_rem(*b),
+                                      [f32, f16, f64] => |c, a, b| *c = a.clone() % b);
 
 bin_to_super_type!(min, Min, linalg:Min,
                    q: [i8, u8, i32] => |c, a, b, _, _| *c = if a < b { *a } else { *b };
@@ -420,10 +427,13 @@ fn declutter_mul_const_mul_const(
     rule_if!(const_fact.shape.volume().is_one() || prec_const_fact.shape.volume().is_one());
     rule_if!(const_fact.datum_type.is_float());
     let result = mul()
-        .eval(tvec!(
-            const_fact.konst.clone().unwrap().into_tvalue(),
-            prec_const_fact.konst.clone().unwrap().into_tvalue()
-        ))?
+        .eval(
+            &EvalContext::out_of_plan(),
+            tvec!(
+                const_fact.konst.clone().unwrap().into_tvalue(),
+                prec_const_fact.konst.clone().unwrap().into_tvalue()
+            ),
+        )?
         .remove(0)
         .into_arc_tensor();
     let mut patch = TypedModelPatch::default();
@@ -488,29 +498,32 @@ fn declutter_pow(
     let b = model.outlet_fact(node.inputs[1])?;
     if let Some(b) = &b.uniform {
         let b = b.cast_to_scalar::<f32>()?;
-        if b == 2.0 {
-            return Ok(Some(TypedModelPatch::replace_single_op(
-                model,
-                node,
-                &[node.inputs[0]],
-                square(),
-            )?));
+        let dt = model.outlet_fact(node.inputs[0])?.datum_type;
+        let unary: Option<Box<dyn TypedOp>> = if b == 2.0 {
+            Some(Box::new(square()))
         } else if b == 0.5 {
+            Some(Box::new(sqrt()))
+        } else if matches!(dt, DatumType::F16 | DatumType::F32) {
+            Some(Box::new(pow_const(b)))
+        } else {
+            None
+        };
+        if let Some(unary) = unary {
             return Ok(Some(TypedModelPatch::replace_single_op(
                 model,
                 node,
                 &[node.inputs[0]],
-                sqrt(),
+                unary,
             )?));
         }
     }
     crate::ops::nn::gelu_approximate::detect_gelu_approx(_op, model, node)
 }
 
-element_wise!(abs, Abs, [i8, i16, i32, i64, f16, f32, i32] => |_, xs| {
+element_wise!(abs, Abs, [i8, i16, i32, i64, f16, f32, f64] => |_, xs| {
     xs.iter_mut().for_each(|x| *x = x.abs());
     Ok(())
-};
+}, [u8, u16, u32, u64] => |_, _| Ok(());
 q: [i8, u8, i32, i32] => f32::abs;
 operating_datum_type: |dt| if dt == TDim::datum_type() { i64::datum_type() } else { dt }
 );
@@ -529,6 +542,22 @@ element_wise!(ln, Ln, [f16, f32, f64] => |_, xs| {
 };
 q: [i8, u8, i32, i32] => f32::ln;
 validation: Validation::Rounding
+);
+
+// x^c for a constant exponent: the unary form of Pow against a uniform operand,
+// going through the same powf so results match the binary op exactly.
+element_wise!(pow_const, PowConst { exponent: f32 },
+    [f16] => |op, xs| {
+        let e = op.exponent;
+        xs.iter_mut().for_each(|x| *x = f16::from_f32(x.to_f32().powf(e)));
+        Ok(())
+    },
+    [f32] => |op, xs| {
+        let e = op.exponent;
+        xs.iter_mut().for_each(|x| *x = x.powf(e));
+        Ok(())
+    };
+    validation: Validation::Rounding
 );
 
 element_wise!(square, Square, [f16, f32, f64] => |_, xs| {
@@ -687,23 +716,47 @@ element_wise!(sinh, Sinh, [f16, f32, f64] => |_, xs| {
 q: [i8, u8, i32] => f32::sinh);
 
 element_wise!(tanh, Tanh,
- [f16] => |_, xs| { (tract_linalg::ops().tanh_f16)().run(xs) },
- [f32] => |_, xs| { (tract_linalg::ops().tanh_f32)().run(xs) },
+ [f16] => |_, xs| { Func::Tanh.ew_f16()?.run(xs) },
+ [f32] => |_, xs| { Func::Tanh.ew_f32()?.run(xs) },
  [f64] => |_, xs| { xs.iter_mut().for_each(|x| *x = x.tanh()); Ok(()) };
  q: [i8, u8, i32] => f32::tanh;
  cost: |dt| {tvec!((Cost::FMA(dt), 11), (Cost::Div(dt), 1))}
 );
 
+/// Every f16 bit pattern mapped through the registered f32 erf kernel and rounded
+/// back, so f16 `Erf` is one load per element. Built from that kernel rather than
+/// from a formula, so the table matches whatever kernel this host dispatches to.
+/// 128 KiB, built on first use.
+fn erf_f16_lut() -> &'static [u16; 1 << 16] {
+    static LUT: std::sync::OnceLock<Box<[u16; 1 << 16]>> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut values: Vec<f32> =
+            (0..=u16::MAX).map(|bits| f16::from_bits(bits).to_f32()).collect();
+        Func::Erf
+            .ew_f32()
+            .expect("no erf kernel to build the f16 lookup table with")
+            .run(&mut values)
+            .expect("erf kernel failed on the lookup table domain");
+        let mut lut = Box::new([0u16; 1 << 16]);
+        lut.iter_mut().zip(values).for_each(|(slot, v)| *slot = f16::from_f32(v).to_bits());
+        lut
+    })
+}
+
 element_wise!(erf, Erf,
- [f32] => |_, xs| { (tract_linalg::ops().erf_f32)().run(xs) },
+ [f32] => |_, xs| { Func::Erf.ew_f32()?.run(xs) },
  [f16] => |_, xs| {
-     let mut f32s = xs.iter().map(|x| x.to_f32()).collect_vec();
-     (tract_linalg::ops().erf_f32)().run(&mut f32s)?;
-     xs.iter_mut().zip(f32s.into_iter()).for_each(|(x, f)| *x = f16::from_f32(f));
+     let lut = erf_f16_lut();
+     xs.iter_mut().for_each(|x| *x = f16::from_bits(lut[x.to_bits() as usize]));
      Ok(())
 };
- cost: |dt| {tvec!((Cost::FMA(dt), 11), (Cost::Div(dt), 1))}
+ cost: |dt| {tvec!((Cost::FMA(dt), 11), (Cost::Div(dt), 1))};
+ declutter: declutter_erf
 );
+
+fn declutter_erf(model: &TypedModel, node: &TypedNode) -> TractResult<Option<TypedModelPatch>> {
+    crate::ops::nn::gelu_exact::detect_gelu_exact(model, node)
+}
 
 element_wise!(acosh, Acosh, [f16, f32, f64] => |_, xs| {
     xs.iter_mut().for_each(|x| *x = x.acosh());
@@ -727,11 +780,14 @@ element_wise!(neg, Neg, [i8, i16, i32, i64, f16, f32, f64, TDim] => |_, xs| {
 };
 q: [i8, u8, i32] => |x: f32| -x);
 
-element_wise!(sign, Sign, [f16, f32, f64] => |_, xs| {
-    xs.iter_mut().for_each(|x| *x = if x.is_zero() { *x } else { x.signum() });
+element_wise!(sign, Sign, [i8, i16, i32, i64, f16, f32, f64] => |_, xs| {
+    xs.iter_mut().for_each(|x| *x = if x.is_zero() { Zero::zero() } else { x.signum() });
+    Ok(())
+}, [u8, u16, u32, u64] => |_, xs| {
+    xs.iter_mut().for_each(|x| *x = if x.is_zero() { *x } else { One::one() });
     Ok(())
 };
-q: [i8, u8, i32] => f32::signum);
+q: [i8, u8, i32] => |x: f32| if x.is_zero() { 0.0 } else { x.signum() });
 
 element_wise_oop!(is_inf, IsInf { detect_positive: bool, detect_negative: bool },
     [f32] => bool |op, xs, ys| {
@@ -762,11 +818,108 @@ mod tests {
     use super::*;
     use ndarray::arr2;
 
+    // Rust checks integer division and remainder overflow in every profile, not only where
+    // overflow-checks is on, so `MIN / -1` panicked even in a release build. These pin the
+    // wrapping result, which is what onnx.reference and ONNX Runtime both produce.
+
+    #[test]
+    fn integer_div_wraps_at_min_over_minus_one() {
+        assert_eq!(
+            div()
+                .0
+                .eval(tensor1(&[i32::MIN]).into(), tensor1(&[-1i32]).into(), i32::datum_type())
+                .unwrap(),
+            tensor1(&[i32::MIN])
+        );
+        assert_eq!(
+            div()
+                .0
+                .eval(tensor1(&[i8::MIN]).into(), tensor1(&[-1i8]).into(), i8::datum_type())
+                .unwrap(),
+            tensor1(&[i8::MIN])
+        );
+        assert_eq!(
+            div()
+                .0
+                .eval(tensor1(&[i64::MIN]).into(), tensor1(&[-1i64]).into(), i64::datum_type())
+                .unwrap(),
+            tensor1(&[i64::MIN])
+        );
+    }
+
+    #[test]
+    fn integer_rem_wraps_at_min_over_minus_one() {
+        assert_eq!(
+            rem()
+                .0
+                .eval(tensor1(&[i32::MIN]).into(), tensor1(&[-1i32]).into(), i32::datum_type())
+                .unwrap(),
+            tensor1(&[0i32])
+        );
+        assert_eq!(
+            rem()
+                .0
+                .eval(tensor1(&[i16::MIN]).into(), tensor1(&[-1i16]).into(), i16::datum_type())
+                .unwrap(),
+            tensor1(&[0i16])
+        );
+    }
+
+    #[test]
+    fn integer_div_and_rem_are_otherwise_unchanged() {
+        // Controls: wrapping only differs from `/` and `%` at MIN over -1.
+        assert_eq!(
+            div()
+                .0
+                .eval(
+                    tensor1(&[-7i32, 7, 9]).into(),
+                    tensor1(&[2i32, -2, 4]).into(),
+                    i32::datum_type()
+                )
+                .unwrap(),
+            tensor1(&[-3i32, -3, 2])
+        );
+        assert_eq!(
+            rem()
+                .0
+                .eval(
+                    tensor1(&[-7i32, 7, 9]).into(),
+                    tensor1(&[2i32, -2, 4]).into(),
+                    i32::datum_type()
+                )
+                .unwrap(),
+            tensor1(&[-1i32, 1, 1])
+        );
+        assert_eq!(
+            div()
+                .0
+                .eval(tensor1(&[255u8]).into(), tensor1(&[2u8]).into(), u8::datum_type())
+                .unwrap(),
+            tensor1(&[127u8])
+        );
+    }
+
     #[test]
     fn test_mul() {
         let a = arr2(&[[1., 2.], [3., 4.]]);
         let b = arr2(&[[1., 0.], [0., 0.]]);
         assert_eq!(a * b, arr2(&[[1., 0.], [0., 0.]]));
+    }
+
+    #[test]
+    fn erf_f16_lut_matches_the_f32_kernel_on_every_f16() {
+        let all: Vec<f16> = (0..=u16::MAX).map(f16::from_bits).collect();
+
+        let mut reference: Vec<f32> = all.iter().map(|x| x.to_f32()).collect();
+        Func::Erf.ew_f32().unwrap().run(&mut reference).unwrap();
+        let reference: Vec<f16> = reference.into_iter().map(f16::from_f32).collect();
+
+        let mut lut = Tensor::from_shape(&[all.len()], &all).unwrap();
+        erf().0.eval_in_place(&mut lut, None).unwrap();
+
+        let lut = lut.to_plain_array_view::<f16>().unwrap();
+        let mismatch = lut.iter().zip(&reference).position(|(a, b)| a.to_bits() != b.to_bits());
+        assert_eq!(mismatch, None);
     }
 
     #[test]
@@ -819,6 +972,20 @@ mod tests {
             .downcast_ref::<TypedBinOp>()
             .unwrap();
         assert!(op.0.downcast_ref::<ShiftRight>().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn sign_of_negative_zero_is_positive_zero() -> TractResult<()> {
+        let mut t = tensor1(&[-0.0f32, 0.0, -2.0, 2.0]);
+        Sign {}.eval_in_place(&mut t, None)?;
+        let got = t.try_as_plain()?.as_slice::<f32>()?;
+        // Compared as bit patterns: -0.0 == 0.0 is true, so an equality check on the
+        // values would pass even when -0.0 is returned.
+        assert_eq!(got[0].to_bits(), 0f32.to_bits());
+        assert_eq!(got[1].to_bits(), 0f32.to_bits());
+        assert_eq!(got[2], -1.0);
+        assert_eq!(got[3], 1.0);
         Ok(())
     }
 }

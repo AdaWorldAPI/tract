@@ -96,12 +96,10 @@ impl Op for PulsedReshape {
 }
 
 impl EvalOp for PulsedReshape {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
-        self.op.eval(inputs)
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        self.op.eval(&EvalContext::out_of_plan(), inputs)
     }
 }
 
@@ -125,7 +123,7 @@ impl PulsedOp for PulsedReshape {
         let new_per_pulse = to[to_pos].to_usize()?;
         let scaled = stream.delay * new_per_pulse;
         ensure!(
-            scaled % old_per_pulse == 0,
+            scaled.is_multiple_of(old_per_pulse),
             "PulsedReshape: stream.delay {} can't be rescaled from per-pulse {} \
              to per-pulse {} (would lose precision)",
             stream.delay,

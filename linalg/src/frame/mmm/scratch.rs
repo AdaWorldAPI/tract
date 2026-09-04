@@ -49,7 +49,7 @@ impl TLSScratch {
         unsafe {
             self.blob.ensure_size_and_align(scratch.blob_size, scratch.blob_align);
 
-            for LocDependant { loc, ker_spec, .. } in &scratch.loc_dependant {
+            for LocDependent { loc, ker_spec, .. } in &scratch.loc_dependent {
                 #[allow(clippy::single_match)]
                 if matches!(scratch.ker_specs[*ker_spec], FusedKerSpec::AddMatMul { .. }) {
                     let scratch = &mut *(self.blob.as_ptr().add(*loc) as *mut AddMatMulTemp);
@@ -71,7 +71,7 @@ pub struct ScratchSpaceImpl<TI: LADatum> {
     blob_size: usize,
     blob_align: usize,
     ker_specs: Vec<FusedKerSpec<TI>>,
-    loc_dependant: TVec<LocDependant>,
+    loc_dependent: TVec<LocDependent>,
     valid_down_tiles: usize,
     remnant_down: usize,
     valid_right_tiles: usize,
@@ -79,10 +79,10 @@ pub struct ScratchSpaceImpl<TI: LADatum> {
 }
 
 #[derive(Debug, new)]
-struct LocDependant {
+struct LocDependent {
     spec: usize,
     ker_spec: usize,
-    // offset for the location dependant structure
+    // offset for the location dependent structure
     loc: usize,
     // offset of its associated dynamic-size buffers
     buffer_a: Option<usize>,
@@ -111,7 +111,7 @@ impl<TI: LADatum> ScratchSpaceImpl<TI> {
         use FusedKerSpec as FKS;
         use FusedSpec as FS;
         self.ker_specs.clear();
-        self.loc_dependant.clear();
+        self.loc_dependent.clear();
         self.ker_specs.reserve(specs.len() + 2);
         self.ker_specs.push(FusedKerSpec::Clear);
         self.valid_down_tiles = m / ker.mr();
@@ -120,8 +120,8 @@ impl<TI: LADatum> ScratchSpaceImpl<TI> {
         self.remnant_right = n % ker.nr();
         let mut offset = 0;
         let mut align = std::mem::size_of::<*const ()>();
-        fn ld(spec: usize, uspec: usize, loc: usize) -> LocDependant {
-            LocDependant { spec, ker_spec: uspec, loc, buffer_a: None, buffer_b: None }
+        fn ld(spec: usize, uspec: usize, loc: usize) -> LocDependent {
+            LocDependent { spec, ker_spec: uspec, loc, buffer_a: None, buffer_b: None }
         }
         for (ix, spec) in specs.iter().enumerate() {
             offset = offset.next_multiple_of(&align);
@@ -138,28 +138,43 @@ impl<TI: LADatum> ScratchSpaceImpl<TI> {
                 FS::RoundingShiftRight(s, rp) => FKS::RoundingShiftRight(*s, *rp),
                 FS::QScale(s, rp, m) => FKS::QScale(*s, *rp, *m),
                 FS::BinPerRow(_, _) => {
-                    self.loc_dependant.push(ld(ix, self.ker_specs.len(), offset));
+                    self.loc_dependent.push(ld(ix, self.ker_specs.len(), offset));
                     offset += TI::datum_type().size_of() * ker.mr();
                     FusedKerSpec::Done
                 }
                 FS::BinPerCol(_, _) => {
-                    self.loc_dependant.push(ld(ix, self.ker_specs.len(), offset));
+                    self.loc_dependent.push(ld(ix, self.ker_specs.len(), offset));
                     offset += TI::datum_type().size_of() * ker.nr();
                     FusedKerSpec::Done
                 }
                 FS::AddRowColProducts(_, _) => {
-                    self.loc_dependant.push(ld(ix, self.ker_specs.len(), offset));
+                    self.loc_dependent.push(ld(ix, self.ker_specs.len(), offset));
                     offset += TI::datum_type().size_of() * (ker.mr() + ker.nr());
                     FusedKerSpec::Done
                 }
                 FS::AddUnicast(_) => {
-                    self.loc_dependant.push(ld(ix, self.ker_specs.len(), offset));
+                    self.loc_dependent.push(ld(ix, self.ker_specs.len(), offset));
                     offset += TI::datum_type().size_of() * ker.mr() * ker.nr();
                     FusedKerSpec::Done
                 }
                 FS::Store(store) => {
-                    self.loc_dependant.push(ld(ix, self.ker_specs.len(), offset));
-                    offset += store.item_size * ker.mr() * ker.nr();
+                    // Only worth a row-major tile when the destination is itself
+                    // n-contiguous: set_from_tile then copies without transposing
+                    // and the kernel's aligned bulk-store path applies.
+                    let row_major = ker.stores_row_major_tile()
+                        && store.col_byte_stride == store.item_size as isize;
+                    let tile_bytes = if row_major {
+                        // 128-align the row-major store tile, with rows padded to
+                        // 128 bytes, so the kernel can hit its aligned bulk-store
+                        // path (e.g. Apple AMX stz-direct).
+                        align = align.lcm(&128);
+                        offset = Integer::next_multiple_of(&offset, &128);
+                        Integer::next_multiple_of(&(store.item_size * ker.nr()), &128) * ker.mr()
+                    } else {
+                        store.item_size * ker.mr() * ker.nr()
+                    };
+                    self.loc_dependent.push(ld(ix, self.ker_specs.len(), offset));
+                    offset += tile_bytes;
                     FusedKerSpec::Done
                 }
                 FS::LeakyRelu(t) => FKS::LeakyRelu(*t.try_as_plain()?.to_scalar()?),
@@ -178,7 +193,7 @@ impl<TI: LADatum> ScratchSpaceImpl<TI> {
                         ld.buffer_b = Some(offset);
                         offset += tmp.size();
                     }
-                    self.loc_dependant.push(ld);
+                    self.loc_dependent.push(ld);
                     FusedKerSpec::AddMatMul {
                         k: 0,
                         pa: std::ptr::null(),
@@ -241,7 +256,7 @@ impl<TI: LADatum> ScratchSpaceImpl<TI> {
             if down < self.valid_down_tiles && right < self.valid_right_tiles {
                 self.for_valid_tile(ker, specs, tls, down, right)?;
                 let err = ker.kernel(tls.ker_specs());
-                debug_assert_eq!(err, 0, "Kernel return error {err}");
+                ensure!(err == 0, "Kernel {} returned error {err}", ker.name());
             } else {
                 let remnant_down =
                     if down < self.valid_down_tiles { ker.mr() } else { self.remnant_down };
@@ -249,7 +264,7 @@ impl<TI: LADatum> ScratchSpaceImpl<TI> {
                     if right < self.valid_right_tiles { ker.nr() } else { self.remnant_right };
                 self.for_border_tile(ker, specs, tls, down, right, remnant_down, remnant_right)?;
                 let err = ker.kernel(tls.ker_specs());
-                debug_assert_eq!(err, 0, "Kernel return error {err}");
+                ensure!(err == 0, "Kernel {} returned error {err}", ker.name());
                 self.postprocess_tile(specs, tls, down, right, remnant_down, remnant_right)?;
             }
             Ok(())
@@ -268,9 +283,9 @@ impl<TI: LADatum> ScratchSpaceImpl<TI> {
         unsafe {
             use FusedKerSpec as FKS;
             use FusedSpec as FS;
-            let ScratchSpaceImpl { ker_specs, loc_dependant, .. } = self;
+            let ScratchSpaceImpl { ker_specs, loc_dependent, .. } = self;
             debug_assert!(specs.len() + 2 == ker_specs.len());
-            for LocDependant { spec, ker_spec, loc, buffer_a, buffer_b } in loc_dependant {
+            for LocDependent { spec, ker_spec, loc, buffer_a, buffer_b } in loc_dependent {
                 let spec = specs.get_unchecked(*spec);
                 let it = match spec {
                     FS::BinPerRow(v, op) => {
@@ -350,8 +365,8 @@ impl<TI: LADatum> ScratchSpaceImpl<TI> {
         unsafe {
             use FusedKerSpec as FKS;
             use FusedSpec as FS;
-            for LocDependant { spec, ker_spec: uspec, loc, buffer_a, buffer_b } in
-                &self.loc_dependant
+            for LocDependent { spec, ker_spec: uspec, loc, buffer_a, buffer_b } in
+                &self.loc_dependent
             {
                 let loc = tls.blob.as_mut_ptr().add(*loc);
                 let spec = specs.get_unchecked(*spec);
@@ -366,11 +381,12 @@ impl<TI: LADatum> ScratchSpaceImpl<TI> {
                                         .get_unchecked(..m_remnant),
                                 );
                             }
-                            if cfg!(debug_assertions) {
-                                buf.get_unchecked_mut(m_remnant..)
-                                    .iter_mut()
-                                    .for_each(|x| *x = TI::zero());
-                            }
+                            // The kernel computes on the tail lanes before their
+                            // results are discarded; garbage there decodes to
+                            // denormals and stalls the fp pipeline. Zero them.
+                            buf.get_unchecked_mut(m_remnant..)
+                                .iter_mut()
+                                .for_each(|x| *x = TI::zero());
                             buf.as_ptr()
                         } else {
                             v.as_ptr_unchecked::<TI>().add(down * ker.mr())
@@ -394,11 +410,9 @@ impl<TI: LADatum> ScratchSpaceImpl<TI> {
                                         .get_unchecked(..n_remnant),
                                 );
                             }
-                            if cfg!(debug_assertions) {
-                                buf.get_unchecked_mut(n_remnant..)
-                                    .iter_mut()
-                                    .for_each(|x| *x = TI::zero());
-                            }
+                            buf.get_unchecked_mut(n_remnant..)
+                                .iter_mut()
+                                .for_each(|x| *x = TI::zero());
                             buf.as_ptr()
                         } else {
                             v.as_ptr_unchecked::<TI>().add(right * ker.nr())
@@ -420,11 +434,9 @@ impl<TI: LADatum> ScratchSpaceImpl<TI> {
                                     .get_unchecked(down * ker.mr()..)
                                     .get_unchecked(..m_remnant),
                             );
-                            if cfg!(debug_assertions) {
-                                r.get_unchecked_mut(m_remnant..)
-                                    .iter_mut()
-                                    .for_each(|x| *x = TI::zero());
-                            }
+                            r.get_unchecked_mut(m_remnant..)
+                                .iter_mut()
+                                .for_each(|x| *x = TI::zero());
                             r.as_ptr()
                         } else {
                             rows.as_ptr_unchecked::<TI>().add(down * ker.mr())
@@ -439,11 +451,9 @@ impl<TI: LADatum> ScratchSpaceImpl<TI> {
                                     .get_unchecked(right * ker.nr()..)
                                     .get_unchecked(..n_remnant),
                             );
-                            if cfg!(debug_assertions) {
-                                r.get_unchecked_mut(n_remnant..)
-                                    .iter_mut()
-                                    .for_each(|x| *x = TI::zero());
-                            }
+                            c.get_unchecked_mut(n_remnant..)
+                                .iter_mut()
+                                .for_each(|x| *x = TI::zero());
                             c.as_ptr()
                         } else {
                             cols.as_ptr_unchecked::<TI>().add(right * ker.nr())
@@ -458,9 +468,7 @@ impl<TI: LADatum> ScratchSpaceImpl<TI> {
                         let tile_ptr = store.ptr.offset(tile_offset);
                         let tmp_d_tile =
                             std::slice::from_raw_parts_mut(loc as *mut TI, ker.mr() * ker.nr());
-                        if cfg!(debug_assertions) {
-                            tmp_d_tile.iter_mut().for_each(|t| *t = TI::zero());
-                        }
+                        tmp_d_tile.iter_mut().for_each(|t| *t = TI::zero());
                         for r in 0..m_remnant as isize {
                             for c in 0..n_remnant as isize {
                                 let inner_offset = c * col_byte_stride + r * row_byte_stride;
@@ -481,11 +489,22 @@ impl<TI: LADatum> ScratchSpaceImpl<TI> {
                         })
                     }
                     FS::Store(c_store) => {
+                        let row_major = ker.stores_row_major_tile()
+                            && c_store.col_byte_stride == c_store.item_size as isize;
+                        let (row_byte_stride, col_byte_stride) = if row_major {
+                            // Pad the row stride to 128 bytes so it stays aligned
+                            // for the kernel's bulk-store path.
+                            let row =
+                                Integer::next_multiple_of(&(c_store.item_size * ker.nr()), &128);
+                            (row as isize, c_store.item_size as isize)
+                        } else {
+                            (c_store.item_size as isize, (c_store.item_size * ker.mr()) as isize)
+                        };
                         let tmpc = OutputStoreKer {
                             ptr: loc as _,
                             item_size: c_store.item_size,
-                            row_byte_stride: c_store.item_size as isize,
-                            col_byte_stride: (c_store.item_size * ker.mr()) as isize,
+                            row_byte_stride,
+                            col_byte_stride,
                         };
                         FKS::Store(tmpc)
                     }
@@ -538,7 +557,7 @@ impl<TI: LADatum> ScratchSpaceImpl<TI> {
         TI: LADatum,
     {
         unsafe {
-            for LocDependant { spec, ker_spec: uspec, .. } in self.loc_dependant.iter() {
+            for LocDependent { spec, ker_spec: uspec, .. } in self.loc_dependent.iter() {
                 let spec = specs.get_unchecked(*spec);
                 let ker_spec = tls.ker_specs::<TI>().get_unchecked(*uspec);
                 if let (FusedSpec::Store(c_store), FusedKerSpec::Store(tmp)) = (spec, ker_spec) {

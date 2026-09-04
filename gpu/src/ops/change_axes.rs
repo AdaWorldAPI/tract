@@ -71,16 +71,9 @@ impl Op for GpuAxisOp {
 }
 
 impl EvalOp for GpuAxisOp {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let tensor = args_1!(inputs).into_tensor();
         let input = tensor.to_device_tensor()?;
         let shape = input.shape();
@@ -97,12 +90,8 @@ impl EvalOp for GpuAxisOp {
                 permutation.insert(*to, *from);
 
                 let out_shape = permute_output_shape(input.shape(), &permutation)?;
-                let output = crate::session_handler::make_tensor_for_node(
-                    session,
-                    node_id,
-                    input.datum_type(),
-                    &out_shape,
-                )?;
+                let output =
+                    crate::turn_handler::make_tensor_for_node(ctx, input.datum_type(), &out_shape)?;
                 // Compute permuted input strides
                 let permuted_strides: TVec<isize> =
                     permutation.iter().map(|&i| input.strides()[i]).collect();
@@ -119,8 +108,8 @@ impl EvalOp for GpuAxisOp {
                 return Ok(tvec!(output.into_tensor().into_tvalue()));
             }
             AxisOp::Reshape(skip, from, to) => {
-                let from = from.iter().map(|d| d.eval(&session.resolved_symbols)).collect();
-                let to = to.iter().map(|d| d.eval(&session.resolved_symbols)).collect();
+                let from = from.iter().map(|d| d.eval(ctx.symbols)).collect();
+                let to = to.iter().map(|d| d.eval(ctx.symbols)).collect();
                 let mut shape: TVec<usize> = input.shape().into();
                 AxisOp::Reshape(*skip, from, to).change_shape_array(&mut shape, false)?;
                 shape
@@ -133,12 +122,8 @@ impl EvalOp for GpuAxisOp {
         };
 
         // Memcpy path (Reshape/Add/Rm) — flat copy, treat as 1D
-        let output = crate::session_handler::make_tensor_for_node(
-            session,
-            node_id,
-            input.datum_type(),
-            &new_shape,
-        )?;
+        let output =
+            crate::turn_handler::make_tensor_for_node(ctx, input.datum_type(), &new_shape)?;
         let flat_len = input.len();
         let ctx = crate::device::get_context()?;
         ctx.copy_nd(input, 0, &[1], &output, 0, &[flat_len], &[1])?;
@@ -162,7 +147,7 @@ impl TypedOp for GpuAxisOp {
         self.inner.axes_mapping(&ref_inputs, &ref_outputs)
     }
 
-    fn substitute_symbols(
+    fn set_symbols(
         &self,
         _source: &TypedModel,
         node: &TypedNode,

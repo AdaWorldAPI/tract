@@ -50,26 +50,42 @@ impl Gather {
 
         let block_len = data_shape[data_axis + 1..].iter().product::<usize>();
 
-        let can_block_copy = data_shape[..data_axis].iter().all(|&d| d == 1)
-            && output_shape[..data_axis].iter().all(|&d| d == 1)
+        // Both shapes agree on the axes before the gathered one, so one outer
+        // stride walks data and output together.
+        let outer_len = data_shape[..data_axis].iter().product::<usize>();
+        let can_block_copy = data_shape[..data_axis] == output_shape[..data_axis]
             && data_view.is_standard_layout()
             && output_view.is_standard_layout();
 
         if can_block_copy {
-            let mut out_offset = 0;
+            let axis_len = data_shape[data_axis];
             let input_slice = data_view.as_slice().unwrap();
             let output_slice = &mut output_view.as_slice_mut().unwrap();
-            for idx_coords in indices.indexed_iter() {
-                let index = *idx_coords.1;
-                let axis_len = data_shape[data_axis] as i64;
-                let resolved_index = if index < 0 { index + axis_len } else { index };
-                let resolved_index = resolved_index as usize;
-
-                let input_offset = resolved_index * block_len;
-
-                output_slice[out_offset..out_offset + block_len]
-                    .clone_from_slice(&input_slice[input_offset..input_offset + block_len]);
-                out_offset += block_len;
+            let resolved: TVec<usize> = indices
+                .iter()
+                .map(|i| if *i < 0 { i + axis_len as i64 } else { *i } as usize)
+                .collect();
+            let mut out_offset = 0;
+            if block_len == 1 {
+                // Gathering the innermost axis: each block is one datum, so a
+                // slice copy per element costs more than the read itself.
+                for outer in 0..outer_len {
+                    let input_base = outer * axis_len;
+                    for index in &resolved {
+                        output_slice[out_offset] = input_slice[input_base + index].clone();
+                        out_offset += 1;
+                    }
+                }
+            } else {
+                for outer in 0..outer_len {
+                    let input_base = outer * axis_len * block_len;
+                    for index in &resolved {
+                        let input_offset = input_base + index * block_len;
+                        output_slice[out_offset..out_offset + block_len]
+                            .clone_from_slice(&input_slice[input_offset..input_offset + block_len]);
+                        out_offset += block_len;
+                    }
+                }
             }
         } else {
             let ic_len = self.axis + 1 + output_shape.len() - (self.axis + indices.ndim());
@@ -88,8 +104,10 @@ impl Gather {
                 output_view[ocoords] =
                     data_view.get(&*icoords).cloned().context("Invalid gather")?;
             }
-            unsafe { output.set_datum_type(data.datum_type()) };
         }
+        // Tensor::uninitialized stamps the plain datum type, dropping any
+        // quantization the data carried.
+        unsafe { output.set_datum_type(data.datum_type()) };
         Ok(output)
     }
 
@@ -304,11 +322,9 @@ impl TypedOp for Gather {
 }
 
 impl EvalOp for Gather {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (data, indices) = args_2!(inputs);
         let result = if let Some(bqs) = data.storage_as::<BlockQuantStorage>() {
             let dt = self.output_type.unwrap();
@@ -338,8 +354,12 @@ mod tests {
         let gatherer = Gather::new(0);
         for idx in 2..3 {
             let index = Tensor::from(arr0(idx));
-            let outputs =
-                gatherer.eval(tvec![data.clone().into_tvalue(), index.into_tvalue()]).unwrap();
+            let outputs = gatherer
+                .eval(
+                    &EvalContext::out_of_plan(),
+                    tvec![data.clone().into_tvalue(), index.into_tvalue()],
+                )
+                .unwrap();
             let output = &outputs[0];
             assert_eq!(output.shape().len(), 0);
             assert_eq!(*output.try_as_plain().unwrap().to_scalar::<i64>().unwrap(), idx + 1);

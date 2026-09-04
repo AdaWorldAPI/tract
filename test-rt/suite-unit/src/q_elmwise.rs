@@ -14,7 +14,11 @@ struct QElmWiseOpProblem {
 impl QOpProblem for QElmWiseOpProblem {
     fn reference_float_ops(&self) -> TractResult<Tensor> {
         let inp = self.tensor_input.cast_to::<f32>()?.clone().into_owned();
-        Ok(self.operator.eval(tvec![inp.into_tvalue()])?.remove(0).into_tensor())
+        Ok(self
+            .operator
+            .eval(&EvalContext::out_of_plan(), tvec![inp.into_tvalue()])?
+            .remove(0)
+            .into_tensor())
     }
 }
 
@@ -105,6 +109,15 @@ pub fn suite() -> TractResult<TestSuite> {
             operator: tract_core::ops::math::tanh(),
             tensor_input: qu8_tensor1(&(0u8..=100).collect::<Box<[u8]>>(), 50, 0.05)?,
             out_dt: qu8_dt(127, 0.001),
+        },
+    );
+
+    suite.add(
+        "sign_at_zero_point_case",
+        QElmWiseOpProblem {
+            operator: tract_core::ops::math::sign(),
+            tensor_input: qi8_tensor1(&[-5, 0, 5], 0, 0.5)?,
+            out_dt: qi8_dt(0, 0.01),
         },
     );
 

@@ -1,6 +1,7 @@
 use tract_data::itertools::izip;
 use tract_linalg::WeightType;
 use tract_linalg::block_quant::{BlockQuantFact, PackedBlockQuantFormat};
+use tract_linalg::mmm::retain_best;
 use tract_num_traits::Zero;
 
 use crate::internal::*;
@@ -21,6 +22,7 @@ use crate::ops::math::{add, div, mul, sub};
 use crate::ops::matmul::ModePicker;
 use crate::ops::matmul::optimized::AddMatMulGeometry;
 use crate::ops::matmul::optimized::MapOutputAxisToInput;
+use crate::ops::matmul::optimized::MatMulOperand;
 use crate::ops::matmul::pack::{OptMatMulPack, OptSimpleMatMulPack};
 use crate::ops::matmul::quant::wire_ensure_q8_flavour;
 use crate::ops::nn::Reduce;
@@ -32,7 +34,7 @@ use crate::ops::cnn::pools::{ConcretePoolGeometry, PoolGeometry, PoolSpec};
 use crate::ops::matmul::optimized::{OptMatMul, ProtoFusedSpec};
 use crate::ops::nn::{BaseDataShape, DataFormat, DataShape};
 
-use tract_linalg::mmm::{MMMInputFormat, MatMatMul};
+use tract_linalg::mmm::{MMMInputFormat, MatMatMul, Query};
 use tract_linalg::pack::{PackedFormat, PackedI8K4};
 
 #[derive(Debug, Clone, new, Hash, PartialEq, Eq)]
@@ -546,40 +548,38 @@ impl Conv {
         let x_dt = input_fact.datum_type;
 
         let acc = if x_dt.is_float() { x_dt } else { i32::datum_type() };
+        // The weights are packed once, ahead of time, so a kernel reached through a panel
+        // extractor would pay it on every panel of every call.
+        let query = Query {
+            weight: if weight_fact.is_exotic() {
+                let bqf = weight_fact
+                    .exotic_fact
+                    .as_ref()
+                    .and_then(|of| of.downcast_ref::<BlockQuantFact>())
+                    .unwrap();
+                WeightType::BlockQuant(bqf.format.clone())
+            } else {
+                w_dt.into()
+            },
+            activation: x_dt,
+            accumulators: tvec!(acc),
+            store: None,
+            allow_extractor: false,
+            m: Some(m),
+            k: Some(k),
+            n: n.as_usize(),
+        };
         if weight_fact.is_exotic() {
-            let bqf = weight_fact
-                .exotic_fact
-                .as_ref()
-                .and_then(|of| of.downcast_ref::<BlockQuantFact>())
-                .unwrap();
-            let weight_type = WeightType::BlockQuant(bqf.format.clone());
-            tract_linalg::ops()
-                .mmm_impls()
-                .iter()
-                .filter(|mmm| mmm.internal_type() == acc)
-                .flat_map(|mmm| {
-                    mmm.packings().iter().enumerate().map(move |(ix, p)| (mmm, ix, &p.0, &p.1))
-                })
-                .filter(|(_, _, pa, pb)| {
-                    pb.precursor() == x_dt.into() && pa.precursor() == weight_type
-                })
-                .map(|(mmm, p, _, _)| (mmm.clone(), p))
-                .min_by_key(|(mmm, _)| {
-                    mmm.quality().cost() as isize * 1000 - (mmm.mr() * mmm.nr()) as isize
-                })
-                .context("Not matmu found")
+            let mut suitable = tract_linalg::MmmDispatch::native().suitable(&query);
+            retain_best(&mut suitable);
+            suitable
+                .into_iter()
+                .map(|(mmm, p, _)| (mmm, p))
+                .max_by_key(|(mmm, _)| mmm.mr() * mmm.nr())
+                .context("No matmul found")
         } else {
-            let mmm = tract_linalg::ops()
-                .mmm(acc, Some(m), Some(k), n.to_usize().ok())
-                .context("No matmul found")?;
-            let packing = mmm
-                .packings()
-                .iter()
-                .position(|p| {
-                    p.0.precursor() == w_dt.unquantized().into()
-                        && p.1.precursor() == x_dt.unquantized().into()
-                })
-                .context("No packing found")?;
+            let (mmm, packing, _) =
+                tract_linalg::MmmDispatch::native().pick(&query).context("No matmul found")?;
             Ok((mmm, packing))
         }
     }
@@ -616,8 +616,12 @@ impl Conv {
             c_to_a_axis_mapping: MapOutputAxisToInput(c_to_a_axis_mapping),
             c_to_b_axis_mapping: MapOutputAxisToInput(c_to_b_axis_mapping),
         };
-        let mut ops: Vec<ProtoFusedSpec> =
-            vec![ProtoFusedSpec::AddMatMul { geo, a: 1, b: 0, packings: vec![(packing, None)] }];
+        let mut ops: Vec<ProtoFusedSpec> = vec![ProtoFusedSpec::AddMatMul {
+            geo,
+            a: MatMulOperand::Input(1),
+            b: MatMulOperand::Input(0),
+            packings: vec![(packing, None)],
+        }];
         let mut wires: TVec<OutletId> = tvec!(input, packed_ker);
         let bias_fact = model.outlet_fact(bias)?;
         if bias_fact.konst.is_none() || !bias_fact.konst.as_ref().unwrap().is_all_zero()? {
@@ -679,9 +683,9 @@ impl Conv {
         // AMX dispatch already handles the tiny-M matmul well. So: on by default
         // on wasm, opt-in on native. Env overrides either way for A/B.
         let enabled = if cfg!(target_family = "wasm") {
-            std::env::var("TRACT_DISABLE_BLOCKED_CONV").is_err()
+            !TRACT_DISABLE_BLOCKED_CONV.get()
         } else {
-            std::env::var("TRACT_ENABLE_BLOCKED_CONV").is_ok()
+            TRACT_ENABLE_BLOCKED_CONV.get()
         };
         if !enabled {
             return None;
@@ -1000,11 +1004,9 @@ impl Op for Conv {
 }
 
 impl EvalOp for Conv {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let mut model = TypedModel::default();
         let wire: TVec<OutletId> = inputs
             .iter()
@@ -1341,15 +1343,33 @@ impl TypedOp for Conv {
 /// `TRACT_LAZY_IM2COL_MIN_KERNEL` env var to experiment with lower thresholds.
 const DEFAULT_LAZY_IM2COL_MIN_KERNEL: usize = 6;
 
+crate::declare_knob!(
+    TRACT_ENABLE_BLOCKED_CONV,
+    bool,
+    false,
+    "Force-enable the direct blocked convolution on native targets (on by default on wasm)."
+);
+crate::declare_knob!(
+    TRACT_DISABLE_BLOCKED_CONV,
+    bool,
+    false,
+    "Force-disable the direct blocked convolution on wasm targets (off by default on native)."
+);
+crate::declare_knob!(
+    TRACT_LAZY_IM2COL_MIN_KERNEL,
+    usize,
+    DEFAULT_LAZY_IM2COL_MIN_KERNEL,
+    "Minimum convolution kernel volume before lazy im2col is preferred over eager."
+);
+crate::declare_knob!(
+    TRACT_LAZY_IM2COL_MAX_EAGER_BYTES,
+    usize,
+    DEFAULT_LAZY_IM2COL_MAX_EAGER_BYTES,
+    "Eager-im2col scratch-size ceiling, in bytes, above which lazy im2col is preferred."
+);
+
 fn lazy_im2col_min_kernel() -> usize {
-    use std::sync::OnceLock;
-    static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TRACT_LAZY_IM2COL_MIN_KERNEL")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_LAZY_IM2COL_MIN_KERNEL)
-    })
+    TRACT_LAZY_IM2COL_MIN_KERNEL.get()
 }
 
 /// Default eager-Im2col scratch-size ceiling, in bytes, above which LazyIm2col is
@@ -1375,14 +1395,7 @@ const DEFAULT_LAZY_IM2COL_MAX_EAGER_BYTES: usize = 1024 * 1024;
 const DEFAULT_LAZY_IM2COL_MAX_EAGER_BYTES: usize = 4 * 1024 * 1024;
 
 fn lazy_im2col_max_eager_bytes() -> usize {
-    use std::sync::OnceLock;
-    static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TRACT_LAZY_IM2COL_MAX_EAGER_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_LAZY_IM2COL_MAX_EAGER_BYTES)
-    })
+    TRACT_LAZY_IM2COL_MAX_EAGER_BYTES.get()
 }
 
 fn should_use_lazy(
@@ -1417,7 +1430,26 @@ fn should_use_lazy(
     let n: usize = output_shape.hw_dims().iter().product();
     let k = pool_spec.input_channels * kernel_volume / group;
     let eager_scratch_bytes = k.saturating_mul(n).saturating_mul(dt.size_of());
-    eager_scratch_bytes >= lazy_im2col_max_eager_bytes()
+    if eager_scratch_bytes >= lazy_im2col_max_eager_bytes() {
+        return true;
+    }
+    // A 1x1 kernel has nothing to gather: its im2col is a reshape, so there is no
+    // materialisation for lazy to save and its per-position indirection is pure loss.
+    if kernel_volume == 1 {
+        return false;
+    }
+    // Single-panel rule. Both paths gather the same `k * n` elements: eager gathers
+    // them once into scratch the matmul then streams once per row panel, lazy
+    // re-gathers per row panel and builds nothing. Eager only pays for itself once
+    // there is more than one row panel to amortise the scratch over -- at a single
+    // panel lazy does the same gathers and skips the buffer entirely. Ask the kernel
+    // that will actually run rather than assuming its geometry.
+    let m = (pool_spec.output_channels / group).max(1);
+    let mr = tract_linalg::MmmDispatch::native()
+        .preferred_kernel(dt, Some(m), Some(k), Some(n))
+        .map(|mmm| mmm.mr())
+        .unwrap_or(1);
+    m <= mr
 }
 
 #[allow(non_snake_case)]
@@ -1455,7 +1487,7 @@ mod test {
             rctensor0(1.0f32),
         );
         let input = input.into_iter().map(IntoTValue::into_tvalue).collect::<TVec<_>>();
-        let output = op.eval(input).unwrap();
+        let output = op.eval(&EvalContext::out_of_plan(), input).unwrap();
         assert_eq!(*output[0], tensor4(&[[[[8i32, 12], [20, 24]]]]));
     }
 

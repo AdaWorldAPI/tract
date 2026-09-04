@@ -62,7 +62,7 @@ mod run_as_f16 {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     struct StateAsF16(TypedSimpleState, TVec<DatumType>);
 
     impl State for StateAsF16 {
@@ -89,6 +89,10 @@ mod run_as_f16 {
                 .collect())
         }
 
+        fn resolve_symbol(&mut self, symbol: &Symbol, value: i64) -> TractResult<()> {
+            self.0.resolve_symbol(symbol, value)
+        }
+
         fn input_count(&self) -> usize {
             self.0.input_count()
         }
@@ -99,10 +103,6 @@ mod run_as_f16 {
 
         fn runnable(&self) -> &dyn Runnable {
             self.0.runnable()
-        }
-
-        fn freeze(&self) -> Box<dyn FrozenState> {
-            Box::new(self.0.freeze())
         }
     }
 
@@ -152,7 +152,7 @@ mod nnef_f16 {
             self.0.write_to_tar(&model, &mut buf)?;
             let reloaded = self.0.model_for_read(&mut &*buf)?;
             Ok(Box::new(RunnableAsF16(
-                reloaded.into_optimized()?.into_runnable_with_options(&options)?,
+                reloaded.into_optimized()?.into_runnable_with_options(options)?,
                 outputs_dt,
             )))
         }

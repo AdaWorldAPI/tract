@@ -2,8 +2,11 @@
 
 pub mod array;
 pub mod bin_ops;
+pub mod causal_conv1d_update;
 pub mod conv;
 pub mod element_wise;
+pub mod fft;
+pub mod gdn_recurrent;
 pub mod matmul;
 pub mod nn;
 mod utils;
@@ -23,13 +26,16 @@ const METAL_FLASH_ATTENTION_LIB: &[u8] = &[];
 
 const MLX_GEMM: &str = include_str!("matmul/mlx_gemm/mlx_gemm.metal");
 const MLX_GEMV: &str = include_str!("matmul/mlx_gemm/mlx_gemv.metal");
+const MLX_SDPA: &str = include_str!("matmul/mlx_sdpa/mlx_sdpa.metal");
 const GGML: &str = include_str!("matmul/ggml_gemm/ggml_mm_mv.metal");
 const BASIC_MAT_MUL: &str = include_str!("matmul/basic/basic_mat_mul.metal");
 const ARRAY_OPS: &str = include_str!("array/array_ops.metal");
 const BIN_OPS: &str = include_str!("bin_ops.metal");
-const NN_OPS: &str = include_str!("nn/nn_ops.metal");
+const NN_OPS: &str = concat!(include_str!("nn/nn_ops.metal"), include_str!("nn/pool.metal"));
 const CONV_OPS: &str = include_str!("conv.metal");
 const ELEMENT_WISE_OPS: &str = include_str!("element_wise.metal");
+const FFT_OPS: &str = include_str!("fft.metal");
+const GDN_RECURRENT: &str = include_str!("gdn_recurrent.metal");
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LibraryContent<'a> {
@@ -41,6 +47,7 @@ pub enum LibraryContent<'a> {
 pub enum LibraryName {
     MlxGemm,
     MlxGemv,
+    MlxSdpa,
     MfaLib,
     BasicMatMul,
     BinOps,
@@ -49,6 +56,8 @@ pub enum LibraryName {
     NNOps,
     ElementWiseOps,
     Ggml,
+    Fft,
+    GdnRecurrent,
 }
 
 impl LibraryName {
@@ -63,7 +72,10 @@ impl LibraryName {
             Self::ElementWiseOps => LibraryContent::Source(ELEMENT_WISE_OPS),
             Self::MlxGemm => LibraryContent::Source(MLX_GEMM),
             Self::MlxGemv => LibraryContent::Source(MLX_GEMV),
+            Self::MlxSdpa => LibraryContent::Source(MLX_SDPA),
             Self::Ggml => LibraryContent::Source(GGML),
+            Self::Fft => LibraryContent::Source(FFT_OPS),
+            Self::GdnRecurrent => LibraryContent::Source(GDN_RECURRENT),
         }
     }
 }

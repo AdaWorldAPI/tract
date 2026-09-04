@@ -32,9 +32,9 @@ fn load_a_slice(slice: &[u8], loops: usize) {
                 }
             }
         } else {
-            let mut ptr = slice.as_ptr();
-            let end = ptr.add(slice.len());
+            let end = slice.as_ptr().add(slice.len());
             for _ in 0..loops {
+                let mut ptr = slice.as_ptr();
                 while ptr < end {
                     std::arch::asm!("
                 vmovaps ymm0, [rsi]
@@ -102,6 +102,25 @@ fn load_a_slice(slice: &[u8], loops: usize) {
     }
 }
 
+/// Streams the slice with volatile word loads, for targets with no hand-written
+/// loop above. Volatile is what stops the reads being optimised away, and it
+/// also blocks the vectorisation the intrinsic paths get by hand, so this
+/// reports a lower figure than they would on comparable hardware.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "arm")))]
+#[inline(never)]
+fn load_a_slice(slice: &[u8], loops: usize) {
+    type Chunk = [usize; 8];
+    let chunks = slice.len() / std::mem::size_of::<Chunk>();
+    unsafe {
+        let base = slice.as_ptr() as *const Chunk;
+        for _ in 0..loops {
+            for i in 0..chunks {
+                std::ptr::read_volatile(base.add(i));
+            }
+        }
+    }
+}
+
 fn bandwidth_seq(slice_len: usize, threads: usize) -> f64 {
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -111,7 +130,12 @@ fn bandwidth_seq(slice_len: usize, threads: usize) -> f64 {
         let gards = (0..threads)
             .map(|_| {
                 s.spawn(|| {
-                    let buffer = unsafe { Blob::new_for_size_and_align(slice_len, 1024) };
+                    let mut buffer = unsafe { Blob::new_for_size_and_align(slice_len, 1024) };
+                    // A fresh allocation is copy-on-write mapped to the kernel's
+                    // shared zero page; a read-only bench would then stream one
+                    // cached page and report cache, not memory, bandwidth. Touch
+                    // every page to fault in distinct physical backing first.
+                    buffer.as_bytes_mut().iter_mut().step_by(4096).for_each(|b| *b = 1);
                     runner::run_bench(|loops| load_a_slice(&buffer, loops))
                 })
             })

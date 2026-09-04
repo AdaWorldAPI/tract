@@ -16,7 +16,7 @@ impl Op for PulsedAxisSlice {
         Ok(vec![format!("axis:{}, skip:{} take:{}", self.axis, self.skip, self.take)])
     }
 
-    not_a_typed_op!();
+    op_as_typed_op!();
 }
 
 impl TypedOp for PulsedAxisSlice {
@@ -28,11 +28,9 @@ impl TypedOp for PulsedAxisSlice {
 }
 
 impl EvalOp for PulsedAxisSlice {
-    fn is_stateless(&self) -> bool {
-        false
-    }
+    not_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         Ok(inputs)
     }
 }

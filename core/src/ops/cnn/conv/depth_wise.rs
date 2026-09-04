@@ -28,11 +28,9 @@ impl Op for DepthWise {
 }
 
 impl EvalOp for DepthWise {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let dt = inputs[0].datum_type();
         #[cfg(target_arch = "aarch64")]
         if dt == f16::datum_type() && tract_linalg::arm64::has_fp16() {

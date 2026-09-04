@@ -91,7 +91,7 @@ impl EinSum {
             if new_axis.inputs[ix].is_empty() {
                 let insert_at = self.axes.rank(InOut::In(ix));
                 tap = patch.wire_node(
-                    format!("{}.prop_axis.{}.input_{}", &node.name, new_axis.repr, ix),
+                    format!("{}.prop_axis.{}.input_{}", node.name, new_axis.repr, ix),
                     AxisOp::Add(insert_at),
                     &[tap],
                 )?[0];
@@ -115,7 +115,7 @@ impl EinSum {
         let mut wire = patch.wire_node(&node.name, Self { axes, ..self.clone() }, &taps)?;
         if let Some(position) = must_rm_axis {
             wire = patch.wire_node(
-                format!("{}.prop_axis.{}.output", &node.name, repr),
+                format!("{}.prop_axis.{}.output", node.name, repr),
                 AxisOp::Rm(position),
                 &wire,
             )?;
@@ -158,11 +158,9 @@ impl Op for EinSum {
 }
 
 impl EvalOp for EinSum {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         if inputs.iter().all(|i| i.datum_type().is_number() && i.is_plain()) {
             let mut adhoc_model = TypedModel::default();
             let mut wires = tvec!();
@@ -295,8 +293,7 @@ impl TypedOp for EinSum {
             }
             None
         };
-        let result: TVec<Option<TDim>> =
-            (0..node.inputs.len()).map(|ix| project_for_input(ix)).collect();
+        let result: TVec<Option<TDim>> = (0..node.inputs.len()).map(project_for_input).collect();
         Ok(Some(result))
     }
 
@@ -567,7 +564,7 @@ fn unit_k_to_broadcast_mul(
     // SDPA when head_dim=1, random-shape proptests with K=1) are intentionally left alone:
     // backend-specific pipelines (Metal SDPA fusion, MetalMul rank-4 broadcast-segment limit,
     // …) pattern-match on the matmul shape and break when we substitute a Mul.
-    let has_deconv_sum_consumer = node.outputs.first().map_or(false, |o| {
+    let has_deconv_sum_consumer = node.outputs.first().is_some_and(|o| {
         o.successors.iter().any(|inlet| model.node(inlet.node).op.name() == "DeconvSum")
     });
     if !has_deconv_sum_consumer {
@@ -631,7 +628,7 @@ fn unit_k_to_broadcast_mul(
             .filter(|(_, c)| !c_axes.contains(c))
             .map(|(i, c)| (i, *c))
             .collect();
-        to_drop.sort_by(|a, b| b.0.cmp(&a.0));
+        to_drop.sort_by_key(|a| std::cmp::Reverse(a.0));
         for (pos, c) in to_drop {
             *wire = patch.wire_node(
                 format!("{name}.rm_extra_in{slot}_{c}"),

@@ -29,7 +29,8 @@ impl CudaGgmlGemm {
         if a.datum_type.is_number() && b.datum_type.is_number() && a.is_plain() && b.is_plain() {
             ensure!(a.rank() == b.rank());
             ensure!(a.rank() >= 2);
-            ensure!(a.shape[a.rank() - 1] == b.shape[b.rank() - 1]);
+            let (ak, bk) = (&a.shape[a.rank() - 1], &b.shape[b.rank() - 1]);
+            ensure!(ak.compatible_with(bk), "Incompatible contraction dim: {ak} vs {bk}");
             let out_shape = GgmlGemm.output_shape(&a.shape, &b.shape);
             Ok(tvec![a.datum_type().unwrap().fact(out_shape)])
         } else if as_quant_fact(inputs[1], &Q4_0).is_some() {
@@ -50,16 +51,9 @@ impl CudaGgmlGemm {
     }
 }
 impl EvalOp for CudaGgmlGemm {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (act_raw, weights_raw) = args_2!(inputs);
         let activs = act_raw
             .to_device_tensor()
@@ -74,8 +68,7 @@ impl EvalOp for CudaGgmlGemm {
         let out_shape = GgmlGemm.output_shape(&activ_shape, &weights_shape);
         let out_dt =
             if get_ggml_q81_fact(activs).is_some() { DatumType::F32 } else { activs.datum_type() };
-        let out =
-            tract_gpu::session_handler::make_tensor_for_node(session, node_id, out_dt, &out_shape)?;
+        let out = tract_gpu::turn_handler::make_tensor_for_node(ctx, out_dt, &out_shape)?;
 
         crate::with_cuda_stream(|stream| GgmlGemm.dispatch_eval(stream, activs, weights, &out))?;
 

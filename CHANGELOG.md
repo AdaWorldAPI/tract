@@ -1,22 +1,294 @@
-# 0.23.0 — soon
+
+# 0.22.x → 0.23 in a nutshell
+
+- **`tract` facade is now the recommended public API.** Renamed from `tract-rs`; sole crate under semver, one curated surface (`Model`/`Runnable`/`State`/`Tensor`/`TDim` + `nnef()`/`onnx()`/`runtime_for_name`). `ndarray` removed from public types in favour of opt-in `impl_ndarray_interop!()`. Most other API renames in this release fall out of this consolidation (`Value`→`Tensor`, `concretize_symbols`→`set_symbols`, `default` runtime → `cpu`, …).
+- **GPU is first-class.** `cuda` + `metal` `Runtime` impls with f16 conv + cuDNN, CUDA 13 (CUDA 12 dropped), automatic per-node CPU fallback when GPU rejects a shape; virtual `gpu` / `gpu-or-cpu` names for portable downstream code.
+- **Supply-chain hardening.** ` Cargo.lock` tracked; CDX + SPDX SBOMs on release binaries plus PEP 770 SBOMs in wheels (`cargo-auditable` + GitHub attestations);
+
+## Migrating from 0.22.x to 0.23
+
+For normal usage we recommend adopting the **`tract` facade crate** (the public API at `api/rs`) instead of wiring `tract-core`, `tract-nnef`, `tract-onnx`, `tract-pulse`, `tract-cuda`, `tract-metal`, etc. directly. The facade exposes one stable surface — `nnef()`, `onnx()`, `runtime_for_name("cpu" | "gpu" | "gpu-or-cpu" | "cuda" | "metal" | ...)`, plus `Model`, `Runnable`, `State`, `Tensor`, `TDim`, and a `SetSymbols` transform builder — with all the backends curated behind it. `impl_ndarray_interop!()` (0.23.0-dev.5) keeps `ndarray` interop opt-in without leaking an `ndarray` version into the public API. Downstream code that pinned `tract-core` + `tract-onnx` directly can usually drop those deps in favour of `tract = "0.23"` and `use tract::prelude::*;`. Examples are now organised around this facade — see `examples/onnx-mobilenet-v2`, `examples/nnef-mobilenet-v2`, and `examples/causal_llm`.
+
+# 0.23.6 - 2026-09-02
+
+### Platforms
+
+- **RISC-V 64 is a supported target.** RVV 1.0 f32 matmul kernels, i8/i32 kernels, f16 kernels behind `Zvfh`, and RVV element-wise and reduction kernels. Vector support is detected through `hwprobe` rather than the `AT_HWCAP` V bit. CI cross-tests riscv64 under qemu with a Bootlin musl toolchain.
+- **WASM**: fused simd128 f32 gelu, silu and erf kernels; a 4x16 f32 GEMM kernel picked by N; the relaxed-simd int8 dot path is now bit-exact across engines; BlockedConv's inner loop is SIMD-vectorized. CI runs the WASM kernel invariants against relaxed-simd, and the CLI builds for `wasm32-wasip1`.
+- Fix: Windows ARM64 linalg assembly builds.
+
+### CPU / linalg
+
+- **Kernel declaration and dispatch reworked.** Every kernel — matmul, element-wise, reduction, unicast, by-scalar, look-up table, panel extractor — is now declared once by macro and registered where it is defined, and dispatch reads one inventory instead of hand-plugged tables. A kernel declares its instruction set, ranking and gating follow from that declaration, and each platform registers a single dispatch policy that picks from a shared candidate list (`candidates()` takes one query, shared with core). The `kit`/`plug`/quality-label vocabulary is retired.
+- **Every kernel tree compiles on every host.** arm32, arm64, x86_64 and wasm kernels build anywhere via bail stubs (foreign trees behind a feature), so CI runs linalg's tests with all kernel trees compiled in — which surfaced dotprod and SME tiers no local build had ever compiled.
+- **Accuracy fixes across activations and reductions**: f32 tanh and sigmoid are kept in range by their input clamp alone (wasm, x86, arm32); the generic GELU is computed with the tanh polynomial and the generic SiLU with the sigmoid polynomial; f16 silu and erf are served from tables instead of widening every chunk to f32; aarch64 cores without `FEAT_FP16` get an f32-roundtrip f16 tanh kernel; softmax and the generic reduce accumulate f16 row sums in f32.
+- **Accurate softmax exp.** The fast-compact exp path is gone; the accurate f32 exp is backed by vectorized hand-written kernels on aarch64, wasm, x86_64 FMA and AVX-512, while GPUs keep the hardware fast path.
+- Matmul selection: the aarch64 mat-vec kernel is picked by m rather than unconditionally; the AMX bf16 opt-in is a ranking boost rather than a capability; FMA f32 kernels rank as peers of the AVX-512 ones; conv's block-quant candidates rank like everything else; kernel return codes are checked in release builds.
+- Any pack format can now be packed from a view.
+- Fix: integer `Div` and `Mod` wrap at `MIN / -1` instead of panicking.
+- Fix: dropping of uninitialised memory in `tensor0`, `nth` and `Range`.
+
+### Core
+
+- **Turn/state model reworked.** Ops receive an `EvalContext` rather than the whole `TurnState`; the per-turn scope is named `turn`, op scratch lives in one place, the state freeze/unfreeze roundtrip is gone, and a `State` can resolve a symbol for the coming turn. Every state names the lane it sits in and is addressed by it. `PinConst`, the parked variable-based state ops and the two states that carried nothing are deleted.
+- **ONNX: Symbolic dimensions use rationals.** `dim_expr` is backed by num-rational with a nom parser, `floor` is out of the TDim parser, and ONNX `dim_param` is parsed as a rational and translated to a TDim explicitly. TDim "floor" is retired.
+- **Tensor data paths**: `Tensor::fill_slice`, the `at_prefix` slice variants, slicing and broadcasting by contiguous runs instead of ndarray views/copies, one-datum blocks copied inline in `stack_tensors`, and tiling by slice assignment.
+- Perf: 1x1 convolutions stay on eager im2col, lazy im2col is preferred when the matmul has a single row panel, depthwise deconvolution is fused into a `DepthwiseDeconv` op instead of an outer-product einsum, `Pow` against a uniform exponent lowers to a `PowConst` unary op (with NNEF serialization), binary by-scalar reads the scalar in place for short groups, `Gather`'s block copy skips slice copies for one-datum blocks, and `LstmEpilogue` sizes its row loop from the state.
+- Perf: `OptScan` passes the input handle through and hands the body output out directly when a single iteration covers the whole axis.
+- **ONNX GRU**: the standard cell is fused into one `GruEpilogue` op.
+
+### Streaming / pulse
+
+- Perf: `PulsePad` skips its copy and symbol re-resolution on pass-through pulses.
+- Work-in-progress: Laned/batch execution for increased parallelism.
+- `PulsedAxisSlice` is a typed op; `Delay` and `PulsePad` state (CPU and GPU) is addressed by lane; GPU pulses are edge-padded from the right frame.
+- The pulse proptests are a suite, CI repeats the pulsed cases over `TRACT_RUNTIMES` and runs the pulsed NNEF cases on device, and the CLI brings a node's pulse output to host before slicing it.
+- BatchifyDataTree transoform: A model's data-free wires now get the batch axis.
+
+### GPU
+
+- **Metal**: skinny f16 matmuls route through a port of MLX's `gemv_wide`; contiguous `softmax_nd3` gets a fast path.
+- CUDA is optional in the Rust facade and in `tract-ffi`.
+
+### NNEF / ONNX
+
+- ONNX loader options are carried as JSON and can be passed from the facade.
+- Fix: **average pooling round-trips lost `count_include_pad`.** The serializer wrote every border as `ignore` and the deserializer built every `SumPool` with the flag false, so a pool that counts its padding came back dividing by the real elements alone (a 9/4 error on a 3x3 window holding four values), silently. The flag now rides the NNEF `border` argument: `constant` counts the pad, `ignore` leaves it out of both sum and divisor.
+- Fix: ONNX `Reshape` honours `allowzero`, rejects a `-1` that divides a zero remainder, and rejects a target shape keeping a negative dimension.
+- Fix: `GatherNd` output shape inference; GRU keeps the cell shape on the output update.
+
+### CLI / diagnostics
+
+- `hwbench` can bench the portable kernels; a new dump reports what mmm selection answers for every machine at once, drawn as a kernel matrix with one coloured cell per machine, with the cells that are closed on purpose marked as such.
+
+# 0.23.5 - 2026-08-19
+
+### GPU
+
+- **Metal Sdpa**: fused attention via ported MLX kernels.
+- **Metal pooling**: max/average pooling kernels, including channels-first tensors.
+- **Metal Resize** runs on GPU; multi-axis `Reduce` split into single-axis reduces; `reduce_nd3` threadgroups sized from the reduced axis; missing bool `BitAnd`/`BitOr`/`BitXor` kernel instantiations added.
+- **CUDA Gated DeltaNet.** Recurrent decode kernels for Qwen3.5, shared with the Metal implementation; legacy Qwen3.5 primitive names accepted on import; example decoder runner in `examples`.
+- Fix: `CudaGgmlGemm`'s contraction-dim check relaxed from strict equality to `compatible_with`.
+- Fix: cuDNN conv scratch kept off the `Send` boundary (`State`/`OpState` are now `Send + Clone` directly).
+
+### CPU / linalg
+
+- **Matmul kernel picker replaced with a per-architecture `LinearCostModel`**, fit with non-negative least squares from on-device measurements — x86 vendor cohorts, per-Apple-chip models, and small/large seed classes for cortex-a53/a55/a7/a9. The old MLP picker is retired. New `cost-model gather/fit/regen` and `hwbench` CLI subcommands support calibrating and auditing kernel choice on new hardware; matrix-vector (n=1) dispatch gets its own dedicated cost model.
+- **New kernels**: AVX-512 and AVX2+FMA SiLU; a full AVX (no-FMA/no-AVX2) f32 tile family plus sigmoid/tanh, covering Sandy/Ivy Bridge and Bulldozer-era x86_64 (1.9–2.6x over the generic fallback); a 128-bit VEX int8 kernel for that same no-FMA tier; ARMv7 NEON fused SiLU; ARMv7 NEON int8 matmul kernels wired into the picker; NEON/generic `silu_f16` and `sigmoid_f16` fallbacks for non-fp16 aarch64; `Q4_0::w4a8_gemv` (int8-dot decode GEMV).
+- **ARMv7 NEON pack transpose** for k-contiguous tiles (skipped below a small-block threshold to avoid regressing tiny shapes).
+- **Row-major output store tile**, opt-in for aligned bulk stores and used by the Apple AMX f16 kernel.
+- Squeeze/reshape ops fuse directly into `OptMatMul`'s store instead of running as separate ops.
+- Cache-block budgets for the L2/L3 tiers now account for cluster-shared caches and are decoupled from parallel chunking; parallelized `OptBin*` binary fast paths.
+- Fix: **activation range bugs across every backend.** Tanh, Sigmoid, and the fused SiLU/GELU kernels could produce values outside their mathematical range on saturating tails — fixed on x86_64 (AVX, AVX-no-FMA), ARM32/ARM64 NEON, WASM, and the scalar generic path, with new range-assertion tests.
+
+### Transformers / LLM
+
+- **Quantized KV-cache storage** (`QuantizedDynKeyValueCache`, int8/int4 packed) with cache-cost reporting; attention-sink tokens stay unquantized.
+- Flash Sdpa (f16-accumulator) now also covers grouped-query attention, and the GQA broadcast fusion looks through cache-read `Cast`/`ApplyRope` ops instead of requiring the KV cache directly under the repeat-interleave chain.
+- `examples`: nemotron-3.5 multilingual streaming ASR example (batch encoder support, `t2n>=0.24` exports)
+
+### Core / NNEF / ONNX
+
+- **ONNX Resize**: opset 18/19 completed, opset-10 asymmetric coordinates, and the `tf_half_pixel_for_nn` coordinate mode; nearest-mode now only lowers to `Tile` when that actually replicates pixels.
+- `NonZero` moved to `onnx-opl` with NNEF serialization.
+- `GatherElements` gets a last-axis fast path; `ScatterNd` and `Gather` block-copy paths now handle a non-trivial outer dimension.
+- `nnef` patch transforms can rewire any named wire, not just graph inputs.
+- Const-fold memory budget halved to 4 MiB and is now bounded by memory rather than element count.
+- Fix: `DequantizeLinearF32` no longer leaks the input's integer constant onto the F32 output fact, which tripped the outlet fact-consistency check inside a `Scan` body.
+- Fix: quantized pointwise (1x1) convs on the Metal/CUDA exec path keep their bias — the einsum→`PrefixMatMul` fusion dropped it, so that fold is now skipped there in favour of the standard requant chain.
+- Fix: `DatumType::with_qparams` no longer flips `QU8` to `QI8`; a requantized unsigned tensor stays unsigned.
+- Fix: quantized `Sign` returns 0 at the zero point.
+- Fix: malformed ONNX `TensorProto`/`GraphProto` attributes return an error instead of panicking; minimum-arity checks for `Concat`/`Squeeze`/`Gemm`; shape inference no longer panics when operands are missing; raw tensor data whose length doesn't match its declared shape is rejected.
+
+### CLI / diagnostics
+
+- **`hwbench`**: M,K,N[,dt] matmul shape probing, `--json` output, an `--assert` gate for CI, a curated default battery, and real memory-bandwidth measurement.
+- **`cost-model gather` / `fit` / `regen`** subcommands for the new `LinearCostModel` (see CPU/linalg above).
+- **`bench-diff`** subcommand and `bench-compare.sh` for comparing two bench runs.
+
+# 0.23.4 - 2026-07-08
+
+### Security / deps
+
+* RUSTSEC-2026-0204: bump crossbeam-epoch to 0.9.20 (invalid pointer deref in
+  `fmt::Display` for `Atomic`/`Shared`) (#2454).
+* RUSTSEC-2026-0190: bump anyhow to 1.0.103.
+* RUSTSEC-2026-0186: dependency refresh.
+* Drop the `ggml` dev-dependency, removing the memmap2 0.5 RustSec advisory.
+
+### GPU
+
+- **CUDA per-thread streams.** Each thread gets its own non-blocking stream;
+  cudarc cross-stream event tracking is disabled and constant uploads are
+  drained at prepare, cutting cross-stream synchronization overhead.
+- **Metal GGML matmul runs in f16.** f16 activations/output for the GGML matmul
+  (no more f32 round-trips), with the f16/f32 branch hoisted out of the hot loop
+  and activation selection done at runtime rather than by template.
+
+### CPU / linalg
+
+- **Intel AMX GEMM kernels (x86_64).** int8 (`avx512amx_mmm_i32_8x8` / `16x16`)
+  and bf16→f32 (`avx512amx_mmm_f32_16x16`, TDPBF16PS) matmul micro-kernels with
+  shape-adaptive dispatch (16x16 for large, 8x8 for small), CPUID cache-size
+  detection, and oneDNN-style prefetch. The AMX bf16 f32 path is opt-in via
+  `TRACT_AMX_BF16`.
+- **AVX-VNNI int8 GEMM kernels.** `avxvnni_mmm_i32_8x8` (ymm) and a zmm 16x16
+  AVX-512-VNNI kernel, the latter gated on runtime-probed dual 512-bit FMA
+  presence (`TRACT_AVX512_FMA_UNITS`).
+- **Cache-aware L3 blocking.** LLC/SLC-aware budget for the L3 outer blocking
+  tier, gated on the working set actually spilling the LLC (#2352).
+- **Q1_58 ternary block-quant (BitNet b1.58)** and `Q4_0::w4a8_gemv` (W4A8
+  int8-dot decode GEMV). (The former Q1_58 label was renamed to `Q2_0_T`.)
+- **Separable average pool.** Concrete-geometry pool codegen plus an opt-in
+  separable avg-pool, with an NHWC kernel.
+- **SIMD ReduceMin** mirroring the existing max reducer.
+
+### Transformers / LLM
+
+- **In-place KV cache.** Opt-in runtime-fused `InPlaceKvSdpa` op.
+- **Fused int4 MatMulNBits.** ONNX `MatMulNBits` int4 now routes through the
+  fused Q4_0 block-quant matmul.
+- **Speculative decoding example.** `examples/causal_llm` gains n-gram + draft-
+  model speculative decoding.
+
+### Core / NNEF / ONNX
+
+- **NeMo FastConformer streaming.** ONNX loader support for cache-aware
+  streaming FastConformer graphs.
+- **ONNX model metadata** exposed in `Graph.properties` (#2408).
+- **ONNX DFT**: fix onesided DFT shape inference and slice axis
+- Fix: `SimplifiedLayerNormalization` now maps to RMSNorm instead of LayerNorm
+  (#2409).
+- Fix: `Iff` constant-condition declutter broadcasts the selected branch to the
+  op's output shape when it is narrower than the broadcast result.
+- Fix: `MultiBroadcastTo` swap-with-`AxisOp` declutter no longer panics when the
+  broadcast adds leading axes (rank-mismatch and out-of-range guards).
+- Fix: `ScatterNd::eval` mutates in place instead of round-tripping the
+  destination through an owned ndarray (two fewer full copies per eval).
+- NNEF: warn on assertions bounding symbols absent from every tensor shape.
+
+### CLI / diagnostics
+
+- **`list-knobs` subcommand** listing all tunable env-var knobs, backed by a new
+  central knob registry in `tract-data`; every knob static is now named after
+  its `TRACT_`-prefixed env var.
+
+# 0.23.3 - 2026-06-19
+
+### GPU
+
+- **Native STFT / FFT on GPU.** Backend-agnostic `GpuStft` (CUDA + Metal) backed
+  by a 512-point Stockham FFT kernel, generalized to power-of-two frames
+  (256/512/1024/2048), plus inverse FFT and lowering of the standalone `Fft` op.
+
+### CPU / linalg
+
+- **SVE2 RmsNorm.** VLA SVE2 `rms_norm_f32` kernel for aarch64 SVE2 hosts.
+
+### Transformers / LLM
+
+- **KV-cache quantization (KIVI-style).** `QuantizedKvSdpa` op with packed u8
+  storage and configurable bit-width, an auto-wiring transform, and NNEF
+  de/serialization round-trip.
+
+### Core / NNEF / ONNX
+
+- **Resize / GridSample in core.** A clean `Resize` subset and `GridSample` moved
+  into `tract-core`: f16 resize, a `sizes` input on `tract_core_resize`, a clamped
+  resize floor for negative source coordinates, and a retained `grid_sample` alias.
+
+# 0.23.2 - 2026-06-16
+
+### Security
+* fix for  [CVE-2026-55832](https://github.com/sonos/tract/security/advisories/GHSA-h668-6x6g-f8r5) in tract-onnx (moderate): lack of sanitation in ONNX split tensor file paths.
+
+# 0.23.1 - 2026-06-10
+
+### Security
+ * fix for [CVE-2026-55093](https://github.com/sonos/tract/security/advisories/GHSA-x5mv-8wgw-29hg) in tract-nnef (moderate): validation of tensor shapes in NNEF .dat files to prevent of multiplication overflow in buffer size computation.
+
+### CPU / linalg
+
+- **int8 GEMM kernels across backends.** aarch64 SDOT (`FEAT_DotProd`), x86_64
+  AVX-512-VNNI (`avx512vnni_mmm_i32_8x8`), and ARM SME2 SMOPA
+  (`sme_qmmm_i32_32x32`) int8→i32 matmul micro-kernels.
+- **AVX-512 element-wise + reduction kernels.** Dedicated AVX-512 kernels for the
+  f32 and f16 activations (sigmoid, tanh, hardswish, silu, gelu, leaky_relu),
+  `erf`, `max`, and fastcompact `softmax` (f32 + f16). On AVX-512-FP16 hosts, a
+  native-f16 `hardswish` kernel is plugged in where it wins.
+- **Fused RmsNorm.** A single 2-pass kernel replaces the
+  MeanOfSquares+Add+Rsqrt+Mul composition for trailing-axis f32/f16 RmsNorm —
+  AVX-512 on x86_64, NEON on aarch64, scalar generic elsewhere.
+
+### GPU
+
+- **Constant `Pad` on GPU.** Backend-agnostic `GpuPad` (CUDA + Metal) via the
+  generic `copy_nd` path; constant mode only (Reflect/Edge stay on host).
+
+### Transformers / LLM
+
+- **Sliding-window attention.** Bounded sliding-window KV cache (ring buffer) and
+  a fused `WindowKvSdpa` op for windowed decode, with an auto-wiring transform
+  and NNEF ser/de.
+- **CPU FlashSdpa**: contiguous P·V GEMM, head-parallel execution, and a
+  sequence-length lowering heuristic.
+
+### ONNX
+
+- **GroupQueryAttention**: accept `local_window_size` (banded mask).
+- **RotaryEmbedding**: handle the `com.microsoft` contrib op.
+
+### Pulse / streaming
+
+- **FFT/STFT pulsification on non-FFT axes** via `Fft::axes_mapping` /
+  `Stft::axes_mapping` (dedicated pulsifier dropped).
+- **Scan**: caller-managed recurrent state is now detected by graph reachability
+  (and auto-enabled from ONNX) rather than an import flag;
+  `force_scan_external_state` decoupled from sequence concretization; stream
+  symbol substituted in the Scan body during pulsification.
+- **MultiBroadcastTo**: linearity-checked per-pulse size on the stream axis.
+
+### Build / CI
+
+- Toolchain consolidated on `rust-toolchain.toml` (stable channel); MSRV derived
+  from `Cargo.toml` `rust-version`; `cargo fmt` checked with stable.
+- Contributor docs added (`CLAUDE.md` / `AGENTS.md`).
+
+# 0.23.0 - 2026-05-1
+
+This section lists changes since 0.23.0-dev.5 only; the dev.2…dev.5 sections below cover the rest of the 0.22.x→0.23.0 delta.
+
+### API — breaking
+
+- **`concretize_symbols` / `substitute_symbols` renamed to `set_symbols`.** Affects `TypedModel::set_symbols`, the `SetSymbols` transform (was `ConcretizeSymbols`), and the `--transform set_symbols=...` CLI form. No deprecation aliases — call sites must be updated.
+- **`default` runtime renamed to `cpu`.** `runtime_for_name("default")` still resolves to the CPU runtime (ad-hoc alias), but `Runtime::name()` returns `"cpu"`. JSON loading configs and `--loading-config-path` payloads that pin `"default"` keep working.
+- **`nnef().with_tract_core()` removed.** The `tract_core` extension is opt-out since 0.23.0-pre — call `disable_tract_core()` instead, or just drop the `with_tract_core()?` line.
+
 
 ### CPU / linalg
 
 - **ARM SME backend (ARMv9.2-A).** New `linalg/arm64/sme` module provides SME GEMM (Phase 1) and SME2 GEMV (`sme_mmv_f32_64x1`, Phase 2A) micro-kernels for Apple M4+, Cortex-X4, and other ARMv9.2-A+ chips. Dispatch is gated on a 512-bit streaming vector length at runtime; SME2 assembler detection skips kernels when the assembler lacks support. Force via `TRACT_CPU_AARCH64_KIND=applem` (or `generic` to disable).
+- **ARMv9 SVE**: f32/f16 GEMM+GEMV and int8→i32 GEMM+GEMV kernels
 - **Apple AMX: shape-aware dispatch.** AMX kernel selection is now M/N/K-aware at runtime, yielding 5–43% wins across canary models.
 - **NEON element-wise kernels.** `HardSwish`, `SiLU`, and `GELU` get dedicated aarch64 NEON kernels wired as single graph ops.
 - **x86_64.** M-aware kernel picker; AVX-512 GEMM routed to the 16×8 / 32×5 / 32×6 kernels.
 - **WASM SIMD.** Relaxed-SIMD FMA in all MMM kernels; 32×1 GEMV kernel (8 v128 accumulators, 8-way ILP); vectorised sigmoid and tanh; `rustfft wasm_simd` enabled. Low-accumulator MMM paths recover 8–23% under `+relaxed-simd`; M-band GEMV dispatch woken up (30–37% on small-M). `Executor::RayonGlobal` for `wasm-bindgen-rayon`.
+- **WASM**: relaxed-dot int8 fast path + PackedI8K4 + SIMD int8 matmul.
 - **Multithreaded GEMM.** TLS borrow and sync hoisted out of the per-tile inner loop; 2D chunked dispatch with a small-MMM threshold avoids rayon overhead on small operands.
 - **im2col.** Contiguous-x fast path for valid (zero-padding, unit stride) convolutions; grouped lazy im2col extended; depthwise convolutions excluded from lazy im2col path; N=1/2/3 zone dispatch for depthwise.
 - **General.** Same-shape fast path in `BinMiniOp::generic_eval`; `rbytes=96/128` fast paths for mn-major packing.
 - **EinSum** Fold contiguous same-role axes in standard codegen.
 - **BLAS / SGemm integration dropped.**
+- **Cache-adaptive 2D-blocking** for the single-thread MMM tile walk; per-OS L2-size detection on Linux.
 
 ### ONNX
 
 - `Resize`: `pytorch_half_pixel` coordinate transformer.
 - `Reshape` with 0-dims and rank change fixed (issue #2104).
+-  Support for GroupQueryAttention, MultiHeadAttention, MatMulNBits (4-bit), SkipLayerNormalization, SimplifiedLayerNormalization, BiasGelu / FastGelu /
+  QuickGelu, LpNormalization, MeanVarianceNormalization, GroupNormalization, RotaryEmbedding, opset-24 Attention, Swish, Mish, Gelu, RMSNormalization.
+- LayerNorm: fixed output dtype mismatch with F16 inputs.
 
 ### NNEF
 
@@ -26,16 +298,20 @@
 ### Pulse for chunked attention layers (experimental)
 
 - **`pulse::Blockify` rewrite pass.** Translates block-diagonal multi-time-axis subgraphs into chunk-parallel form: recognises quadratic sections (EinSum terminators, `DiagGather` initiators, banded masks, Softmax body chains) and rewrites each into a per-chunk section. Covered by ex01–ex10 synthetic harness cases.
-- **`DiagGather` op** (moved from `transformers` into `core`): causal skew-trick gather with ROI-driven narrowing and re-anchoring.
+- **`DiagGather` op**: causal skew-trick gather with ROI-driven narrowing and re-anchoring.
 - **`WindowOnAxis` op**: windowed gather over the streaming axis with configurable pad value.
 - **`AxisOp::Reshape` pulsifier**: auto-inserts alignment `Delay` on streaming-axis size change.
 - Stream-axis LCM merge + slope-based per-pulse sizing for `Range`.
+- **Scan body state reused across iterations** instead of reallocated per step.
+- **`scaled_masked_softmax`** gains a `bool`-mask variant and a `post_softmax_mask` variant on both cuda and metal.
+- **`GpuPulsePad`**: stride-aware initial copy fixes 26% drift on pulsified encoders where a fused move axis fed a non-contiguous view to the pad.
 
 ### Runtime / plan
 
 - Per-node shape resolve skipped once all symbols are bound.
 - `TDim::Sym` fast-path in shape resolve; lock-free `guess_scenario` on empty scope.
 - `PropagateRoi` iterates to fixed point and simplifies.
+- **Virtual runtime names `gpu` and `gpu-or-cpu`.** `runtime_for_name("gpu")` returns the first available GPU backend (cuda or metal) or errors; `"gpu-or-cpu"` falls back to CPU if none is present.
 
 ### Scan
 
@@ -53,7 +329,17 @@
 - `doc/symbolic-shapes.md`: TDim, Symbol, and how to bind them.
 - `doc/op.md`: working with a `Tensor`'s data.
 - `doc/cli-recipe.md`: `--audit-json`, `--save-outputs`, timing pitfalls, environment-variable table.
-- `README.md`: refreshed — current backends, modern examples table, Python bindings section, torch-to-nnef pointer.
+- `README.md`: refreshed — current runtimes, modern examples table, Python bindings section, torch-to-nnef pointer.
+
+### Supply chain / build / CI
+
+- **`Cargo.lock` tracked.** All workspace + binary builds are now reproducible against the same dependency snapshot.
+- **SBOMs on release binaries (CycloneDX + SPDX).** `tract-cli` release binaries are built with `cargo-auditable` (Rust dep tree embedded in the `.dep-v0` section) and shipped alongside CDX + SPDX SBOMs generated by `syft`. Both SBOMs are signed via GitHub attestations (`actions/attest-sbom` + `actions/attest-build-provenance`).
+- **PEP 770 SBOMs in Python wheels.** Wheels are built with `cargo-auditable` and have `sbom.cdx.json` + `sbom.spdx.json` injected into `.dist-info/sboms/` per PEP 770.
+- **Release builds pinned to current stable rustc** via `dtolnay/rust-toolchain@stable`.
+- **`cargo-deny` lints wired up for `tract-cli`.**
+- **zizmor SARIF upload** to GitHub's security tab.
+
 
 # 0.23.0-dev.5 - 2026-04-22
 
@@ -146,7 +432,7 @@
 - **`into_tract()` renamed to `into_model()`** in all API layers.
 - **`DatumType` variant names shortened** — the `TRACT_DATUM_TYPE_` prefix is dropped (C API).
 - **Deprecated state methods removed**: `init_states()`, `state_initializers`, and the `n_states` parameter are gone from `State` trait and `RunTensors`.
-- **Python**: `concretize_symbols` and `pulse` methods replaced by typed transform classes; `TransformSpec` is now an abstract base class.
+- **Python**: `set_symbols` and `pulse` methods replaced by typed transform classes; `TransformSpec` is now an abstract base class.
 
 ### Improvements
 

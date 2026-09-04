@@ -18,9 +18,9 @@ impl ShapeFact {
     }
 
     fn compute_concrete(&mut self) {
-        assert!(self.dims.iter().all(|d| d.to_isize().map(|d| d >= 0).unwrap_or(true)));
+        assert!(self.dims.iter().all(|d| d.as_i64().map(|d| d >= 0).unwrap_or(true)));
         self.concrete =
-            self.dims.iter().map(|d| d.to_usize()).collect::<TractResult<TVec<_>>>().ok()
+            self.dims.iter().map(|d| d.as_i64().map(|d| d as usize)).collect::<Option<TVec<_>>>()
     }
 
     /// Shape of the tensor, unless it has symbolic dimensions.
@@ -152,8 +152,7 @@ impl ShapeFact {
 
     pub fn consistent(&self) -> TractResult<()> {
         ensure!(
-            self.concrete
-                == self.dims.iter().map(|d| d.to_usize()).collect::<TractResult<TVec<_>>>().ok()
+            self.concrete == self.dims.iter().map(|d| d.as_usize()).collect::<Option<TVec<_>>>()
         );
         Ok(())
     }
@@ -328,12 +327,11 @@ impl TypedFact {
                 bail!("fact says {}, constant is {:?}", self.format_dt_shape_nocheck(), k);
             }
             if let Some(bqf) = self.exotic_fact().and_then(|of| of.downcast_ref::<BlockQuantFact>())
+                && let Some(bqs) = k.storage_as::<BlockQuantStorage>()
             {
-                if let Some(bqs) = k.storage_as::<BlockQuantStorage>() {
-                    let inner_bqf =
-                        BlockQuantFact::new(dyn_clone::clone_box(bqs.format()), k.shape().into());
-                    ensure!(&inner_bqf == bqf, "BlockQuantStorage fact mismatch");
-                }
+                let inner_bqf =
+                    BlockQuantFact::new(dyn_clone::clone_box(bqs.format()), k.shape().into());
+                ensure!(&inner_bqf == bqf, "BlockQuantStorage fact mismatch");
             }
         }
         if let Some(u) = &self.uniform
@@ -397,8 +395,10 @@ impl Fact for TypedFact {
             return Ok(false);
         }
         for i in 0..t.rank() {
-            if let Ok(dim) =
-                self.shape[i].eval(symbols.unwrap_or(&SymbolValues::default())).to_usize()
+            if let Some(dim) = self.shape[i]
+                .eval(symbols.unwrap_or(&SymbolValues::default()))
+                .as_i64()
+                .map(|d| d as usize)
                 && dim != t.shape()[i]
             {
                 return Ok(false);

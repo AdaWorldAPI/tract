@@ -15,19 +15,13 @@ impl Op for BlockQuantIntoShape {
 }
 
 impl EvalOp for BlockQuantIntoShape {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn state(
-        &self,
-        _session: &TurnState,
-        _node_id: usize,
-    ) -> TractResult<Option<Box<dyn OpState>>> {
+    fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(None)
     }
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs).into_tensor();
         let g = input.shape()[0];
         let bqs = input.try_storage_as::<BlockQuantStorage>()?.clone();
@@ -71,19 +65,13 @@ impl Op for SplitGroupBlockQuant {
 }
 
 impl EvalOp for SplitGroupBlockQuant {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn state(
-        &self,
-        _session: &TurnState,
-        _node_id: usize,
-    ) -> TractResult<Option<Box<dyn OpState>>> {
+    fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(None)
     }
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs);
         let bqs = input.try_storage_as::<BlockQuantStorage>()?.clone();
         let mut new_shape: TVec<usize> = input.shape().into();
@@ -105,7 +93,7 @@ impl TypedOp for SplitGroupBlockQuant {
         let o: usize = input.shape[0].to_usize()?;
         ensure!(o % self.group == 0);
         let mut new_shape: TVec<usize> =
-            input.shape.iter().map(|d| d.to_usize()).collect::<TractResult<_>>()?;
+            input.shape.iter().map(|d| d.to_usize()).collect::<Result<_, _>>()?;
         new_shape[0] = o / self.group;
         new_shape.insert(0, self.group);
         let exotic_fact = BlockQuantFact::new(bqf.format.clone(), new_shape.clone());

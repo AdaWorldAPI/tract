@@ -1,32 +1,12 @@
 use crate::axes::Axis;
 use crate::internal::*;
 use ndarray::*;
-use tract_linalg::WeightType;
 use tract_linalg::block_quant::{
     BlockQuantStorage, PackedBlockQuantFact, PackedBlockQuantFormat, block_quant_slice,
 };
 use tract_linalg::mmm::{MMMInputFormat, MMMInputValue, PackedMatrixStorage};
-use tract_linalg::pack::{PackedFormat, PackedI8K4};
 
 use super::ModePicker;
-
-// Pack one (possibly strided) view with a dynamic packing format. Keeps the
-// PackedFormat fast path byte-identical; routes the K=4-inner SMOPA packer
-// (PackedI8K4) through its view packer. Other formats are unsupported here.
-fn pack_view_with(
-    packer: &dyn MMMInputFormat,
-    t: &TensorView,
-    k_axis: usize,
-    mn_axis: usize,
-) -> TractResult<Box<dyn MMMInputValue>> {
-    if let Some(pf) = packer.downcast_ref::<PackedFormat>() {
-        pf.pack_tensor_view(t, k_axis, mn_axis)
-    } else if let Some(p4) = packer.downcast_ref::<PackedI8K4>() {
-        p4.pack_view(t, k_axis, mn_axis)
-    } else {
-        bail!("OptMatMulPack does not support packing format {packer:?}")
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OptMatMulPack {
@@ -49,17 +29,10 @@ impl Op for OptMatMulPack {
 }
 
 impl EvalOp for OptMatMulPack {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        _node_id: usize,
-        session: &TurnState,
-        mut inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
-        self.do_eval(session, inputs.remove(0))
+    fn eval(&self, ctx: &EvalContext, mut inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        self.do_eval(ctx, inputs.remove(0))
     }
 }
 
@@ -101,22 +74,22 @@ impl TypedOp for OptMatMulPack {
 }
 
 impl OptMatMulPack {
-    fn do_eval(&self, _session: &TurnState, input: TValue) -> TractResult<TVec<TValue>> {
+    fn do_eval(&self, _ctx: &EvalContext, input: TValue) -> TractResult<TVec<TValue>> {
         unsafe {
             let mode = self.mode_picker.pick(input.shape()[self.mn_axis])?;
             let packer = &self.packers[mode];
             let output_shape: TVec<usize> = self.output_shape(input.shape());
             let stores = if output_shape.iter().all(|d| *d == 1) {
-                let packed = pack_view_with(&**packer, &input.view(), self.k_axis, self.mn_axis)?;
-                PackedMatrixStorage::new_batched(&output_shape, vec![packed])
+                let packed = packer.prepare_one_view(&input.view(), self.k_axis, self.mn_axis)?;
+                PackedMatrixStorage::new_batched(&output_shape, tvec![packed])
                     .into_tensor(input.datum_type())
             } else {
                 let mut bc_shape: TVec<usize> = input.shape().into();
                 bc_shape[self.k_axis] = 1;
                 bc_shape[self.mn_axis] = 1;
 
-                let mut values: Vec<Box<dyn MMMInputValue>> =
-                    Vec::with_capacity(output_shape.iter().product());
+                let mut values: TVec<Box<dyn MMMInputValue>> =
+                    TVec::with_capacity(output_shape.iter().product());
                 for coord in indices(&*bc_shape) {
                     let offset = coord
                         .as_array_view()
@@ -125,12 +98,9 @@ impl OptMatMulPack {
                         .map(|(x, s)| *x as isize * s)
                         .sum::<isize>()
                         * input.datum_type().size_of() as isize;
-                    values.push(pack_view_with(
-                        &**packer,
-                        &TensorView::from_bytes(&input, offset, input.shape(), input.strides()),
-                        self.k_axis,
-                        self.mn_axis,
-                    )?);
+                    let view =
+                        TensorView::from_bytes(&input, offset, input.shape(), input.strides());
+                    values.push(packer.prepare_one_view(&view, self.k_axis, self.mn_axis)?);
                 }
                 PackedMatrixStorage::new_batched(&output_shape, values)
                     .into_tensor(input.datum_type())
@@ -156,12 +126,7 @@ pub struct DynPackedExoticFact {
 
 impl ExoticFact for DynPackedExoticFact {
     fn buffer_sizes(&self) -> TVec<TDim> {
-        let elem_bytes = match self.packers[0].precursor() {
-            WeightType::Plain(dt) => dt.size_of(),
-            // OptMatMulPack only ever carries plain (PackedFormat / PackedI8K4) packers.
-            WeightType::BlockQuant(_) => 1,
-        };
-        tvec!(self.k.clone() * &self.mn * elem_bytes)
+        tvec!(self.packers[0].mem_size(self.k.clone(), self.mn.clone()))
     }
 }
 
@@ -180,19 +145,13 @@ impl Op for OptSimpleMatMulPack {
 }
 
 impl EvalOp for OptSimpleMatMulPack {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn state(
-        &self,
-        _session: &TurnState,
-        _node_id: usize,
-    ) -> TractResult<Option<Box<dyn OpState>>> {
+    fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(None)
     }
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs);
         let bqs = input.try_storage_as::<BlockQuantStorage>()?;
         // Leading dims before the last 2 (M, K) are batch/group dims
@@ -205,7 +164,7 @@ impl EvalOp for OptSimpleMatMulPack {
                 let iv: Box<dyn MMMInputValue> = Box::new(self.packed_format.pack(slice, k)?);
                 Ok(iv)
             })
-            .collect::<TractResult<Vec<_>>>()?;
+            .collect::<TractResult<TVec<_>>>()?;
         let leading_shape = &input.shape()[..input.rank().saturating_sub(2)];
         let output =
             PackedMatrixStorage::new_batched(leading_shape, values).into_tensor(input.datum_type());

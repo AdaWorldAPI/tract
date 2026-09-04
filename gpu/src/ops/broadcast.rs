@@ -22,28 +22,20 @@ impl Op for GpuMultiBroadcastTo {
 }
 
 impl EvalOp for GpuMultiBroadcastTo {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input_value = args_1!(inputs);
         let input = input_value.to_device_tensor()?;
-        let shape = self.shape.eval_to_usize(&session.resolved_symbols)?;
-        let output = crate::session_handler::make_tensor_for_node(
-            session,
-            node_id,
-            input.datum_type(),
-            &shape,
-        )?;
+        let shape = self.shape.eval_to_usize(ctx.symbols)?;
+        let output = crate::turn_handler::make_tensor_for_node(ctx, input.datum_type(), &shape)?;
 
-        // Pad input shape/strides to output rank for broadcasting
-        let mut input_strides = vec![input.strides()[0]; output.rank() - input.rank()];
+        // Pad input shape/strides to output rank for broadcasting.  The padded
+        // axes have dim 1, so `compute_broadcast_strides` zeroes their stride
+        // whatever it is given -- which is what lets a rank-0 input, whose
+        // `strides()` is empty, broadcast at all.
+        let pad_stride = input.strides().first().copied().unwrap_or(1);
+        let mut input_strides = vec![pad_stride; output.rank() - input.rank()];
         input_strides.extend(input.strides());
         let mut input_shape = vec![1usize; output.rank() - input.rank()];
         input_shape.extend(input.shape());

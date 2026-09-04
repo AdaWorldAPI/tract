@@ -28,15 +28,15 @@ fn declutter_xor(
     node: &TypedNode,
 ) -> TractResult<Option<TypedModelPatch>> {
     // Xor(x, 1) = Not(x)
-    if let Some(uniform) = crate::ops::binary::one_input_is_uniform(model, node)? {
-        if tensor0(1i64).close_enough(&uniform.uni, false).is_ok() {
-            return Ok(Some(TypedModelPatch::replace_single_op(
-                model,
-                node,
-                &[uniform.var],
-                crate::ops::element_wise::ElementWiseOp(Box::new(Not {}), None),
-            )?));
-        }
+    if let Some(uniform) = crate::ops::binary::one_input_is_uniform(model, node)?
+        && tensor0(1i64).close_enough(&uniform.uni, false).is_ok()
+    {
+        return Ok(Some(TypedModelPatch::replace_single_op(
+            model,
+            node,
+            &[uniform.var],
+            crate::ops::element_wise::ElementWiseOp(Box::new(Not {}), None),
+        )?));
     }
     Ok(None)
 }
@@ -74,11 +74,9 @@ impl Op for Iff {
 }
 
 impl EvalOp for Iff {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (cond, t, f) = args_3!(inputs);
         anyhow::ensure!(t.datum_type() == f.datum_type());
         let shape: TVec<usize> = multi_broadcast(&[cond.shape(), t.shape(), f.shape()])?;
@@ -153,12 +151,12 @@ impl TrueRange {
 
 pub(crate) fn classify_true_range(expr: &TDim, shape: &ShapeFact) -> Option<TrueRange> {
     fn try_ge(ge: &TDim, shape: &ShapeFact) -> Option<(usize, TDim)> {
-        if let TDim::Ge(lhs, rhs) = ge {
-            if let TDim::Sym(sym) = &**lhs {
-                let k = sym_to_coord_axis(sym)?;
-                if k < shape.rank() && !rhs.symbols().contains(sym) {
-                    return Some((k, *rhs.clone()));
-                }
+        if let TDim::Ge(lhs, rhs) = ge
+            && let TDim::Sym(sym) = &**lhs
+        {
+            let k = sym_to_coord_axis(sym)?;
+            if k < shape.rank() && !rhs.symbols().contains(sym) {
+                return Some((k, *rhs.clone()));
             }
         }
         None
@@ -241,7 +239,17 @@ impl TypedOp for Iff {
         rule_if_let!(Ok(cond_val) = uniform.cast_to_scalar::<bool>());
         let branch = if cond_val { node.inputs[1] } else { node.inputs[2] };
         let mut patch = TypedModelPatch::default();
-        let wire = patch.tap_model(model, branch)?;
+        let mut wire = patch.tap_model(model, branch)?;
+        // The output shape is the broadcast of all three inputs; the selected
+        // branch may be narrower and must be broadcast up, not shunted as is.
+        let out_shape = &model.outlet_fact(node.id.into())?.shape;
+        if &model.outlet_fact(branch)?.shape != out_shape {
+            wire = patch.wire_node(
+                format!("{}.broadcast", node.name),
+                crate::ops::array::MultiBroadcastTo::new(out_shape.clone()),
+                &[wire],
+            )?[0];
+        }
         patch.shunt_outside(model, node.id.into(), wire)?;
         Ok(Some(patch))
     }
@@ -546,6 +554,36 @@ mod tests {
         assert!(t_unsq_fact.uniform_tdim.is_some(), "t_unsq should have uniform_tdim");
         assert!(lt_fact.uniform_tdim.is_some(), "lt should have uniform_tdim");
 
+        Ok(())
+    }
+
+    /// Iff(const_cond, t, f) where the selected branch is narrower than the
+    /// output (which is the broadcast of cond and both branches).  The fold
+    /// must broadcast the branch up; shunting it as-is fails patch
+    /// validation ("Trying to substitute a 1,2,3 by 1,2,1").
+    #[test]
+    fn iff_fold_broadcasts_narrower_branch() -> TractResult<()> {
+        let mut model = TypedModel::default();
+        let cond = model.wire_node(
+            "cond",
+            crate::ops::konst::Const::new(
+                Tensor::from_shape(&[1, 2, 3], &[false; 6])?.into_arc_tensor(),
+            )?,
+            &[],
+        )?[0];
+        let then = model.add_source("then", f32::fact([1, 2, 3]))?;
+        let otherwise = model.add_source("else", f32::fact([1, 2, 1]))?;
+        let iff = model.wire_node("iff", Iff, &[cond, then, otherwise])?[0];
+        model.select_output_outlets(&[iff])?;
+
+        let model = model.into_decluttered()?;
+
+        let iff_count = model.nodes().iter().filter(|n| n.op_as::<Iff>().is_some()).count();
+        assert_eq!(iff_count, 0, "Expected Iff to be folded");
+        assert_eq!(
+            model.output_fact(0)?.shape.to_tvec(),
+            tvec![1.to_dim(), 2.to_dim(), 3.to_dim()]
+        );
         Ok(())
     }
 }

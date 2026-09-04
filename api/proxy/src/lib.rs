@@ -144,19 +144,41 @@ wrapper!(Onnx, TractOnnx, tract_onnx_destroy);
 
 impl OnnxInterface for Onnx {
     type InferenceModel = InferenceModel;
-    fn load(&self, path: impl AsRef<Path>) -> Result<InferenceModel> {
+
+    fn load_with_options(
+        &self,
+        path: impl AsRef<Path>,
+        options: impl Into<OnnxOptionsSpec>,
+    ) -> Result<InferenceModel> {
         let path = path.as_ref();
         let path = CString::new(
             path.to_str().with_context(|| format!("Failed to re-encode {path:?} to uff-8"))?,
         )?;
+        let options = CString::new(options.into().to_json())?;
         let mut model = null_mut();
-        check!(sys::tract_onnx_load(self.0, path.as_ptr(), &mut model))?;
+        check!(sys::tract_onnx_load_with_options(
+            self.0,
+            path.as_ptr(),
+            options.as_ptr(),
+            &mut model
+        ))?;
         Ok(InferenceModel(model))
     }
 
-    fn load_buffer(&self, data: &[u8]) -> Result<InferenceModel> {
+    fn load_buffer_with_options(
+        &self,
+        data: &[u8],
+        options: impl Into<OnnxOptionsSpec>,
+    ) -> Result<InferenceModel> {
+        let options = CString::new(options.into().to_json())?;
         let mut model = null_mut();
-        check!(sys::tract_onnx_load_buffer(self.0, data.as_ptr() as _, data.len(), &mut model))?;
+        check!(sys::tract_onnx_load_buffer_with_options(
+            self.0,
+            data.as_ptr() as _,
+            data.len(),
+            options.as_ptr(),
+            &mut model
+        ))?;
         Ok(InferenceModel(model))
     }
 }
@@ -501,7 +523,7 @@ impl Clone for State {
     }
 }
 
-// Safety: the underlying FrozenState is Send
+// Safety: the handle exclusively owns a `tract::State`, which is Send.
 unsafe impl Send for State {}
 
 impl StateInterface for State {

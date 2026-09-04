@@ -1,10 +1,11 @@
 #[cfg(target_vendor = "apple")]
 extern crate tract_metal;
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
 extern crate tract_cuda;
 extern crate tract_transformers;
 
+use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::io::Cursor;
 use std::path::Path;
@@ -39,7 +40,8 @@ pub mod prelude {
 
     // User-facing API types
     pub use tract_api::{
-        ConcretizeSymbols, Datum, DatumType, FloatPrecision, Pulse, TransformSpec, tensor,
+        Datum, DatumType, FloatPrecision, OnnxOptions, OnnxOptionsSpec, Pulse, SetSymbols,
+        TransformSpec, tensor,
     };
 
     // Traits needed for method resolution — hidden from namespace
@@ -148,15 +150,66 @@ impl Debug for Onnx {
     }
 }
 
+/// Apply `assertions` to a freshly parsed model.
+///
+/// They are applied after the parse on purpose: an assertion only has to hold
+/// before shapes are unified, which happens later, so nothing needs threading a
+/// SymbolScope into the ONNX parser.
+fn apply_assertions(
+    model: &tract_onnx::prelude::InferenceModel,
+    assertions: &[String],
+) -> Result<()> {
+    for assertion in assertions {
+        model
+            .symbols
+            .add_assertion(assertion)
+            .with_context(|| format!("Adding assertion {assertion:?}"))?;
+    }
+    Ok(())
+}
+
+impl Onnx {
+    /// The loader to parse with.
+    ///
+    /// Borrows unless an option actually changes something. `Onnx` owns an
+    /// `OnnxOpRegister`, a `HashMap<String, OpBuilder>` with 182 entries, and
+    /// `with_ignore_value_info` takes `self` by value, so the obvious spelling
+    /// copies that map on every load whether or not any option is set. Measured
+    /// at 5.6 us per clone against a 19 ms load, so this is tidiness rather than
+    /// a fix: a caller that asks for nothing should get exactly what it got
+    /// before.
+    fn loader(&self, options: &OnnxOptions) -> Cow<'_, tract_onnx::Onnx> {
+        if options.ignore_value_info {
+            Cow::Owned(self.0.clone().with_ignore_value_info(true))
+        } else {
+            Cow::Borrowed(&self.0)
+        }
+    }
+}
+
 impl OnnxInterface for Onnx {
     type InferenceModel = InferenceModel;
-    fn load(&self, path: impl AsRef<Path>) -> Result<Self::InferenceModel> {
-        Ok(InferenceModel(self.0.model_for_path(path)?))
+
+    fn load_with_options(
+        &self,
+        path: impl AsRef<Path>,
+        options: impl Into<OnnxOptionsSpec>,
+    ) -> Result<Self::InferenceModel> {
+        let options = options.into().parse()?;
+        let model = self.loader(&options).model_for_path(path)?;
+        apply_assertions(&model, &options.assertions)?;
+        Ok(InferenceModel(model))
     }
 
-    fn load_buffer(&self, data: &[u8]) -> Result<Self::InferenceModel> {
-        let m = self.0.model_for_read(&mut Cursor::new(data))?;
-        Ok(InferenceModel(m))
+    fn load_buffer_with_options(
+        &self,
+        data: &[u8],
+        options: impl Into<OnnxOptionsSpec>,
+    ) -> Result<Self::InferenceModel> {
+        let options = options.into().parse()?;
+        let model = self.loader(&options).model_for_read(&mut Cursor::new(data))?;
+        apply_assertions(&model, &options.assertions)?;
+        Ok(InferenceModel(model))
     }
 }
 
@@ -345,12 +398,14 @@ impl RunnableInterface for Runnable {
     type Fact = Fact;
 
     fn run(&self, inputs: impl IntoInputs<Tensor>) -> Result<Vec<Tensor>> {
-        StateInterface::run(&mut self.spawn_state()?, inputs.into_inputs()?)
+        let inputs: TVec<TValue> =
+            inputs.into_inputs()?.into_iter().map(|v| v.0.into_tvalue()).collect();
+        let outputs = self.0.run(inputs)?;
+        Ok(outputs.into_iter().map(|t| Tensor(t.into_arc_tensor())).collect())
     }
 
     fn spawn_state(&self) -> Result<State> {
-        let state = self.0.spawn()?;
-        Ok(State(Some(state.freeze_into())))
+        Ok(State(Some(self.0.spawn()?)))
     }
 
     fn input_count(&self) -> Result<usize> {
@@ -421,7 +476,7 @@ impl RunnableInterface for Runnable {
 }
 
 // STATE
-pub struct State(Option<Box<dyn tract_nnef::internal::FrozenState>>);
+pub struct State(Option<Box<dyn tract_nnef::internal::State>>);
 
 impl Debug for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -431,12 +486,9 @@ impl Debug for State {
 
 impl Clone for State {
     fn clone(&self) -> Self {
-        State(self.0.as_ref().map(|s| tract_nnef::tract_core::dyn_clone::clone_box(&**s)))
+        State(self.0.clone())
     }
 }
-
-// Safety: FrozenState is Send
-unsafe impl Send for State {}
 
 impl StateInterface for State {
     type Fact = Fact;
@@ -453,10 +505,9 @@ impl StateInterface for State {
     fn run(&mut self, inputs: impl IntoInputs<Tensor>) -> Result<Vec<Tensor>> {
         let inputs: TVec<TValue> =
             inputs.into_inputs()?.into_iter().map(|v| v.0.into_tvalue()).collect();
-        let frozen = self.0.take().context("State has been invalidated")?;
-        let mut state = frozen.unfreeze();
+        let mut state = self.0.take().context("State has been invalidated")?;
         let outputs = state.run(inputs)?;
-        self.0 = Some(state.freeze_into());
+        self.0 = Some(state);
         Ok(outputs.into_iter().map(|t| Tensor(t.into_arc_tensor())).collect())
     }
 }
@@ -603,7 +654,7 @@ impl DimInterface for Dim {
     }
 
     fn to_int64(&self) -> Result<i64> {
-        self.0.to_i64()
+        Ok(self.0.to_i64()?)
     }
 }
 

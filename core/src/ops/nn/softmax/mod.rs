@@ -12,25 +12,13 @@ use tract_num_traits::Zero;
 
 use crate::internal::*;
 use ndarray::prelude::*;
+use tract_linalg::routines::Func;
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Default)]
 pub enum SoftmaxKind {
-    Softmax(SoftmaxExp),
-    LogSoftmax,
-}
-
-impl Default for SoftmaxKind {
-    fn default() -> Self {
-        SoftmaxKind::Softmax(SoftmaxExp::default())
-    }
-}
-
-#[derive(Debug, Copy, Clone, Hash, Default, PartialEq, Eq)]
-pub enum SoftmaxExp {
     #[default]
-    Libc,
-    // https://nic.schraudolph.org/pubs/Schraudolph99.pdf
-    FastCompact,
+    Softmax,
+    LogSoftmax,
 }
 
 #[derive(Debug, Clone, new, Hash, Default, PartialEq, Eq)]
@@ -43,17 +31,13 @@ pub struct Softmax {
 impl Op for Softmax {
     fn name(&self) -> StaticName {
         match self.kind {
-            SoftmaxKind::Softmax(_) => "Softmax".into(),
+            SoftmaxKind::Softmax => "Softmax".into(),
             SoftmaxKind::LogSoftmax => "LogSoftmax".into(),
         }
     }
 
     fn info(&self) -> TractResult<Vec<String>> {
-        let mut infos = vec![format!("Axis: {:?}", self.axes)];
-        if let SoftmaxKind::Softmax(exp) = self.kind {
-            infos.push(format!("Exp impl: {exp:?}"))
-        };
-        Ok(infos)
+        Ok(vec![format!("Axis: {:?}", self.axes)])
     }
 
     op_as_typed_op!();
@@ -127,11 +111,9 @@ impl TypedOp for Softmax {
 }
 
 impl EvalOp for Softmax {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs);
         let dt = input.datum_type();
 
@@ -151,7 +133,55 @@ impl Softmax {
     where
         T: Float + Datum + std::iter::Sum,
     {
-        let mut iterating_shape: TVec<usize> = input.shape().into();
+        let mut output = input.into_tensor();
+
+        // Fast path: when the softmax axes are the trailing axes of a
+        // C-contiguous tensor, the buffer is [n_rows, row_len] row-major
+        // (row_len = product of the softmax dims), so every softmax region is
+        // one contiguous row. Rows split across threads while each row's
+        // reduction stays serial, keeping the result bit-identical.
+        let rank = output.rank();
+        let mut sm_axes: TVec<usize> = self.axes.clone();
+        sm_axes.sort_unstable();
+        let trailing = !sm_axes.is_empty()
+            && sm_axes.len() <= rank
+            && sm_axes.iter().enumerate().all(|(i, &a)| a == rank - sm_axes.len() + i);
+        if trailing
+            && matches!(T::datum_type(), DatumType::F32 | DatumType::F16)
+            && output.strides() == &*Tensor::natural_strides(output.shape())
+        {
+            let row_len: usize = sm_axes.iter().map(|&a| output.shape()[a]).product();
+            if row_len > 0 {
+                let kind = self.kind;
+                let mut output_plain = output.try_as_plain_mut()?;
+                // Dtype-concrete `as_slice_mut` (checked, no transmute) since T is
+                // f32/f16 here; keeps this core path free of new `unsafe`.
+                if T::datum_type() == f32::datum_type() {
+                    let data = output_plain.as_slice_mut::<f32>()?;
+                    let total = data.len();
+                    tract_linalg::multithread::par_chunks_mut(data, row_len, total, |_, chunk| {
+                        for row in chunk.chunks_mut(row_len) {
+                            self.softmax_inner_slice_f32(row, kind)?;
+                        }
+                        Ok(())
+                    })?;
+                } else {
+                    let data = output_plain.as_slice_mut::<f16>()?;
+                    let total = data.len();
+                    tract_linalg::multithread::par_chunks_mut(data, row_len, total, |_, chunk| {
+                        for row in chunk.chunks_mut(row_len) {
+                            self.softmax_inner_slice_f16(row, kind)?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                return Ok(tvec!(output.into_tvalue()));
+            }
+        }
+
+        // Slow path: strided or non-trailing axes, iterated with ndarray view
+        // collapsing (the contiguous-row fast path above did not apply).
+        let mut iterating_shape: TVec<usize> = output.shape().into();
 
         for i in 0..iterating_shape.len() {
             if self.axes.contains(&i) {
@@ -159,7 +189,6 @@ impl Softmax {
             }
         }
 
-        let mut output = input.into_tensor();
         let mut output_plain = output.try_as_plain_mut()?;
         let mut view = output_plain.to_array_view_mut::<T>()?;
 
@@ -225,31 +254,29 @@ impl Softmax {
     }
 
     fn softmax_inner_slice_f16(&self, slice: &mut [f16], kind: SoftmaxKind) -> TractResult<()> {
-        let max = (tract_linalg::ops().max_f16)().run(slice)?;
+        let max = Func::ReduceMax.reduce_f16()?.run(slice)?;
         match kind {
-            SoftmaxKind::Softmax(exp_impl) => {
-                let sum = match exp_impl {
-                    SoftmaxExp::Libc => {
-                        let mut s = f16::zero();
-                        slice.iter_mut().for_each(|x| {
-                            *x = (*x - max).exp();
-                            s += *x;
-                        });
-                        s
-                    }
-                    SoftmaxExp::FastCompact => (tract_linalg::ops().softmax2_fastcompact_f16)()
-                        .run_with_params(slice, max)?,
-                };
-                let rsum = sum.recip();
-                (tract_linalg::ops().mul_by_scalar_f16)().run_with_params(slice, rsum)?;
+            SoftmaxKind::Softmax => {
+                // f16 softmax runs the scalar libm exp and accumulates the sum
+                // in f32: a row long enough for the running sum to outgrow its
+                // own terms stalls in f16, costing double digits of relative
+                // error by a few thousand elements. A vectorized f16 exp is not
+                // worth its fragility, f16 softmax always lands here.
+                let mut sum = 0f32;
+                slice.iter_mut().for_each(|x| {
+                    *x = (*x - max).exp();
+                    sum += x.to_f32();
+                });
+                let rsum = f16::from_f32(sum.recip());
+                Func::MulByScalar.ew_f16_param()?.run_with_params(slice, rsum)?;
             }
             SoftmaxKind::LogSoftmax => {
-                let mut exp_sum = f16::zero();
+                let mut exp_sum = 0f32;
                 slice.iter_mut().for_each(|x| {
                     *x -= max;
-                    exp_sum += x.exp();
+                    exp_sum += x.exp().to_f32();
                 });
-                let log_sum = exp_sum.ln();
+                let log_sum = f16::from_f32(exp_sum.ln());
                 slice.iter_mut().for_each(|x| *x -= log_sum);
             }
         }
@@ -257,23 +284,12 @@ impl Softmax {
     }
 
     fn softmax_inner_slice_f32(&self, slice: &mut [f32], kind: SoftmaxKind) -> TractResult<()> {
-        let max = (tract_linalg::ops().max_f32)().run(slice)?;
+        let max = Func::ReduceMax.reduce_f32()?.run(slice)?;
         match kind {
-            SoftmaxKind::Softmax(exp_impl) => {
-                let sum = match exp_impl {
-                    SoftmaxExp::Libc => {
-                        let mut s = f32::zero();
-                        slice.iter_mut().for_each(|x| {
-                            *x = (*x - max).exp();
-                            s += *x;
-                        });
-                        s
-                    }
-                    SoftmaxExp::FastCompact => (tract_linalg::ops().softmax2_fastcompact_f32)()
-                        .run_with_params(slice, max)?,
-                };
+            SoftmaxKind::Softmax => {
+                let sum = Func::Softmax2.map_reduce_f32()?.run_with_params(slice, max)?;
                 let rsum = sum.recip();
-                (tract_linalg::ops().mul_by_scalar_f32)().run_with_params(slice, rsum)?;
+                Func::MulByScalar.ew_f32_param()?.run_with_params(slice, rsum)?;
             }
             SoftmaxKind::LogSoftmax => {
                 let mut exp_sum = f32::zero();
@@ -298,7 +314,7 @@ fn softmax_inner<T: Float + Datum + std::iter::Sum, D: Dimension>(
     view.mapv_inplace(|x| x - max);
     let exp_sum = view.iter().map(|&x| x.exp()).sum();
     match kind {
-        SoftmaxKind::Softmax(_) => {
+        SoftmaxKind::Softmax => {
             view.mapv_inplace(|x| x.exp() / exp_sum);
         }
         SoftmaxKind::LogSoftmax => {
@@ -459,7 +475,7 @@ mod test {
                 Softmax { axes: self.axes.clone(), quant_output_dt, ..Softmax::default() };
 
             // Compute quantized output
-            let result = softmax.eval(inputs)?;
+            let result = softmax.eval(&EvalContext::out_of_plan(), inputs)?;
             let result = args_1!(result);
             let result_float = result.cast_to::<f32>()?;
 
@@ -467,7 +483,7 @@ mod test {
             let input_float = self.data.cast_to::<f32>()?;
             let inputs_float = tvec!(input_float.into_owned().into_tvalue());
             let softmax_float = Softmax { axes: self.axes.clone(), ..Softmax::default() };
-            let reference_float = softmax_float.eval(inputs_float)?;
+            let reference_float = softmax_float.eval(&EvalContext::out_of_plan(), inputs_float)?;
             let reference_array = args_1!(reference_float);
             let reference = reference_array.to_plain_array_view::<f32>()?;
 
@@ -531,15 +547,14 @@ mod test {
                 self.data.iter().map(|it| (*it as f32 - in_zero_point as f32) * in_scale).collect();
             let mut in_float_array = Array1::from_vec(in_float);
             softmax_inner(in_float_array.view_mut(), SoftmaxKind::default());
-            let rescaled_output = in_float_array
+            in_float_array
                 .iter()
                 .map(|it| {
                     ((*it / out_scale).round() as i32 + out_zero_point)
                         .max(u8::MIN as i32)
                         .min(u8::MAX as i32) as u8
                 })
-                .collect();
-            rescaled_output
+                .collect()
         }
 
         fn quantized(&self) -> Vec<u8> {
@@ -738,6 +753,38 @@ mod test {
 
         let prob = InnerSoftmaxProblem { in_qp, out_qp, data };
         prob.check()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod f16_accumulator {
+    use super::*;
+
+    /// The f16 row must stay close to the same softmax evaluated in f32. A row
+    /// long enough for the running sum to outgrow its own terms is the case an
+    /// f16 accumulator silently drops.
+    #[test]
+    fn long_rows_keep_their_normalisation() -> TractResult<()> {
+        for len in [1024usize, 4096, 8192] {
+            let logits: Vec<f32> = (0..len).map(|i| ((i as f32) * 0.7).sin() * 0.5).collect();
+
+            let mut half: Vec<f16> = logits.iter().map(|v| f16::from_f32(*v)).collect();
+            Softmax::new(tvec![0], None, SoftmaxKind::Softmax)
+                .softmax_inner_slice_f16(&mut half, SoftmaxKind::Softmax)?;
+
+            let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = logits.iter().map(|v| (v - max).exp()).collect();
+            let total: f32 = exps.iter().sum();
+
+            let got: f32 = half.iter().map(|v| v.to_f32()).sum();
+            assert!((got - 1.0).abs() < 0.02, "len {len}: row sums to {got}, expected 1.0");
+            for (i, (h, e)) in half.iter().zip(&exps).enumerate() {
+                let want = e / total;
+                let err = (h.to_f32() - want).abs() / want.max(f32::MIN_POSITIVE);
+                assert!(err < 0.05, "len {len} lane {i}: got {h}, want {want}, rel {err}");
+            }
+        }
         Ok(())
     }
 }

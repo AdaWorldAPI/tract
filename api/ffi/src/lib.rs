@@ -6,8 +6,8 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use tract::{State, Tensor};
 use tract_api::{
     AsFact, DatumType, DimInterface, FactInterface, InferenceModelInterface, ModelInterface,
-    NnefInterface, OnnxInterface, RunnableInterface, RuntimeInterface, StateInterface,
-    TensorInterface,
+    NnefInterface, OnnxInterface, OnnxOptions, OnnxOptionsSpec, RunnableInterface,
+    RuntimeInterface, StateInterface, TensorInterface,
 };
 
 /// Used as a return type of functions that can encounter errors.
@@ -309,6 +309,58 @@ pub unsafe extern "C" fn tract_onnx_load(
         *model = std::ptr::null_mut();
         let path = CStr::from_ptr(path).to_str()?;
         let m = Box::new(TractInferenceModel((*onnx).0.load(path)?));
+        *model = Box::into_raw(m);
+        Ok(())
+    })
+}
+
+/// Read the loader options: a JSON object, or null for the defaults.
+unsafe fn read_options(options: *const c_char) -> Result<OnnxOptionsSpec> {
+    if options.is_null() {
+        return Ok(OnnxOptions::new().into());
+    }
+    Ok(unsafe { CStr::from_ptr(options) }.to_str()?.into())
+}
+
+/// Parse and load an ONNX model as a tract InferenceModel, with loader options.
+///
+/// `options` is a null-terminated utf-8 JSON object, or null for the defaults.
+/// See `OnnxOptions` in the Rust API for the fields. An unknown field is an error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tract_onnx_load_with_options(
+    onnx: *const TractOnnx,
+    path: *const c_char,
+    options: *const c_char,
+    model: *mut *mut TractInferenceModel,
+) -> TRACT_RESULT {
+    wrap(|| unsafe {
+        check_not_null!(onnx, path, model);
+        *model = std::ptr::null_mut();
+        let path = CStr::from_ptr(path).to_str()?;
+        let options = read_options(options)?;
+        let m = Box::new(TractInferenceModel((*onnx).0.load_with_options(path, options)?));
+        *model = Box::into_raw(m);
+        Ok(())
+    })
+}
+
+/// Parse and load an ONNX buffer as a tract InferenceModel, with loader options.
+///
+/// See `tract_onnx_load_with_options` for `options`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tract_onnx_load_buffer_with_options(
+    onnx: *const TractOnnx,
+    data: *const c_void,
+    len: usize,
+    options: *const c_char,
+    model: *mut *mut TractInferenceModel,
+) -> TRACT_RESULT {
+    wrap(|| unsafe {
+        check_not_null!(onnx, data, model);
+        *model = std::ptr::null_mut();
+        let data = std::slice::from_raw_parts(data as *const u8, len);
+        let options = read_options(options)?;
+        let m = Box::new(TractInferenceModel((*onnx).0.load_buffer_with_options(data, options)?));
         *model = Box::into_raw(m);
         Ok(())
     })
@@ -819,12 +871,12 @@ pub unsafe extern "C" fn tract_runtime_release(runtime: *mut *mut TractRuntime) 
 // RUNNABLE MODEL
 pub struct TractRunnable(tract::Runnable);
 
-/// Spawn a session state from a runnable model.
+/// Spawn a state from a runnable model.
 ///
 /// This function does not take ownership of the `runnable` object, it can be used again to spawn
 /// other state instances. The runnable object is internally reference counted, it will be
 /// kept alive as long as any associated `State` exists (or as long as the `runnable` is not
-/// explicitely release with `tract_runnable_release`).
+/// explicitly release with `tract_runnable_release`).
 ///
 /// `state` is a newly-created object. It should ultimately be detroyed with `tract_state_destroy`.
 #[unsafe(no_mangle)]

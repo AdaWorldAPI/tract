@@ -45,8 +45,8 @@ masked score matrix.
 Blockify recognises this pattern (the recogniser matches Mul-by-mask
 followed by either `Reduce<Sum>` or a contracting `EinSum`) and rewrites
 the second EinSum the same way as the first, with the chunk batch axis
-prepended to its subscripts.  Numerical match is verified end-to-end in
-`harness/core-proptest-pulse/tests/blockify_ex01.rs`.
+prepended to its subscripts.  Numerical match is verified end-to-end by
+this case's own `runme.sh`, against the numpy reference in `io.npz`.
 
 ## ex03-banded-reduce
 
@@ -68,8 +68,8 @@ einsum's contracted axis carries `W·k` elements per chunk instead of
 `k`.  Pulsification is non-causal: the streamed output is delayed by
 `L = upper − lower` chunks (the future-lookahead the band requires),
 flushed by feeding zero-chunks at the end of the stream.  Numerical
-match is verified end-to-end in
-`harness/core-proptest-pulse/tests/blockify_ex01.rs::ex03_*`.
+match is verified end-to-end by this case's own `runme.sh`, against the
+numpy reference in `io.npz`.
 
 ## ex04-banded-causal
 
@@ -103,3 +103,17 @@ covers `[chunk(i) - 1, chunk(i)]` — past+current).
 This exercises the contracted-axis-detection logic in
 `detect_contracted_score_axis` and the auxiliary-input windowing in
 `wire_terminator_einsum` — paths that ex01–ex04 don't reach.
+
+## ex14-batched-banded-reduce
+
+ex03's banded mask with a batch axis on the data and none on the mask, which
+is the shape every batched conformer export has: the scores are `[B, T, T]`,
+the mask is a function of position alone, and a rank-strict `mul` forces an
+`unsqueeze(mask, axes = [0])` in front of it.
+
+Pulsification windows the mask chain into a `Delay` / `PulsePad` pair, so that
+extent-1 axis decides whether the pair is one buffer for all streams or one per
+stream. `batchify_data_free` turns it into the batch axis before pulsification,
+and the case asserts the numbers are unchanged *and* that the state count is:
+a batch axis that perturbs blockify's chunk frame shows up as extra `Delay`
+states rather than as a wrong result.

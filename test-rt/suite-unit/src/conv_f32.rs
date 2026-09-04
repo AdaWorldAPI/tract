@@ -35,7 +35,6 @@ impl ConvProblem {
     }
 
     pub fn reference(&self) -> ArrayD<f32> {
-        // dbg!(self);
         assert_eq!(self.data.shape(), &*self.shape_in.shape, "inconsistent shapes in test");
         let n = *self.shape_in.n().unwrap_or(&1);
         let ci_per_g = self.shape_in.c() / self.group;
@@ -110,7 +109,6 @@ impl ConvProblem {
             .fmt
             .from_n_c_hw(self.shape_in.n().cloned().unwrap_or(1), co_per_g * self.group, shape_out)
             .unwrap();
-        // dbg!(&shape_out);
         let mut out = ArrayD::zeros(&*shape_out.shape);
         for n in 0..n {
             for g in 0..self.group {
@@ -334,15 +332,11 @@ impl Test for ConvProblem {
         approx: Approximation,
     ) -> TestResult {
         let reference = self.reference().into_tensor();
-        // dbg!(&reference);
         let mut model = self.tract()?;
-        //       dbg!(&model);
         model.declutter()?;
-        //       dbg!(&model);
         model.properties.insert("tract-rt-test.id".to_string(), rctensor0(id.to_string()));
         let mut output = runtime.prepare(model)?.run(tvec![self.data.clone().into_tvalue()])?;
         let output = output.remove(0).into_tensor();
-        // dbg!(&output);
         output.close_enough(&reference, approx)
     }
 }
@@ -351,6 +345,26 @@ pub fn suite() -> TractResult<TestSuite> {
     let mut suite = TestSuite::default();
 
     suite.add_arbitrary::<ConvProblem>("proptest", ConvProblemParams::default());
+
+    // Grouped conv (group>1, ci_per_group>1) with a unit spatial axis: the
+    // im2col matmul is batched over the group, and reshape_group carries a unit
+    // axis entangled with that batch. Absorbing the reshape into the matmul
+    // store must not fold a batch axis, else per-group packed inputs desync
+    // (OOB in storage.rs).
+    suite.add(
+        "group_reshape_absorb",
+        ConvProblem {
+            shape_in: DataFormat::CHW.from_n_c_hw(1, 4, [1, 2])?,
+            kernel_format: KernelFormat::OIHW,
+            group: 2,
+            data: ArrayD::zeros(vec![4, 1, 2]),
+            kernel: ArrayD::zeros(vec![2, 2, 1, 2]),
+            bias: None,
+            pad: PaddingSpec::Valid,
+            strides: tvec!(1, 1),
+            dilations: tvec!(1, 1),
+        },
+    );
 
     suite.add(
         "trivial_0",

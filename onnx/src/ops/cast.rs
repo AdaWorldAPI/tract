@@ -51,11 +51,7 @@ impl ElementWiseMiniOp for Cast {
             }
         } else {
             tract_hir::ops::cast::cast(self.to)
-                .eval_with_session(
-                    usize::MAX,
-                    &TurnState::default(),
-                    tvec!(t.clone().into_tvalue()),
-                )
+                .eval(&EvalContext::out_of_plan(), tvec!(t.clone().into_tvalue()))
                 .map(|mut t| t.remove(0).into_tensor())
         }
     }
@@ -67,8 +63,6 @@ impl ElementWiseMiniOp for Cast {
     ) -> TractResult<Option<TypedModelPatch>> {
         let from = model.outlet_fact(node.inputs[0])?.datum_type;
         if from == self.to {
-            Ok(Some(TypedModelPatch::replace_single_op(model, node, &node.inputs, Identity)?))
-        } else if from == TDim::datum_type() && self.to == i32::datum_type() {
             Ok(Some(TypedModelPatch::replace_single_op(model, node, &node.inputs, Identity)?))
         } else if from == String::datum_type() && self.to == f32::datum_type() {
             Ok(None)

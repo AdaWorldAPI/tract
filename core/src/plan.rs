@@ -1,23 +1,162 @@
 use std::borrow::Borrow;
-use std::cell::RefCell;
 use std::fmt::{Debug, Display};
 
 use multithread::Executor;
 
 use crate::internal::*;
 use crate::model::{Fact, Graph, OutletId};
-use crate::ops::FrozenOpState;
 use crate::ops::konst::Const;
 use crate::runtime::RunOptions;
 
 use self::order::{build_flush_list, eval_order_for_nodes, eval_order_opt_ram_for_nodes};
 
+/// Identifies one running state, so an op can key resources it manages itself
+/// per session and per node. Unique for the process; a state gets one at
+/// construction and keeps it until it is dropped, at which point the plan calls
+/// [`EvalOp::drop_session`] on every node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionId(u64);
+
+static NEXT_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl SessionId {
+    /// For evaluating an op outside any plan -- const folding, shape inference.
+    /// No state is ever built against it, so nothing keys scratch on it.
+    pub const NONE: SessionId = SessionId(u64::MAX);
+
+    fn next() -> SessionId {
+        SessionId(NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// Where one stream's state lives inside a state shared by several streams. An
+/// index into the lane axis the state's per-lane buffers are sized at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LaneId(pub usize);
+
+/// Which lane each seat of a turn's batch carries: the index is the seat, the
+/// value is the lane. `max_lanes` is the extent of the lane axis, fixed for the
+/// life of the state, so an op sizing a buffer on first eval knows how wide to
+/// make it -- a turn seating one lane of many still needs the full width.
+///
+/// A lane appears at most once, which is what makes a stream's state sequential:
+/// two seats of one turn cannot both advance the same lane. A model with no
+/// session-scoped state has nothing to address, so its seating is inert.
+///
+/// Seats and lanes both index axis 0 -- of the turn's tensors and of a laned
+/// state's buffers respectively. A runtime seating more than one lane is what
+/// must have checked that axis 0 of every stateful node is the model's batch
+/// axis; ops only assert that their input carries one stream per seat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seating {
+    lanes: Vec<LaneId>,
+    max_lanes: usize,
+}
+
+impl Seating {
+    pub fn new(max_lanes: usize, lanes: impl IntoIterator<Item = LaneId>) -> TractResult<Seating> {
+        let lanes: Vec<LaneId> = lanes.into_iter().collect();
+        for (seat, lane) in lanes.iter().enumerate() {
+            ensure!(lane.0 < max_lanes, "Seat {seat} takes lane {} of {max_lanes}", lane.0);
+            ensure!(!lanes[..seat].contains(lane), "Lane {} takes two seats in one turn", lane.0);
+        }
+        Ok(Seating { lanes, max_lanes })
+    }
+
+    /// The seating of a state one stream owns: one lane wide, that lane seated.
+    /// Every turn has a seating, and this is what an unbatched turn is.
+    pub fn single() -> Seating {
+        Seating { lanes: vec![LaneId(0)], max_lanes: 1 }
+    }
+
+    pub fn max_lanes(&self) -> usize {
+        self.max_lanes
+    }
+
+    pub fn lanes(&self) -> &[LaneId] {
+        &self.lanes
+    }
+
+    /// Seats filled this turn, i.e. the extent of the batch axis of the tensors
+    /// flowing through it.
+    pub fn occupancy(&self) -> usize {
+        self.lanes.len()
+    }
+
+    /// Where seat `ix` reads its stream and writes its state: the seat on axis 0
+    /// of the turn's tensors, the lane on axis 0 of the state's buffers. Both are
+    /// absent when the state is one lane wide, as its buffers then have no lane
+    /// axis and axis 0 of the tensors carries data rather than streams.
+    pub fn address(&self, ix: usize) -> (Option<usize>, Option<usize>) {
+        if self.max_lanes == 1 { (None, None) } else { (Some(ix), Some(self.lanes[ix].0)) }
+    }
+}
+
+/// Resources a [`TurnStateHandler`] installs for the turn and ops read while
+/// evaluating, keyed by the stored type. This is the extension point: ops see it
+/// read-only, only a handler mutates it.
+pub type TurnShared = anymap3::Map<dyn std::any::Any + Send>;
+
+/// Everything an op is given about where and when it is being evaluated. Ops
+/// receive it by shared reference: they can read the turn's symbols and the
+/// installed shared resources, and they can identify themselves with
+/// `(session, node_id)`, but they cannot reach another node's values or rebind a
+/// symbol.
+#[derive(Debug, Clone, Copy)]
+pub struct EvalContext<'a> {
+    pub session: SessionId,
+    pub node_id: usize,
+    pub symbols: &'a SymbolValues,
+    pub scenario: Option<usize>,
+    pub shared: Option<&'a TurnShared>,
+    /// Which lane each seat of this turn carries. A turn one stream owns is
+    /// [`Seating::single`], so an op reads the same field either way.
+    pub seating: &'a Seating,
+}
+
 pub struct TurnState {
     pub resolved_symbols: SymbolValues,
     pub scenario: Option<usize>,
-    pub cached_mmm_scratch_space: RefCell<Option<Box<dyn tract_linalg::mmm::ScratchSpace>>>,
-    pub scratch_extensions: anymap3::Map,
     pub values: Vec<Option<TVec<TValue>>>,
+    /// Resources installed for the turn by a [`TurnStateHandler`], reachable by
+    /// ops through [`EvalContext::shared`]. Entries outlive the turn --
+    /// `reset_turn` does not touch them -- so what a handler installs is reused
+    /// turn after turn unless it drops it in `after_plan_eval`.
+    pub shared: TurnShared,
+    /// Which lane each seat of this turn carries. A laned runtime sets it before
+    /// each turn; a state one stream owns keeps [`Seating::single`].
+    pub seating: Seating,
+}
+
+impl EvalContext<'static> {
+    /// Context for evaluating outside any plan -- const folding and shape
+    /// inference. What [`EvalOp::eval_out_of_plan`] hands the op: no symbol is
+    /// bound and no shared resource is reachable.
+    pub fn out_of_plan() -> EvalContext<'static> {
+        static SYMBOLS: std::sync::OnceLock<SymbolValues> = std::sync::OnceLock::new();
+        static SEATING: std::sync::OnceLock<Seating> = std::sync::OnceLock::new();
+        EvalContext {
+            session: SessionId::NONE,
+            node_id: usize::MAX,
+            symbols: SYMBOLS.get_or_init(SymbolValues::default),
+            scenario: None,
+            shared: None,
+            seating: SEATING.get_or_init(Seating::single),
+        }
+    }
+}
+
+impl TurnState {
+    pub fn context(&self, session: SessionId, node_id: usize) -> EvalContext<'_> {
+        EvalContext {
+            session,
+            node_id,
+            symbols: &self.resolved_symbols,
+            scenario: self.scenario,
+            shared: Some(&self.shared),
+            seating: &self.seating,
+        }
+    }
 }
 
 impl Default for TurnState {
@@ -25,9 +164,9 @@ impl Default for TurnState {
         TurnState {
             resolved_symbols: SymbolValues::default(),
             scenario: None,
-            cached_mmm_scratch_space: None.into(),
-            scratch_extensions: anymap3::Map::new(),
             values: vec![],
+            shared: TurnShared::new(),
+            seating: Seating::single(),
         }
     }
 }
@@ -37,21 +176,21 @@ impl Clone for TurnState {
         TurnState {
             resolved_symbols: self.resolved_symbols.clone(),
             scenario: self.scenario,
-            cached_mmm_scratch_space: None.into(),
-            scratch_extensions: anymap3::Map::new(),
             values: vec![],
+            shared: TurnShared::new(),
+            seating: self.seating.clone(),
         }
     }
 }
 
-pub trait SessionStateHandler: Send + Sync + Debug {
-    fn before_plan_eval(&self, session_state: &mut TurnState) -> TractResult<()>;
-    fn after_plan_eval(&self, session_state: &mut TurnState) -> TractResult<()>;
+pub trait TurnStateHandler: Send + Sync + Debug {
+    fn before_plan_eval(&self, turn: &mut TurnState) -> TractResult<()>;
+    fn after_plan_eval(&self, turn: &mut TurnState) -> TractResult<()>;
 }
 
 impl Debug for TurnState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SessionState({:?})", self.resolved_symbols)
+        write!(f, "TurnState({:?})", self.resolved_symbols)
     }
 }
 
@@ -68,7 +207,7 @@ where
     has_unresolved_symbols: bool,
     symbols: Vec<Symbol>,
     executor: Option<Executor>,
-    session_handler: Option<Arc<dyn SessionStateHandler + 'static>>,
+    turn_handler: Option<Arc<dyn TurnStateHandler + 'static>>,
 }
 
 impl<F, O> SimplePlan<F, O>
@@ -112,11 +251,8 @@ where
         Self::build_with_outputs_and_deps(model, outputs, &[], &RunOptions::default()).map(Arc::new)
     }
 
-    pub fn with_session_handler<H: SessionStateHandler + 'static>(
-        mut self,
-        session_handler: H,
-    ) -> Self {
-        self.session_handler = Some(Arc::new(session_handler));
+    pub fn with_turn_handler<H: TurnStateHandler + 'static>(mut self, turn_handler: H) -> Self {
+        self.turn_handler = Some(Arc::new(turn_handler));
         self
     }
 
@@ -176,7 +312,7 @@ where
             has_unresolved_symbols: !symbols.is_empty(),
             symbols: symbols.into_iter().collect(),
             executor: options.executor.clone(),
-            session_handler: None,
+            turn_handler: None,
         })
     }
 
@@ -198,7 +334,7 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct SimpleState<F, O>
 where
     F: Fact + Clone + 'static,
@@ -207,6 +343,36 @@ where
     pub(crate) plan: Arc<SimplePlan<F, O>>,
     pub op_states: Vec<Option<Box<dyn OpState>>>,
     pub turn_state: TurnState,
+    session: SessionId,
+}
+
+/// A clone is a distinct session: it gets its own [`SessionId`], so whatever the
+/// ops key on `(session, node_id)` stays separate from the original's.
+impl<F, O> Clone for SimpleState<F, O>
+where
+    F: Fact + Clone + 'static,
+    O: Debug + Display + AsRef<dyn Op> + AsMut<dyn Op> + Clone + 'static,
+{
+    fn clone(&self) -> Self {
+        SimpleState {
+            plan: self.plan.clone(),
+            op_states: self.op_states.clone(),
+            turn_state: self.turn_state.clone(),
+            session: SessionId::next(),
+        }
+    }
+}
+
+impl<F, O> Drop for SimpleState<F, O>
+where
+    F: Fact + Clone + 'static,
+    O: Debug + Display + AsRef<dyn Op> + AsMut<dyn Op> + Clone + 'static,
+{
+    fn drop(&mut self) {
+        for (ix, node) in self.plan.model.nodes.iter().enumerate() {
+            node.op().drop_session(self.session, ix);
+        }
+    }
 }
 
 impl<F, O> SimpleState<F, O>
@@ -219,7 +385,8 @@ where
         let turn = TurnState::default();
         let model = plan.model();
         let states: Vec<Option<Box<dyn OpState>>> = vec![None; model.nodes.len()];
-        let mut state = SimpleState { plan, op_states: states, turn_state: turn };
+        let mut state =
+            SimpleState { plan, op_states: states, turn_state: turn, session: SessionId::next() };
         state.reset_op_states()?;
         Ok(state)
     }
@@ -247,28 +414,60 @@ where
     }
     /// Reset wires state.
     pub fn reset_turn(&mut self) -> TractResult<()> {
+        self.reset_turn_keep_symbols();
+        self.turn_state.resolved_symbols = SymbolValues::default();
+        Ok(())
+    }
+
+    /// Like [`reset_turn`] but keeps the resolved symbols (and scenario). Used by
+    /// `Scan`/`Loop` bodies, whose shapes are constant across iterations: it lets
+    /// the body resolve its symbols once and skip the per-iteration re-resolution
+    /// the full `reset_turn` + `run` cycle would otherwise force.
+    pub(crate) fn reset_turn_keep_symbols(&mut self) {
         for node in &self.plan.order {
             self.turn_state.values[*node] = None;
         }
+    }
+
+    /// Clear resolved symbols (and scenario) without touching node values. Used at
+    /// the start of a fresh `Scan` evaluation, since the body state persists across
+    /// outer calls and a previous call may have left stale symbol resolutions.
+    pub(crate) fn clear_resolved_symbols(&mut self) {
         self.turn_state.resolved_symbols = SymbolValues::default();
+        self.turn_state.scenario = None;
+    }
+
+    /// Seat the lanes carrying the coming turn's streams, one lane per row of
+    /// axis 0 of its tensors.
+    pub fn seat(&mut self, seating: Seating) {
+        self.turn_state.seating = seating;
+    }
+
+    /// Drop the session state `lanes` hold, handing them to new streams.
+    pub fn reset_lanes(&mut self, lanes: &[LaneId]) -> TractResult<()> {
+        for op_state in self.op_states.iter_mut().flatten() {
+            op_state.reset_lanes(lanes)?;
+        }
         Ok(())
     }
 
     /// Reset op inner state.
     fn reset_op_states(&mut self) -> TractResult<()> {
-        let &mut SimpleState { ref plan, ref mut turn_state, op_states: ref mut states, .. } = self;
+        let &mut SimpleState {
+            ref plan, ref turn_state, op_states: ref mut states, session, ..
+        } = self;
         for (ix, n) in plan.model.nodes.iter().enumerate() {
-            states[ix] = if n.op().is_stateless() { None } else { n.op().state(turn_state, ix)? };
+            states[ix] = n.op().state(&turn_state.context(session, ix))?;
         }
         Ok(())
     }
 
-    fn resolve_symbols_with_states(&mut self) -> TractResult<()> {
+    pub(crate) fn resolve_symbols_with_states(&mut self) -> TractResult<()> {
         for state in self
             .op_states
             .iter_mut()
             .filter_map(Option::as_mut)
-            .filter(|s| s.init_tensor_fact().is_some())
+            .filter(|s| s.has_init_tensor_fact())
         {
             state.resolve_symbols(&mut self.turn_state)?;
         }
@@ -290,7 +489,7 @@ where
     ) -> TractResult<TVec<TValue>>
     where
         Eval: for<'a, 'b, 'c> FnMut(
-            &'a mut TurnState,
+            &'a EvalContext<'a>,
             Option<&'b mut (dyn OpState + 'static)>,
             &'c Node<F, O>,
             TVec<TValue>,
@@ -308,7 +507,7 @@ where
     pub fn exec_plan_with_eval<Eval, E>(&mut self, eval: Eval) -> TractResult<()>
     where
         Eval: for<'a, 'b, 'c> FnMut(
-            &'a mut TurnState,
+            &'a EvalContext<'a>,
             Option<&'b mut (dyn OpState + 'static)>,
             &'c Node<F, O>,
             TVec<TValue>,
@@ -327,7 +526,7 @@ where
     fn do_exec_plan_with_eval<Eval, E>(&mut self, mut eval: Eval) -> TractResult<()>
     where
         Eval: for<'a, 'b, 'c> FnMut(
-            &'a mut TurnState,
+            &'a EvalContext<'a>,
             Option<&'b mut (dyn OpState + 'static)>,
             &'c Node<F, O>,
             TVec<TValue>,
@@ -337,7 +536,7 @@ where
         {
             self.ready_turn();
             self.plan
-                .session_handler
+                .turn_handler
                 .as_ref()
                 .map(|it| it.before_plan_eval(&mut self.turn_state))
                 .transpose()?;
@@ -361,7 +560,6 @@ where
                     })?;
                     inputs.push(prec[i.slot].clone())
                 }
-
                 for flush in &self.plan.flush_lists[step] {
                     trace!("  Ran {} can now flush {}", node, self.plan.model.node(*flush));
                     self.turn_state.values[*flush] = None;
@@ -390,13 +588,20 @@ where
                     }
                 }
 
-                let vs = eval(
-                    &mut self.turn_state,
-                    self.op_states[node.id].as_deref_mut(),
-                    node,
-                    inputs,
-                )
-                .map_err(|e| e.into())?;
+                // A node with no precursors whose value is already set is a model
+                // input: `set_inputs` wrote it and `reset_turn` clears everything
+                // else, so hand it in rather than have the op reach for it. After
+                // the checks above, which are stated against the node's declared
+                // inputs -- a source declares none.
+                if node.inputs.is_empty()
+                    && let Some(preset) = self.turn_state.values[*n].as_ref()
+                {
+                    inputs = preset.clone();
+                }
+
+                let ctx = self.turn_state.context(self.session, node.id);
+                let vs = eval(&ctx, self.op_states[node.id].as_deref_mut(), node, inputs)
+                    .map_err(|e| e.into())?;
 
                 if !syms_done && self.plan.has_unresolved_symbols {
                     for (o, v) in node.outputs.iter().zip(vs.iter()) {
@@ -448,7 +653,7 @@ where
                 self.turn_state.values[node.id] = Some(vs);
             }
             self.plan
-                .session_handler
+                .turn_handler
                 .as_ref()
                 .map(|it| it.after_plan_eval(&mut self.turn_state))
                 .transpose()?;
@@ -465,6 +670,22 @@ where
         );
 
         for (ix, t) in inputs.into_iter().enumerate() {
+            self.set_input(ix, t)?
+        }
+        Ok(())
+    }
+
+    /// Like [`set_inputs`] but drains the caller's buffer (leaving it empty with
+    /// its capacity intact) instead of consuming it, so a repeated caller (a
+    /// `Scan` body loop) can reuse one allocation across iterations.
+    pub(crate) fn set_inputs_drain(&mut self, inputs: &mut TVec<TValue>) -> TractResult<()> {
+        ensure!(
+            inputs.len() == self.model().inputs.len(),
+            "Wrong number of inputs for model. Expected {} got {}",
+            self.model().inputs.len(),
+            inputs.len()
+        );
+        for (ix, t) in inputs.drain(..).enumerate() {
             self.set_input(ix, t)?
         }
         Ok(())
@@ -555,7 +776,7 @@ where
         let mut v = tvec![];
         for o in plan.outputs.iter() {
             let vs = turn_state.values[o.node].as_mut().ok_or_else(|| {
-                format_err!("Outputs of {:?} are not computed", &plan.model.nodes()[o.node])
+                format_err!("Outputs of {:?} are not computed", plan.model.nodes()[o.node])
             })?;
             v.push(vs[o.slot].clone())
         }
@@ -583,6 +804,11 @@ where
             })?;
             inputs.push(prec[i.slot].clone())
         }
+        if node.inputs.is_empty()
+            && let Some(preset) = turn_state.values[node.id].as_ref()
+        {
+            inputs = preset.clone();
+        }
         Ok(inputs)
     }
 
@@ -596,10 +822,17 @@ where
         node: usize,
         inputs: TVec<TValue>,
     ) -> TractResult<()> {
-        let &mut SimpleState { ref plan, ref mut turn_state, op_states: ref mut states, .. } = self;
+        let &mut SimpleState {
+            ref plan,
+            ref mut turn_state,
+            op_states: ref mut states,
+            session,
+            ..
+        } = self;
         let nodes = plan.model.nodes();
         let node = &nodes[node];
-        let vs = eval(turn_state, states[node.id].as_deref_mut(), node, inputs)?;
+        let ctx = turn_state.context(session, node.id);
+        let vs = eval(&ctx, states[node.id].as_deref_mut(), node, inputs)?;
         turn_state.values[node.id] = Some(vs);
         Ok(())
     }
@@ -620,14 +853,21 @@ where
                 for i in &node.inputs {
                     inputs.push(self.turn_state.values[i.node].as_ref().unwrap()[i.slot].clone())
                 }
+                if node.inputs.is_empty()
+                    && let Some(preset) = self.turn_state.values[node.id].as_ref()
+                {
+                    inputs = preset.clone();
+                }
             }
             let &mut Self {
                 op_states: ref mut states,
-                turn_state: ref mut session_state,
+                turn_state: ref mut turn,
                 ref plan,
+                session,
                 ..
             } = self;
-            eval(session_state, states[node].as_deref_mut(), &plan.model().nodes[node], inputs)?
+            let ctx = turn.context(session, node);
+            eval(&ctx, states[node].as_deref_mut(), &plan.model().nodes[node], inputs)?
         };
         self.turn_state.values[node] = Some(values);
         Ok(self.turn_state.values[node].as_ref().unwrap())
@@ -654,56 +894,10 @@ where
     pub fn model(&self) -> &Graph<F, O> {
         &self.plan.model
     }
-
-    pub fn freeze(&self) -> FrozenSimpleState<F, O> {
-        FrozenSimpleState {
-            plan: self.plan.clone(),
-            resolved_symbols: self.turn_state.resolved_symbols.clone(),
-            scenario: self.turn_state.scenario,
-            states: self.op_states.iter().map(|s| s.as_ref().map(|s| s.freeze())).collect(),
-            values: self
-                .turn_state
-                .values
-                .iter()
-                .enumerate()
-                .map(|(ix, t)| {
-                    if self.model().nodes[ix].op_is::<Const>() {
-                        t.as_ref().map(|t| t.iter().map(|t| t.clone().into_tensor()).collect())
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-        }
-    }
-
-    pub fn freeze_into(self) -> FrozenSimpleState<F, O> {
-        let plan = self.plan;
-        let model = &plan.model;
-        FrozenSimpleState {
-            resolved_symbols: self.turn_state.resolved_symbols,
-            scenario: self.turn_state.scenario,
-            states: self.op_states.into_iter().map(|s| s.map(|s| s.freeze_into())).collect(),
-            values: self
-                .turn_state
-                .values
-                .into_iter()
-                .enumerate()
-                .map(|(ix, t)| {
-                    if model.nodes[ix].op_is::<Const>() {
-                        t.map(|t| t.into_iter().map(|t| t.into_tensor()).collect())
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-            plan,
-        }
-    }
 }
 
 pub fn eval<F, O>(
-    session_state: &mut TurnState,
+    ctx: &EvalContext,
     mut state: Option<&mut (dyn OpState + 'static)>,
     node: &Node<F, O>,
     input: TVec<TValue>,
@@ -712,58 +906,11 @@ where
     F: Fact + Clone + 'static,
     O: Debug + Display + AsRef<dyn Op> + AsMut<dyn Op> + Clone + 'static,
 {
-    // eprint!("{node} {input:?}");
-    #[allow(clippy::let_and_return)]
-    let r = match state {
-        Some(ref mut state) => state.eval(session_state, node.op(), input),
-        None => node.op().eval_with_session(node.id, session_state, input),
+    match state {
+        Some(ref mut state) => state.eval(ctx, node.op(), input),
+        None => node.op().eval(ctx, input),
     }
-    .with_context(|| format!("Evaluating {node}"));
-    // eprintln!(" ==> {}", r.as_ref().unwrap()[0].dump(true)?);
-    r
-}
-
-#[derive(Clone, Debug)]
-pub struct FrozenSimpleState<F, O>
-where
-    F: Fact + Clone + 'static,
-    O: Debug + Display + AsRef<dyn Op> + AsMut<dyn Op> + Clone + 'static,
-{
-    plan: Arc<SimplePlan<F, O>>,
-    pub resolved_symbols: SymbolValues,
-    pub scenario: Option<usize>,
-    pub states: Vec<Option<Box<dyn FrozenOpState>>>,
-    pub values: Vec<Option<TVec<Tensor>>>,
-}
-
-impl<F, O> FrozenSimpleState<F, O>
-where
-    F: Fact + Clone + 'static,
-    O: Debug + Display + AsRef<dyn Op> + AsMut<dyn Op> + Clone + 'static,
-{
-    pub fn plan(&self) -> &Arc<SimplePlan<F, O>> {
-        &self.plan
-    }
-
-    pub fn unfreeze(&self) -> SimpleState<F, O> {
-        SimpleState {
-            plan: self.plan.clone(),
-            turn_state: TurnState {
-                resolved_symbols: self.resolved_symbols.clone(),
-                scenario: self.scenario,
-                cached_mmm_scratch_space: None.into(),
-                scratch_extensions: anymap3::Map::new(),
-                values: self
-                    .values
-                    .iter()
-                    .map(|t| {
-                        t.as_ref().map(|t| t.iter().map(|t| t.clone().into_tvalue()).collect())
-                    })
-                    .collect(),
-            },
-            op_states: self.states.iter().map(|s| s.as_ref().map(|s| s.unfreeze())).collect(),
-        }
-    }
+    .with_context(|| format!("Evaluating {node}"))
 }
 
 #[cfg(test)]
@@ -793,7 +940,7 @@ mod test {
     }
 
     #[test]
-    fn frozen_type_state_is_send() {
-        is_send::<TypedFrozenSimpleState>();
+    fn type_state_is_send() {
+        is_send::<TypedSimpleState>();
     }
 }

@@ -197,6 +197,7 @@ mod tests {
 
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn run_test_case(
         batch: usize,
         q_heads: usize,
@@ -264,7 +265,7 @@ mod tests {
                 acc_datum_type: DatumType::F32,
                 is_causal,
             }
-            .eval(ref_inputs)?;
+            .eval(&EvalContext::out_of_plan(), ref_inputs)?;
 
             cuda_output.to_host()?.close_enough(&ref_output[0], Approximation::Approximate)?;
             Ok(())

@@ -1,15 +1,11 @@
-use crate::Ops;
 use crate::pack::Packing;
 
-pub fn plug(ops: &mut Ops) {
-    ops.panel_extractors.push(packed_32_q40_to_f32.clone());
-}
-
-panel_extractor!(kernel_packed_32_q40_to_f32 as packed_32_q40_to_f32(
+panel_extractor!(aarch64; kernel_packed_32_q40_to_f32 as packed_32_q40_to_f32(
     Box::new(super::q40p32z16se()),
     f32::packing(32).align(16)
 ));
 
+#[cfg(target_arch = "aarch64")]
 unsafe fn kernel_packed_32_q40_to_f32(input: *const u8, output: *mut u8, k: usize) {
     unsafe {
         if k == 0 {
@@ -96,3 +92,5 @@ unsafe fn kernel_packed_32_q40_to_f32(input: *const u8, output: *mut u8, k: usiz
         );
     }
 }
+
+bail_stub!(aarch64; unsafe fn kernel_packed_32_q40_to_f32(*const u8, *mut u8, usize));

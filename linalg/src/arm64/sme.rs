@@ -1,6 +1,7 @@
-use crate::Ops;
-use crate::frame::mmm::ImplementationQuality::ManuallyOptimized;
+use crate::DatumType;
+use crate::isa::IsaSet;
 use crate::mmm::*;
+use crate::mmm_tiers::MmmTier;
 
 // CAN_FUSE: everything except LeakyRelu / QScale / RoundingShiftRight /
 // ShiftLeft. LoadTile, AddUnicast, AddRowColProducts, per-row/col/scalar
@@ -16,8 +17,13 @@ const CAN_FUSE: fn(&FusedSpec) -> bool = |f| {
     )
 };
 
-const SME: fn() -> bool = has_sme;
-const SME2: fn() -> bool = has_sme2;
+// The SMOPA i32 kernel implements the quant fuse ops (QScale / RoundingShiftRight
+// / ShiftLeft) bit-exactly; only LeakyRelu is unsupported (kernel returns 1).
+const CAN_FUSE_I32: fn(&FusedSpec) -> bool = |f| !matches!(f, FusedSpec::LeakyRelu(_));
+
+MMMExternKernel!(aarch64; sme_qmmm_i32_32x32<i32>(32,32)@(128,128) isa(Aarch64Sme2) can_fuse(CAN_FUSE_I32)
+    packing[1] = i8i8 => |k| k.with_packing(crate::pack::PackedI8K4::new(32), crate::pack::PackedI8K4::new(32));
+    store(i8));
 
 // Streaming vector length in bytes, read via `RDSVL x0, #1` (encoding
 // 0x04bf5820). RDSVL is legal in non-streaming mode, but is UNDEFINED
@@ -51,25 +57,25 @@ fn sme_geometry_supported() -> bool {
     unsafe { streaming_vector_bytes() == 64 }
 }
 
-MMMExternKernel!(
+MMMExternKernel!(aarch64;
     sme_mmm_f32_32x32<f32>(32, 32)@(128, 128)
-    where(SME)
+    isa(Aarch64Sme)
     can_fuse(CAN_FUSE)
-    quality(ManuallyOptimized)
+
 );
 
-MMMExternKernel!(
+MMMExternKernel!(aarch64;
     sme_mmv_f32_64x1<f32>(64, 1)@(128, 128)
-    where(SME2)
+    isa(Aarch64Sme2)
     can_fuse(CAN_FUSE)
-    quality(ManuallyOptimized)
+
 );
 
 #[cfg(target_os = "macos")]
 pub fn has_sme() -> bool {
     // TRACT_SME_DISABLE=1 forces the SME path off so callers can A/B
     // against the AMX path on the same binary.
-    if std::env::var_os("TRACT_SME_DISABLE").is_some() {
+    if crate::knobs::TRACT_SME_DISABLE.get() {
         return false;
     }
     // hw.optional.arm.FEAT_SME is an INTEGER sysctl, not a string. The
@@ -128,7 +134,7 @@ pub fn has_sme() -> bool {
 pub fn has_sme2() -> bool {
     // TRACT_SME_DISABLE=1 disables both SME and SME2 dispatch on the same
     // binary so end users can A/B the entire SME backend.
-    if std::env::var_os("TRACT_SME_DISABLE").is_some() {
+    if crate::knobs::TRACT_SME_DISABLE.get() {
         return false;
     }
     use std::ffi::{CString, c_char, c_int, c_void};
@@ -179,19 +185,50 @@ pub fn has_sme2() -> bool {
     false
 }
 
-pub fn plug(ops: &mut Ops) {
-    if has_sme() {
-        log::info!("SME optimisation activated");
-        ops.mmm_f32 = Box::new(|_, _, _| sme_mmm_f32_32x32.mmm());
-        ops.mmm_impls.extend_from_slice(&[sme_mmm_f32_32x32.mmm()]);
+fn sme_preferred(
+    _isa: &IsaSet,
+    dt: DatumType,
+    query: &Query,
+    _suitable: &[Suitable],
+) -> Option<&'static str> {
+    match (dt, query.n) {
+        (DatumType::F32, Some(1)) => None,
+        (DatumType::F32, _) => Some(sme_mmm_f32_32x32.name.as_str()),
+        _ => None,
     }
-    if has_sme2() {
-        log::info!("SME2 GEMV optimisation activated");
-        ops.mmv_f32 = Box::new(|_, _| sme_mmv_f32_64x1.mmm());
-        ops.mmm_impls.extend_from_slice(&[sme_mmv_f32_64x1.mmm()]);
+}
+
+fn sme2_preferred(
+    _isa: &IsaSet,
+    dt: DatumType,
+    query: &Query,
+    _suitable: &[Suitable],
+) -> Option<&'static str> {
+    match (dt, query.n) {
+        (DatumType::F32, Some(1)) => Some(sme_mmv_f32_64x1.name.as_str()),
+        (DatumType::I32, Some(1)) => None,
+        (DatumType::I32, _) => Some(sme_qmmm_i32_32x32.name.as_str()),
+        _ => None,
     }
-    if !has_sme() && !has_sme2() {
-        log::info!("No SME optimisation");
+}
+
+inventory::submit! {
+    MmmTier {
+        arch: Some(crate::isa::Arch::Aarch64),
+        precedence: 4,
+        name: "sme",
+        applies: |isa| isa.has(crate::isa::Isa::Aarch64Sme),
+        preferred: sme_preferred,
+    }
+}
+
+inventory::submit! {
+    MmmTier {
+        arch: Some(crate::isa::Arch::Aarch64),
+        precedence: 5,
+        name: "sme2",
+        applies: |isa| isa.has(crate::isa::Isa::Aarch64Sme2),
+        preferred: sme2_preferred,
     }
 }
 

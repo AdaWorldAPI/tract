@@ -50,7 +50,7 @@ impl RmsNorm {
         ensure!(output.shape() == input.shape());
         ensure!(output.datum_type() == input.datum_type());
 
-        if (axis == (input.rank() - 1)) && (input.shape()[axis] % 4 == 0) {
+        if (axis == (input.rank() - 1)) && input.shape()[axis].is_multiple_of(4) {
             let shape = input.shape();
             let shape_nd2 = tvec![shape[..axis].iter().product::<usize>(), shape[axis]];
 
@@ -186,8 +186,10 @@ mod tests {
             let eps = Arc::new(tensor0(0.0001f32));
             let cpu_rms = rms_norm::RmsNorm { axis, eps: Arc::clone(&eps) };
 
-            let cpu_output =
-                cpu_rms.eval(tvec![a.to_host()?.into_tvalue()])?[0].clone().into_tensor();
+            let cpu_output = cpu_rms
+                .eval(&EvalContext::out_of_plan(), tvec![a.to_host()?.into_tvalue()])?[0]
+                .clone()
+                .into_tensor();
             let metal_output = RmsNorm.eval(stream, &a, axis, &eps)?;
 
             cpu_output
@@ -292,7 +294,9 @@ mod tests {
 
             let cpu_rms = rms_norm::RmsNorm { axis: self.axis, eps: Arc::clone(&self.eps) };
 
-            let cpu_output = cpu_rms.eval(tvec![a.into_tvalue()])?[0].clone().into_tensor();
+            let cpu_output = cpu_rms.eval(&EvalContext::out_of_plan(), tvec![a.into_tvalue()])?[0]
+                .clone()
+                .into_tensor();
 
             Ok(cpu_output)
         }

@@ -43,7 +43,7 @@ impl Silu {
 
         let n_el = output.len();
 
-        let use_silu_4 = (n_el % 4 == 0) && (n_el as f32 > 2f32.powi(12));
+        let use_silu_4 = n_el.is_multiple_of(4) && (n_el as f32 > 2f32.powi(12));
         let kernel_name = self.kernel_name(input.datum_type(), use_silu_4)?;
 
         let n_threads = if use_silu_4 { n_el / 4 } else { n_el };
@@ -101,7 +101,7 @@ mod tests {
             .into_device()?;
 
             let cpu_output = tract_core::ops::nn::silu::silu()
-                .eval(tvec![a.to_host()?.into_tvalue()])?[0]
+                .eval(&EvalContext::out_of_plan(), tvec![a.to_host()?.into_tvalue()])?[0]
                 .clone()
                 .into_tensor();
             let metal_output = Silu.eval(stream, &a)?;
@@ -201,7 +201,9 @@ mod tests {
         pub fn reference(&self) -> TractResult<Tensor> {
             let a = Tensor::from_shape(self.shape.as_slice(), &self.input)?;
             let silu = tract_core::ops::nn::silu::silu();
-            let cpu_output = silu.eval(tvec![a.into_tvalue()])?[0].clone().into_tensor();
+            let cpu_output = silu.eval(&EvalContext::out_of_plan(), tvec![a.into_tvalue()])?[0]
+                .clone()
+                .into_tensor();
 
             Ok(cpu_output)
         }

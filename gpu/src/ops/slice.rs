@@ -27,21 +27,14 @@ impl Op for GpuSlice {
 }
 
 impl EvalOp for GpuSlice {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input_value = args_1!(inputs);
         let input = input_value.to_device_tensor()?;
 
-        let start = self.inner.start.eval(&session.resolved_symbols).to_usize()?;
-        let end = self.inner.end.eval(&session.resolved_symbols).to_usize()?;
+        let start = self.inner.start.eval(ctx.symbols).to_usize()?;
+        let end = self.inner.end.eval(ctx.symbols).to_usize()?;
         let axis = self.inner.axis;
 
         let input_shape = input.shape();
@@ -62,12 +55,7 @@ impl EvalOp for GpuSlice {
 
         let offset = (start * input_strides[axis] as usize) * input_dt.size_of();
 
-        let output = crate::session_handler::make_tensor_for_node(
-            session,
-            node_id,
-            input.datum_type(),
-            &o_shape,
-        )?;
+        let output = crate::turn_handler::make_tensor_for_node(ctx, input.datum_type(), &o_shape)?;
 
         if o_shape[axis] != 0 {
             // Slice uses same strides as input (broadcast strides with matching shapes)
@@ -94,7 +82,7 @@ impl TypedOp for GpuSlice {
             .with_context(|| format!("Error while computing facts for {:?}", self.name()))
     }
 
-    fn substitute_symbols(
+    fn set_symbols(
         &self,
         _source: &TypedModel,
         node: &TypedNode,

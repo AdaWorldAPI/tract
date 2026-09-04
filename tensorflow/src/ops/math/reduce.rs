@@ -48,15 +48,13 @@ impl Op for Reduce {
 }
 
 impl EvalOp for Reduce {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (input, axes) = args_2!(inputs);
         let axes: Vec<i64> = axes.cast_to::<i64>()?.try_as_plain()?.as_slice::<i64>()?.to_vec();
         let op = nn::Reduce::new(Some(axes), self.keep_dims, self.reducer);
-        expand(op).eval(tvec!(input))
+        expand(op).eval(&EvalContext::out_of_plan(), tvec!(input))
     }
 }
 

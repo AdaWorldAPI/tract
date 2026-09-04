@@ -3,9 +3,11 @@ use std::fmt::{Debug, Display};
 #[allow(unused_imports)]
 use std::fs;
 
+#[allow(unused_imports)]
 use nu_ansi_term::Color::*;
 
 use log::Level::Info;
+#[allow(unused_imports)]
 use tract_core::internal::*;
 
 use crate::dump::annotate_with_graph_def;
@@ -26,7 +28,6 @@ pub fn handle(
     }
 
     let cumulative = sub_matches.get_flag("cumulative");
-    let resilent = sub_matches.get_flag("resilient");
     if sub_matches.get_one::<String>("stage").is_some() {
         // --with is by pipeline and put in params
         return handle_reference_stage(cumulative, params, &output_params, &run_params);
@@ -38,98 +39,7 @@ pub fn handle(
     if let Some(pbdir) = sub_matches.get_one::<String>("pbdir") {
         return handle_pbdir(cumulative, pbdir, params, &output_params, &run_params);
     }
-    if sub_matches.get_flag("tf") {
-        return handle_tensorflow(cumulative, resilent, params, &output_params, &run_params);
-    }
     bail!("No comparison target found")
-}
-
-#[cfg(not(feature = "conform"))]
-pub fn handle_tensorflow(
-    _cumulative: bool,
-    _resilient: bool,
-    _params: &mut Parameters,
-    _output_params: &DisplayParams,
-    _run_params: &RunParams,
-) -> TractResult<()> {
-    bail!("`tf` feature is required for this to work");
-}
-
-#[cfg(feature = "conform")]
-pub fn handle_tensorflow(
-    cumulative: bool,
-    resilient: bool,
-    params: &mut Parameters,
-    output_params: &DisplayParams,
-    run_params: &RunParams,
-) -> TractResult<()> {
-    let tract = &params.tract_model;
-    let mut tf = params.tf_model.take().unwrap();
-    // First generate random values for the inputs.
-    let input_facts = tract
-        .input_outlets()
-        .iter()
-        .map(|&i| tract.outlet_typedfact(i))
-        .collect::<TractResult<Vec<_>>>()?;
-    let generated = crate::tensor::make_inputs(&*input_facts)?;
-
-    // Execute the model on tensorflow first.
-    info!("Running the model on tensorflow.");
-    trace!("Inject inputs in tensorflow graph.");
-    let pairs: Vec<_> = tract
-        .input_outlets()
-        .iter()
-        .map(|s| &*tract.node_name(s.node))
-        .zip(generated.iter().cloned())
-        .collect();
-
-    trace!("Execute the model on tensorflow.");
-    let eval_order = tract.eval_order()?;
-
-    let mut wanted_outputs: Vec<&str> = eval_order
-        .iter()
-        .filter(|&n| !tract.input_outlets().contains(&OutletId::new(*n, 0)))
-        .map(|&n| tract.node_name(n))
-        .collect();
-
-    for o in tract.output_outlets() {
-        let name = &*tract.node_name(o.node);
-        if !wanted_outputs.contains(&name) {
-            wanted_outputs.push(name);
-        }
-    }
-
-    let mut all_values: HashMap<String, Vec<TractResult<TValue>>> = HashMap::new();
-    if resilient {
-        for name in wanted_outputs {
-            all_values.insert(
-                name.to_string(),
-                vec![
-                    tf.run(pairs.clone(), &name)
-                        .map(|t| Arc::new(t[0].clone().into()))
-                        .map_err(|e| e.into()),
-                ],
-            );
-        }
-    } else {
-        tf.run_get_many(pairs, wanted_outputs)?.into_iter().for_each(|(k, v)| {
-            all_values.insert(k.to_string(), vec![Ok(v[0].clone().into())]);
-        });
-    };
-
-    for (ix, input) in tract.input_outlets().iter().enumerate() {
-        let name = tract.node_name(input.node);
-        all_values.insert(name.to_string(), vec![Ok(generated[ix].clone().into_arc_tensor())]);
-    }
-    dispatch_model_no_pulse!(params.tract_model, |m| compare(
-        cumulative,
-        m,
-        &all_values,
-        &params,
-        &output_params,
-        run_params,
-        ("tract", "tf"),
-    ))
 }
 
 pub fn handle_npz(
@@ -253,8 +163,8 @@ pub fn handle_with_model(
     let mut state = plan.spawn()?;
     let inputs = get_or_make_inputs(&(reference_model.clone() as _), run_params)?;
     for input in inputs.sources {
-        state.run_plan_with_eval(input, |session, state, node, input| -> TractResult<_> {
-            let result = tract_core::plan::eval(session, state, node, input)?;
+        state.run_plan_with_eval(input, |turn, state, node, input| -> TractResult<_> {
+            let result = tract_core::plan::eval(turn, state, node, input)?;
             if node.outputs.len() == 1 {
                 values.entry(node.name.clone()).or_default().push(Ok(result[0].clone()));
             }
@@ -370,7 +280,7 @@ pub fn handle_stream(
         let chunk_sym = pulsed.symbols.sym(&chunk_sym_name);
         let chunk_size = chunk_size_t.cast_to_scalar::<i64>()? as usize;
         ensure!(
-            stream_dim % chunk_size == 0,
+            stream_dim.is_multiple_of(chunk_size),
             "stream_dim {stream_dim} not divisible by Blockify chunk size {chunk_size}"
         );
         concrete_sym_values = concrete_sym_values.with(&chunk_sym, (stream_dim / chunk_size) as _);
@@ -430,7 +340,7 @@ pub fn handle_stream(
     let plan = Arc::new(model.as_ref().clone().into_runnable()?);
     let mut state = SimpleState::new(&plan)?;
     let input_shape: TVec<usize> =
-        model_input_fact.shape.iter().map(|d| d.to_usize()).collect::<TractResult<TVec<_>>>()?;
+        model_input_fact.shape.iter().map(|d| d.to_usize()).collect::<Result<TVec<_>, _>>()?;
 
     let mut node_slices: HashMap<String, Vec<Tensor>> = HashMap::new();
     let mut node_axes: HashMap<String, usize> = HashMap::new();
@@ -453,8 +363,8 @@ pub fn handle_stream(
 
         state.run_plan_with_eval(
             tvec!(pulsed_input.into_tensor().into()),
-            |session, op_state, node, input| -> TractResult<TVec<TValue>> {
-                let result = tract_core::plan::eval(session, op_state, node, input)?;
+            |turn, op_state, node, input| -> TractResult<TVec<TValue>> {
+                let result = tract_core::plan::eval(turn, op_state, node, input)?;
 
                 if let Some(info) = pulse_meta.get(&node.name) {
                     // Skip nodes where the optimizer removed the streaming axis (e.g.
@@ -483,7 +393,8 @@ pub fn handle_stream(
                                 // Full pulse in valid region
                                 (0, info.output_pulse)
                             };
-                            let valid = result[0].slice(info.output_axis, p_o, p_o + count)?;
+                            let value = crate::utils::clarify_tvalue(&result[0])?;
+                            let valid = value.slice(info.output_axis, p_o, p_o + count)?;
                             node_slices
                                 .entry(node.name.clone())
                                 .or_default()
@@ -496,7 +407,7 @@ pub fn handle_stream(
                     node_slices
                         .entry(node.name.clone())
                         .or_default()
-                        .push(result[0].clone().into_tensor());
+                        .push(crate::utils::clarify_tvalue(&result[0])?.into_tensor());
                 }
 
                 Ok(result)
@@ -516,8 +427,7 @@ pub fn handle_stream(
     }
 
     // Concretize the reference model and delegate to compare()
-    let concrete_ref =
-        Arc::new(reference.clone().substitute_symbols(&concrete_sym_values.to_dim_map())?);
+    let concrete_ref = Arc::new(reference.clone().set_symbols(&concrete_sym_values.to_dim_map())?);
     compare(
         false,
         &concrete_ref,
@@ -560,25 +470,31 @@ where
     let all_values: HashMap<String, &Vec<TractResult<TValue>>> =
         all_values.iter().map(|(k, v)| (canonic(k), v)).collect();
     let inputs = get_or_make_inputs(&(tract.clone() as _), run_params)?;
-    for (turn, inputs) in inputs.sources.into_iter().enumerate() {
+    for (turn_ix, inputs) in inputs.sources.into_iter().enumerate() {
         state.run_plan_with_eval(
             inputs,
-            |session_state, state, node, input| -> TractResult<TVec<TValue>> {
-                let mut returning = tract_core::plan::eval(session_state, state, node, input)?;
+            |turn, state, node, input| -> TractResult<TVec<TValue>> {
+                let mut returning = tract_core::plan::eval(turn, state, node, input)?;
                 let tags = annotations.node_mut(node.id.into());
                 let mut comparison_error = None;
                 for slot in 0..returning.len() {
                     let get_value = |label: &str| {
                         all_values
                             .get(&canonic(label))
-                            .and_then(|v| v.get(turn))
+                            .and_then(|v| v.get(turn_ix))
                             .and_then(|r| r.as_ref().ok())
                             .cloned()
                     };
+                    // The GPU translator wraps nodes that absorb adjacent
+                    // axis ops with a `.fused_axis_op` suffix.  Strip it for
+                    // lookup so per-node bisection lines up GPU outputs with
+                    // the CPU reference.
+                    let stripped_name =
+                        node.name.strip_suffix(".fused_axis_op").unwrap_or(&node.name);
                     let reference: Option<TValue> = tract
                         .outlet_label((node.id, slot).into())
                         .and_then(get_value)
-                        .or_else(|| get_value(&node.name).filter(|_| slot == 0));
+                        .or_else(|| get_value(stripped_name).filter(|_| slot == 0));
 
                     let Some(reference) = reference else {
                         tags.style = Some(Yellow.into());
@@ -593,7 +509,7 @@ where
                     let needed_type = clarified_fact.datum_type;
                     let needed_shape = clarified_fact
                         .shape
-                        .eval_to_usize(&session_state.resolved_symbols)
+                        .eval_to_usize(turn.symbols)
                         .with_context(|| {
                             format!(
                                 "evaluating shape {:?} on node #{} {} (slot {}); known symbols: {:?}",
@@ -601,7 +517,7 @@ where
                                 node.id,
                                 node.name,
                                 slot,
-                                session_state.resolved_symbols,
+                                *turn.symbols,
                             )
                         })?;
 
@@ -645,7 +561,7 @@ where
                         let mut msg = vec![Red
                             .bold()
                             .paint(format!(
-                                "At turn {turn}, wrong value for output {slot}, {e}"
+                                "At turn {turn_ix}, wrong value for output {slot}, {e}"
                             ))
                             .to_string()];
                         msg.push(format!("{:<8}: {:?}", labels.0, computed));
@@ -654,13 +570,24 @@ where
                     } else {
                         debug!(
                             "At turn {}, matching value for {:?}",
-                            turn,
+                            turn_ix,
                             OutletId::new(node.id, slot)
                         )
                     }
 
-                    if !cumulative && returning[slot].is_plain() {
-                        returning[slot] = reference.into_tvalue();
+                    if !cumulative {
+                        use tract_gpu::tensor::{DeviceTensorExt, IntoDevice};
+                        if returning[slot].is_plain() {
+                            returning[slot] = reference.into_tvalue();
+                        } else if returning[slot].as_device_tensor().is_some() {
+                            // Device-resident output: stage the CPU reference
+                            // back onto the device so downstream device ops can
+                            // consume it.  Without this, cumulative=off would
+                            // silently keep tract's (potentially-drifted) value
+                            // and per-node bisection becomes useless on GPU.
+                            returning[slot] =
+                                reference.into_device()?.into_tensor().into_tvalue();
+                        }
                     }
                 }
                 if let Some(e) = comparison_error {

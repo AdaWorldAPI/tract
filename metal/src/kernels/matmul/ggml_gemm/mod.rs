@@ -81,6 +81,7 @@ struct GgmlGemvParams {
     ne1: i32,
     r2: i16,
     r3: i16,
+    out_f16: i16,
 }
 
 impl From<GemmDispatchParams> for GgmlGemvParams {
@@ -115,6 +116,7 @@ impl From<GemmDispatchParams> for GgmlGemvParams {
             ne1: params.m as i32,
             r2: (params.a_batch / params.b_batch) as i16,
             r3: 1,
+            out_f16: (params.dts[0] == F16) as i16,
         }
     }
 }
@@ -152,8 +154,9 @@ impl GemmKernel for GgmlGemm {
                 && matches!(facts[0].datum_type, F16 | F32))
     }
 
-    fn output_dt(&self, _a_dt: DatumType, _b_dt: DatumType) -> TractResult<DatumType> {
-        Ok(F32)
+    fn output_dt(&self, a_dt: DatumType, _b_dt: DatumType) -> TractResult<DatumType> {
+        // Output dtype follows the activation (input[0]).
+        Ok(a_dt)
     }
 
     fn dispatch_eval(
@@ -180,7 +183,15 @@ impl GemmKernel for GgmlGemm {
 
         ensure!(!transpose_a && transpose_b);
 
-        if (dts[0] == F32) && (k % 32 == 0) && (k >= 64) && ((m > 4) || (q40_b && a_batch > 1)) {
+        // The q4_0 matrix-vector kernel stays bandwidth-bound (one weight read)
+        // for several activation rows, so it beats the tiled GEMM until ~8 rows;
+        // the f16/f32 mat-vec kernels are tuned for 4.
+        let gemv_max_rows = if q40_b { 8 } else { 4 };
+        if matches!(dts[0], F32 | F16)
+            && (k % 32 == 0)
+            && (k >= 64)
+            && ((m > gemv_max_rows) || (q40_b && a_batch > 1))
+        {
             dispatch_metal_ggml_gemm(
                 stream, params, a_offset, a_buffer, b_offset, b_buffer, c_buffer, c_offset,
             )?;
@@ -198,8 +209,9 @@ fn mv_kernel_name_and_dispatch_params(
     params: &GemmDispatchParams,
 ) -> TractResult<(String, (u64, u64, u64))> {
     if params.q40_b {
-        ensure!(params.dts[0] == F32);
-        Ok(("kernel_mul_mv_q4_0_f32".to_string(), (8, 8, 1)))
+        ensure!(matches!(params.dts[0], F32 | F16));
+        // Activation/output dtype is carried at runtime by GgmlGemvParams::out_f16.
+        Ok(("kernel_mul_mv_q4_0".to_string(), (8, 8, 1)))
     } else if params.dts[1] == F32 {
         ensure!(params.dts[0] == F32);
         Ok(("kernel_mul_mv_f32_f32".to_string(), (32, 1, 4)))
@@ -207,7 +219,7 @@ fn mv_kernel_name_and_dispatch_params(
         if params.dts[0] == F32 {
             if (params.m * params.a_batch) < 4 {
                 Ok(("kernel_mul_mv_f16_f32_1row".to_string(), (32, 1, 1)))
-            } else if (params.k >= 128) && (params.k % 4 == 0) && (params.n >= 8) {
+            } else if (params.k >= 128) && params.k.is_multiple_of(4) && (params.n >= 8) {
                 Ok(("kernel_mul_mv_f16_f32_l4".to_string(), (32, 1, params.m as u64)))
             } else {
                 Ok(("kernel_mul_mv_f16_f32".to_string(), (32, 1, 4)))
@@ -234,7 +246,6 @@ fn dispatch_metal_ggml_gemv(
     output_offset: usize,
 ) -> TractResult<()> {
     let (name, (nth0, nth1, nrows)) = mv_kernel_name_and_dispatch_params(&params)?;
-    //dbg!(&name);
     let pipeline = stream.load_pipeline(LibraryName::Ggml, &name)?;
 
     let ggml_params: GgmlGemvParams = params.clone().into();
@@ -286,13 +297,16 @@ fn dispatch_metal_ggml_gemm(
 ) -> TractResult<()> {
     let GemmDispatchParams { dts, q40_b, .. } = params;
 
-    ensure!((matches!(dts[1], F32 | F16) || q40_b) && dts[0] == F32);
+    ensure!((matches!(dts[1], F32 | F16) || q40_b) && matches!(dts[0], F32 | F16));
 
+    // The GEMM is templated on both weight (i1) and activation/output (i2)
+    // dtype: a single fat runtime-branched kernel regressed prefill and PSO
+    // load on apple-m1-max (the dead f16-output path inflates the f32 kernel's
+    // footprint), so each combination gets its own specialized kernel.
     let i1_tname = if !q40_b { DeviceTensor::tname(dts[1])? } else { "q4_0" };
     let i2_tname = DeviceTensor::tname(dts[0])?;
 
     let name = format!("kernel_mul_mm_{i1_tname}_{i2_tname}");
-    //dbg!(&name);
     let pipeline = stream.load_pipeline(LibraryName::Ggml, &name)?;
 
     let ggml_params: GgmlGemmParams = params.clone().into();

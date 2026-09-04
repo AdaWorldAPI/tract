@@ -41,11 +41,9 @@ impl Op for Const {
 }
 
 impl EvalOp for Const {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, _inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, _inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         Ok(tvec![Arc::clone(&self.0).into_tvalue()])
     }
 }
@@ -76,7 +74,7 @@ impl TypedOp for Const {
         Ok(tvec!((Cost::Params(self.0.datum_type().unquantized()), self.0.len().into())))
     }
 
-    fn substitute_symbols(
+    fn set_symbols(
         &self,
         _source: &TypedModel,
         node: &TypedNode,

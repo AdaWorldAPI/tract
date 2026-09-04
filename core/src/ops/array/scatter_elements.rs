@@ -83,11 +83,9 @@ impl TypedOp for ScatterElements {
 }
 
 impl EvalOp for ScatterElements {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (data, indices, updates) = args_3!(inputs);
         let indices = indices.cast_to::<i64>()?;
         let indices = indices.to_plain_array_view::<i64>()?;

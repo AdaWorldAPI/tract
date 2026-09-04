@@ -1,6 +1,6 @@
 [package]
 name = "tract-metal"
-version = "0.23.0-pre"
+version = "0.23.7-pre"
 license = "MIT OR Apache-2.0"
 authors = [
 	"Hubert de La Jonquière <hubert.delajonquiere@sonos.com>",
@@ -38,9 +38,16 @@ default = [ ]
 criterion.workspace = true
 proptest.workspace = true
 rand.workspace = true
-ggml = { git = "https://github.com/rustformers/llm.git", rev="9376078", features = ["metal"] }
 
 [[bench]]
 name = "metal_gemm"
 harness = false
 
+
+[[bench]]
+name = "metal_reduce"
+harness = false
+
+[[bench]]
+name = "gdn_recurrent"
+harness = false

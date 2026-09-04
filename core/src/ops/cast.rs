@@ -40,16 +40,9 @@ impl Op for Cast {
 }
 
 impl EvalOp for Cast {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        _node_id: usize,
-        state: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs);
         if input.datum_type() == self.to {
             Ok(tvec!(input))
@@ -61,7 +54,7 @@ impl EvalOp for Cast {
                 input_plain.as_slice::<TDim>()?,
                 tmp_plain.as_slice_mut::<i64>()?
             ) {
-                *i = dim.eval(&state.resolved_symbols).to_i64()?
+                *i = dim.eval(ctx.symbols).to_i64()?
             }
             Ok(tvec!(tmp.cast_to_dt(self.to)?.into_owned().into_tvalue()))
         } else {
@@ -74,10 +67,10 @@ impl TypedOp for Cast {
     fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
         let mut fact = self.to.fact(inputs[0].shape.clone());
         fact.uniform_tdim = inputs[0].uniform_tdim.clone();
-        if let Some(u) = &inputs[0].uniform {
-            if let Ok(cast_u) = u.cast_to_dt(self.to) {
-                fact.uniform = Some(std::sync::Arc::new(cast_u.into_owned()));
-            }
+        if let Some(u) = &inputs[0].uniform
+            && let Ok(cast_u) = u.cast_to_dt(self.to)
+        {
+            fact.uniform = Some(std::sync::Arc::new(cast_u.into_owned()));
         }
         Ok(tvec!(fact))
     }

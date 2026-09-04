@@ -53,7 +53,7 @@ fn pulsify(
     // `start + window - 1 < 0` (purely-past) — neither is needed yet.
     ensure!(op.start <= 0, "WindowOnAxis pulsifier: start > 0 not supported (got {})", op.start);
     ensure!(
-        op.start + op.window as i64 - 1 >= 0,
+        op.start + op.window as i64 > 0,
         "WindowOnAxis pulsifier: window must straddle current (start={}, window={})",
         op.start,
         op.window
@@ -127,11 +127,9 @@ impl Op for PulsedExposeWindow {
 }
 
 impl EvalOp for PulsedExposeWindow {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs).into_tensor();
         let mut new_shape: TVec<usize> = input.shape().into();
         // input shape on `axis` is W (= pulse + overlap, with pulse=1).
@@ -196,7 +194,9 @@ mod tests {
         let op = WindowOnAxis::future(0, 2, f32::datum_type()).unwrap();
         let input =
             tract_core::ndarray::Array2::<f32>::from_shape_fn((4, 2), |(i, j)| (i * 10 + j) as f32);
-        let result = op.eval(tvec!(input.clone().into_dyn().into_tvalue())).unwrap();
+        let result = op
+            .eval(&EvalContext::out_of_plan(), tvec!(input.clone().into_dyn().into_tvalue()))
+            .unwrap();
         let out = result[0].to_plain_array_view::<f32>().unwrap().to_owned();
         assert_eq!(out.shape(), &[4, 2, 2]);
         // Slot w=0: copy of input.

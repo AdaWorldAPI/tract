@@ -1,7 +1,8 @@
 mod basic;
 mod ggml_gemm;
-mod mfa;
+pub mod mfa;
 mod mlx_gemm;
+pub mod mlx_sdpa;
 
 pub use basic::BasicMatMul;
 pub use ggml_gemm::GgmlGemm;
@@ -220,6 +221,14 @@ pub trait GemmKernel:
         ensure!([DatumType::F16, DatumType::F32].contains(&a_dt));
         ensure!(a_dt == b_dt);
         Ok(a_dt)
+    }
+
+    /// Datum type the kernel accumulates in for the given operand dtype. The
+    /// default (f32) keeps the proptest reference accurate; a kernel that
+    /// accumulates in operand precision must override, else the reference is
+    /// unfairly more accurate than the kernel and flags spurious mismatches.
+    fn accumulator_dt(_operand: DatumType) -> DatumType {
+        DatumType::F32
     }
 
     fn dispatch_eval(
@@ -444,12 +453,106 @@ mod tests {
                 b = b.clone().cast_to_dt(DatumType::F32).unwrap().into_owned();
             }
 
-            let output = args_1!(matmul.eval(tvec![a.into_tvalue(), b.into_tvalue()])?);
+            let output = args_1!(
+                matmul
+                    .eval(&EvalContext::out_of_plan(), tvec![a.into_tvalue(), b.into_tvalue()])?
+            );
             metal_output.to_host()?.close_enough(&output, Approximation::SuperApproximate)?;
             Ok(())
         })
     }
 
+    // Skinny-M bake-off: which GEMM kernel wins for the shapes a decode step
+    // produces (M small, N large). The winner is device-dependent, so this
+    // prints a table rather than asserting.
+    //   cargo test -p tract-metal bench_skinny_gemm -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_skinny_gemm() -> TractResult<()> {
+        use std::time::Instant;
+        with_borrowed_metal_stream(|stream| {
+            let device = metal::Device::system_default().unwrap();
+            let arch: String = unsafe {
+                use metal::foreign_types::ForeignTypeRef;
+                use objc::runtime::Object;
+                use objc::{msg_send, sel, sel_impl};
+                let dev: *mut Object = device.as_ref().as_ptr() as *mut Object;
+                let a: *mut Object = msg_send![dev, architecture];
+                let n: *mut Object = msg_send![a, name];
+                let c: *const std::os::raw::c_char = msg_send![n, UTF8String];
+                std::ffi::CStr::from_ptr(c).to_string_lossy().into_owned()
+            };
+            println!("  device: {} arch: {arch}", device.name());
+            for dt in [DatumType::F16, DatumType::F32] {
+                for (k, n) in [(2048usize, 2048usize), (2048, 32000)] {
+                    println!("\n  {dt:?} K={k} N={n} (x @ w.T)");
+                    println!("    M  |    Mlx ms |   Ggml ms | Ggml/Mlx | gemv_wide ms");
+                    for m in [1usize, 2, 4, 8, 16] {
+                        let a = Tensor::zero_dt(dt, &[1, m, k])?.into_device()?;
+                        // transposed weights: [n, k], the layout a Linear keeps
+                        let b = Tensor::zero_dt(dt, &[1, n, k])?.into_device()?;
+                        let c = unsafe { DeviceTensor::uninitialized_dt(dt, &[1, m, n])? };
+                        let time = |run: &dyn Fn() -> TractResult<()>| -> TractResult<f64> {
+                            for _ in 0..3 {
+                                run()?;
+                                stream.wait_until_completed()?;
+                            }
+                            let mut best = f64::MAX;
+                            for _ in 0..5 {
+                                let t = Instant::now();
+                                for _ in 0..20 {
+                                    run()?;
+                                }
+                                stream.wait_until_completed()?;
+                                best = best.min(t.elapsed().as_secs_f64() / 20.0);
+                            }
+                            Ok(best)
+                        };
+                        let mlx = time(&|| {
+                            GemmImpl::<MlxGemm>::new(false, true).dispatch_eval(stream, &a, &b, &c)
+                        })?;
+                        let ggml = time(&|| {
+                            GemmImpl::<GgmlGemm>::new(false, true).dispatch_eval(stream, &a, &b, &c)
+                        })?;
+                        // forced past mlx's own arch gate, to get a number here
+                        let wide = mlx_gemm::gemv_wide_config(m, n, k, Some(15))
+                            .map(|cfg| {
+                                time(&|| {
+                                    mlx_gemm::dispatch_metal_mlx_gemv_wide(
+                                        stream,
+                                        dt,
+                                        (m, n, k),
+                                        &cfg,
+                                        &get_metal_buffer(&a),
+                                        a.buffer_offset(),
+                                        &get_metal_buffer(&b),
+                                        b.buffer_offset(),
+                                        &get_metal_buffer(&c),
+                                        c.buffer_offset(),
+                                    )
+                                })
+                            })
+                            .transpose()?;
+                        println!(
+                            "    {m:<2} | {:9.4} | {:9.4} | {:8.2}x | {}",
+                            mlx * 1e3,
+                            ggml * 1e3,
+                            ggml / mlx,
+                            match wide {
+                                Some(w) => format!("{:9.4} ({:.2}x vs Mlx)", w * 1e3, mlx / w),
+                                None => "        - ".to_string(),
+                            }
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    // Expected offsets keep their `1 *` batch-index factor so each one reads as
+    // `batch * stride`, matching the batch being dispatched.
+    #[allow(clippy::identity_op)]
     #[test]
     fn test_gemm_dispatches_params() -> TractResult<()> {
         let dt = DatumType::F32;
@@ -777,6 +880,17 @@ mod tests {
             let output = pb.run().unwrap();
             prop_assert!(output.close_enough(&pb.reference().unwrap(), Approximation::Approximate).is_ok())
         }
+
+        #[test]
+        fn mmm_ggml_prop_q4_f16(pb in <MmmProblem<GgmlGemm, f16>>::arbitrary_with(
+            MmmProblemParams {
+                force_k_as_inner_axis: true,
+                q4_0_weights: true,
+            }
+        )) {
+            let output = pb.run().unwrap();
+            prop_assert!(output.close_enough(&pb.reference().unwrap(), Approximation::VeryApproximate).is_ok())
+        }
     }
 
     #[derive(Default, Debug, Clone)]
@@ -866,7 +980,11 @@ mod tests {
                 transpose_b: self.transpose_rhs,
                 transpose_c: false,
                 quantize_output: None,
-                operating_dt: Some(F::datum_type()),
+                // Accumulate the golden in each kernel's own accumulation precision. GGML/MLX
+                // accumulate in f32, so a f16 reference accumulator would be noisier than the
+                // kernel it checks and flag spurious mismatches at large k; MFA's GEMM instead
+                // accumulates in the operand dtype.
+                operating_dt: Some(K::accumulator_dt(F::datum_type())),
             };
 
             let lhs_tensor = if self.transpose_lhs {
@@ -883,7 +1001,10 @@ mod tests {
             if self.q4_0 {
                 rhs_tensor = Q4_0.simulate_precision_loss(rhs_tensor, 2)?
             };
-            let output = matmul.eval(tvec![lhs_tensor.into_tvalue(), rhs_tensor.into_tvalue()])?;
+            let output = matmul.eval(
+                &EvalContext::out_of_plan(),
+                tvec![lhs_tensor.into_tvalue(), rhs_tensor.into_tvalue()],
+            )?;
 
             Ok(output[0].clone().into_tensor())
         }

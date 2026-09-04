@@ -9,7 +9,7 @@ use itertools::{Itertools, izip};
 use ndarray::prelude::*;
 #[cfg(feature = "complex")]
 use num_complex::Complex;
-use num_traits::{Float, Zero};
+use num_traits::Float;
 use std::borrow::Cow;
 use std::fmt;
 use std::hash::Hash;
@@ -34,15 +34,23 @@ pub enum Approximation {
     SuperApproximate,
     UltraApproximate,
     Custom(f32, f32, f32),
+    /// Compare by integer ULP distance in the reference tensor's own float type,
+    /// accepting a distance up to the given bound.
+    ///
+    /// Unlike the tolerance-based variants this does not go through an f32 cast,
+    /// so an f16 comparison stays an f16 comparison. Use it to assert that two
+    /// implementations of a kernel agree to within a known number of rounding
+    /// steps.
+    Ulp(u64),
 }
 
 impl PartialEq for Approximation {
     fn eq(&self, other: &Self) -> bool {
-        use Approximation::Custom;
-        if let (Custom(aa, ar, ao), Custom(ba, br, bo)) = (self, other) {
-            aa == ba && ar == br && bo == ao
-        } else {
-            std::mem::discriminant(self) == std::mem::discriminant(other)
+        use Approximation::*;
+        match (self, other) {
+            (Custom(aa, ar, ao), Custom(ba, br, bo)) => aa == ba && ar == br && bo == ao,
+            (Ulp(a), Ulp(b)) => a == b,
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
         }
     }
 }
@@ -69,6 +77,9 @@ impl Approximation {
             (SuperApproximate, _) => (0.1, 0.05, 0.0001),
             (UltraApproximate, _) => (0.2, 0.1, 0.0005),
             (Custom(atol, rtol, out), _) => (*atol as _, *rtol as _, *out as _),
+            // Handled by a dedicated path in `Tensor::close_enough`; these values
+            // are never consulted.
+            (Ulp(_), _) => (0.0, 0.0, 0.0),
         }
     }
 }
@@ -172,6 +183,33 @@ pub fn vector_size() -> usize {
         return if is_x86_feature_detected!("avx512f") { 512 / 8 } else { 256 / 8 };
     }
     128 / 8
+}
+
+/// Copy `outer` blocks of `block` bytes from a contiguous source into a destination
+/// strided by `out_stride`, as `T`-sized items. Used for blocks too small for a
+/// `copy_nonoverlapping` call per block to pay for itself.
+///
+/// # Safety
+/// `block` and `out_stride` must be multiples of `size_of::<T>()`, both pointers must
+/// be `T`-aligned, and the two ranges must not overlap.
+#[inline]
+unsafe fn copy_blocks<T: Copy>(
+    src: *const u8,
+    dst: *mut u8,
+    outer: usize,
+    block: usize,
+    out_stride: usize,
+) {
+    unsafe {
+        let n = block / std::mem::size_of::<T>();
+        for o in 0..outer {
+            let s = src.add(o * block) as *const T;
+            let d = dst.add(o * out_stride) as *mut T;
+            for i in 0..n {
+                *d.add(i) = *s.add(i);
+            }
+        }
+    }
 }
 
 impl Tensor {
@@ -290,16 +328,21 @@ impl Tensor {
             tensor.update_strides_and_len();
         }
         if !tensor.storage.is_empty() {
-            if dt == String::datum_type() || dt == Blob::datum_type() {
-                // assumes zero-initialized string and blob are valid
-                tensor.plain_storage_mut().as_bytes_mut().fill(0);
-            } else if dt == TDim::datum_type() {
+            unsafe fn write_defaults<T: Datum + Default>(tensor: &mut Tensor) {
                 unsafe {
-                    tensor
-                        .as_slice_mut_unchecked::<TDim>()
-                        .iter_mut()
-                        .for_each(|dim| std::ptr::write(dim, TDim::zero()))
+                    let len = tensor.len;
+                    let dst = tensor.as_slice_mut_unchecked::<T>().as_mut_ptr();
+                    for i in 0..len {
+                        std::ptr::write(dst.add(i), T::default());
+                    }
                 }
+            }
+            if dt == String::datum_type() {
+                unsafe { write_defaults::<String>(&mut tensor) }
+            } else if dt == Blob::datum_type() {
+                unsafe { write_defaults::<Blob>(&mut tensor) }
+            } else if dt == TDim::datum_type() {
+                unsafe { write_defaults::<TDim>(&mut tensor) }
             } else if cfg!(debug_assertions) {
                 assert!(dt.is_copy());
                 if dt == DatumType::F32 {
@@ -332,24 +375,74 @@ impl Tensor {
         shape[axis] = tensors.iter().map(|v| v.borrow().shape()[axis]).sum();
         unsafe {
             let mut result = Tensor::uninitialized_dt(dt, &shape)?;
-            if dt.is_copy() && shape[..axis].iter().all(|d| *d == 1) {
+            // Every input keeps the same trailing block, so one outer stride walks
+            // them alongside the result and each contribution stays contiguous.
+            let outer: usize = shape[..axis].iter().product();
+            let out_stride = shape[axis..].iter().product::<usize>() * dt.size_of();
+            // Each contribution is `outer` blocks of `block` bytes, strided by
+            // `out_stride` in the result. At one f32 per block -- DTLN's
+            // [1, 2, 128, 2] axis-3 concat, FastEnhancer's [1, 256, 1, 2] -- a
+            // copy_nonoverlapping per block is `outer` calls to move four bytes
+            // each, and the generic strided assign below is no better. Copy those
+            // inline, typed, instead: no call, and the loop is a plain strided
+            // store LLVM can widen.
+            const SMALL_BLOCK_BYTES: usize = 64;
+            if dt.is_copy()
+                && outer > 0
+                && tensors.iter().all(|t| t.borrow().storage.as_plain().is_some())
+            {
+                let out = result.plain_storage_mut().as_mut_ptr();
                 let mut offset = 0isize;
                 for v in tensors {
                     let v = v.borrow();
-                    let len = v.storage.byte_len();
-                    std::ptr::copy_nonoverlapping(
-                        v.plain_storage().as_ptr(),
-                        result.plain_storage_mut().as_mut_ptr().offset(offset),
-                        len,
-                    );
-                    offset += len as isize;
+                    let block = v.storage.byte_len() / outer;
+                    let src = v.plain_storage().as_ptr();
+                    let dst = out.offset(offset);
+                    if outer == 1 {
+                        std::ptr::copy_nonoverlapping(src, dst, block);
+                    } else if block >= SMALL_BLOCK_BYTES {
+                        for o in 0..outer {
+                            std::ptr::copy_nonoverlapping(
+                                src.add(o * block),
+                                dst.add(o * out_stride),
+                                block,
+                            );
+                        }
+                    } else {
+                        // `block` and both pointers are multiples of the datum size,
+                        // so the typed copy stays aligned.
+                        match dt.size_of() {
+                            1 => copy_blocks::<u8>(src, dst, outer, block, out_stride),
+                            2 => copy_blocks::<u16>(src, dst, outer, block, out_stride),
+                            4 => copy_blocks::<u32>(src, dst, outer, block, out_stride),
+                            8 => copy_blocks::<u64>(src, dst, outer, block, out_stride),
+                            16 => copy_blocks::<u128>(src, dst, outer, block, out_stride),
+                            _ => {
+                                for o in 0..outer {
+                                    std::ptr::copy_nonoverlapping(
+                                        src.add(o * block),
+                                        dst.add(o * out_stride),
+                                        block,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    offset += block as isize;
                 }
             } else {
                 let mut offset = 0;
                 for t in tensors {
                     let t = t.borrow();
                     let len = t.shape()[axis];
-                    result.assign_slice_from_resolved(offset..offset + len, t, 0..len, axis);
+                    result.assign_slice_from_resolved(
+                        &[],
+                        offset..offset + len,
+                        t,
+                        &[],
+                        0..len,
+                        axis,
+                    );
                     offset += len;
                 }
             }
@@ -499,6 +592,15 @@ impl Tensor {
         align: usize,
     ) -> TractResult<Tensor> {
         let mut tensor = unsafe { Tensor::uninitialized_aligned_dt(dt, shape, align) }?;
+        let expected = tensor.as_bytes().len();
+        ensure!(
+            content.len() == expected,
+            "Raw tensor data length ({}) does not match shape {:?} of {:?} ({} bytes)",
+            content.len(),
+            shape,
+            dt,
+            expected
+        );
         tensor.as_bytes_mut().copy_from_slice(content);
         Ok(tensor)
     }
@@ -615,7 +717,7 @@ impl Tensor {
     }
 
     pub fn split_axis(mut self, axis: usize, outer_dim: usize) -> TractResult<Tensor> {
-        if self.shape[axis] % outer_dim != 0 {
+        if !self.shape[axis].is_multiple_of(outer_dim) {
             bail!(
                 "Invalid axis split, shape is {:?}, axis split at {}, outer {}",
                 self.shape,
@@ -696,7 +798,56 @@ impl Tensor {
     }
 
     pub fn broadcast_to_shape(&self, shape: &[usize]) -> TractResult<Tensor> {
-        dispatch_datum!(Self::broadcast_to_shape_t(self.dt)(self, shape))
+        if !self.dt.is_copy() {
+            return dispatch_datum!(Self::broadcast_to_shape_t(self.dt)(self, shape));
+        }
+        ensure!(
+            self.rank() <= shape.len(),
+            "Broadcasting {self:?} to {shape:?} would lose {} axes",
+            self.rank() - shape.len()
+        );
+        let offset = shape.len() - self.rank();
+        let mut src: TVec<usize> = tvec!(1; shape.len());
+        src[offset..].copy_from_slice(self.shape());
+        ensure!(
+            izip!(&src, shape).all(|(s, d)| *s == 1 || s == d),
+            "Broadcasting {self:?} to {shape:?}"
+        );
+        // The axes from the innermost one down to the first broadcast axis are
+        // one contiguous run of the source, so only the axes above it need a
+        // coordinate walk, with a null source stride wherever they broadcast.
+        let mut split = shape.len();
+        while split > 0 && src[split - 1] == shape[split - 1] {
+            split -= 1;
+        }
+        let dt_size = self.dt.size_of();
+        let run = shape[split..].iter().product::<usize>() * dt_size;
+        let outer: usize = shape[..split].iter().product();
+        let mut src_strides: TVec<usize> = tvec!(0; split);
+        let mut acc = run;
+        for ax in (0..split).rev() {
+            src_strides[ax] = if src[ax] == 1 { 0 } else { acc };
+            acc *= src[ax];
+        }
+        let mut output = unsafe { Tensor::uninitialized_dt(self.dt, shape)? };
+        if run == 0 || outer == 0 {
+            return Ok(output);
+        }
+        let source = self.as_bytes();
+        let dst = output.as_bytes_mut();
+        let mut coords: TVec<usize> = tvec!(0; split);
+        for block in 0..outer {
+            let from: usize = izip!(&coords, &src_strides).map(|(c, s)| c * s).sum();
+            dst[block * run..][..run].copy_from_slice(&source[from..][..run]);
+            for ax in (0..split).rev() {
+                coords[ax] += 1;
+                if coords[ax] < shape[ax] {
+                    break;
+                }
+                coords[ax] = 0;
+            }
+        }
+        Ok(output)
     }
 
     pub fn broadcast_vector_to_shape(&self, shape: &[usize], axis: usize) -> TractResult<Tensor> {
@@ -739,11 +890,27 @@ impl Tensor {
             Ok(output)
         }
     }
-
     pub fn assign_slice(
         &mut self,
         range: impl std::ops::RangeBounds<usize>,
         src: &Tensor,
+        src_range: impl std::ops::RangeBounds<usize>,
+        axis: usize,
+    ) -> TractResult<()> {
+        self.assign_slice_at_prefix(&[], range, src, &[], src_range, axis)
+    }
+
+    /// Assign `src`'s `src_range` along `axis` into `range` along `axis`, each
+    /// taken in the sub-tensor at its prefix. A prefix indexes the leading axes
+    /// as [`Tensor::view_at_prefix`] does, and both prefixes cover the same
+    /// axes, whose extents may then differ. `axis` stays an axis of the whole
+    /// tensors, so it has to sit past the prefixes.
+    pub fn assign_slice_at_prefix(
+        &mut self,
+        prefix: &[usize],
+        range: impl std::ops::RangeBounds<usize>,
+        src: &Tensor,
+        src_prefix: &[usize],
         src_range: impl std::ops::RangeBounds<usize>,
         axis: usize,
     ) -> TractResult<()> {
@@ -764,7 +931,16 @@ impl Tensor {
             src_range,
         );
         ensure!(
-            itertools::izip!(0.., self.shape(), src.shape())
+            prefix.len() == src_prefix.len() && prefix.len() <= axis,
+            "Attempt to assign axis {axis} at prefixes {prefix:?} and {src_prefix:?}"
+        );
+        ensure!(
+            izip!(prefix, self.shape()).all(|(ix, dim)| ix < dim)
+                && izip!(src_prefix, src.shape()).all(|(ix, dim)| ix < dim),
+            "Attempt to assign into {self:?} at {prefix:?} from {src:?} at {src_prefix:?}"
+        );
+        ensure!(
+            izip!(prefix.len().., &self.shape[prefix.len()..], &src.shape[prefix.len()..])
                 .all(|(ix, dst, src)| ix == axis || src == dst),
             "Attempt to assign a {}-axis range of {:?} from a range of {:?}",
             axis,
@@ -785,7 +961,7 @@ impl Tensor {
             range,
             self
         );
-        unsafe { self.assign_slice_from_resolved(range, src, src_range, axis) };
+        unsafe { self.assign_slice_from_resolved(prefix, range, src, src_prefix, src_range, axis) };
         Ok(())
     }
 
@@ -798,14 +974,23 @@ impl Tensor {
     ) {
         let range = clip_range_bounds(self.shape[axis], range);
         let src_range = clip_range_bounds(src.shape[axis], src_range);
-        unsafe { self.assign_slice_from_resolved(range, src, src_range, axis) };
+        unsafe { self.assign_slice_from_resolved(&[], range, src, &[], src_range, axis) };
+    }
+
+    /// The byte offset of the sub-tensor at `prefix`, which indexes the leading
+    /// axes as [`Tensor::view_at_prefix`] does.
+    fn prefix_offset(&self, prefix: &[usize]) -> usize {
+        izip!(prefix, &self.strides).map(|(ix, stride)| ix * *stride as usize).sum::<usize>()
+            * self.datum_type().size_of()
     }
 
     #[allow(clippy::ptr_eq)]
     unsafe fn assign_slice_from_resolved(
         &mut self,
+        prefix: &[usize],
         range: std::ops::Range<usize>,
         src: &Tensor,
+        src_prefix: &[usize],
         src_range: std::ops::Range<usize>,
         axis: usize,
     ) {
@@ -813,47 +998,147 @@ impl Tensor {
             use ndarray::Slice;
             unsafe fn assign_slice_t<T: Datum>(
                 to: &mut Tensor,
+                to_prefix: &[usize],
                 to_range: Range<usize>,
                 from: &Tensor,
+                from_prefix: &[usize],
                 from_range: Range<usize>,
                 axis: usize,
             ) {
                 unsafe {
-                    to.to_array_view_mut_unchecked::<T>()
+                    let mut to_view = to.to_array_view_mut_unchecked::<T>();
+                    let mut from_view = from.to_array_view_unchecked::<T>();
+                    for (ax, (to, from)) in izip!(to_prefix, from_prefix).enumerate() {
+                        to_view.slice_axis_inplace(Axis(ax), Slice::from(*to..*to + 1));
+                        from_view.slice_axis_inplace(Axis(ax), Slice::from(*from..*from + 1));
+                    }
+                    to_view
                         .slice_axis_mut(Axis(axis), Slice::from(to_range))
-                        .assign(
-                            &from
-                                .to_array_view_unchecked::<T>()
-                                .slice_axis(Axis(axis), Slice::from(from_range)),
-                        )
+                        .assign(&from_view.slice_axis(Axis(axis), Slice::from(from_range)))
                 }
             }
-            if self.datum_type().is_copy() && self.shape[..axis].iter().all(|d| *d == 1) {
-                let stride = self.strides[axis] as usize * self.datum_type().size_of();
-                let dst_start = (stride * range.start) as isize;
-                let src_start = (stride * src_range.start) as isize;
-                let len = stride * range.len();
+            if self.datum_type().is_copy() {
+                // Tensors carry natural strides, so a range along `axis` is one
+                // contiguous run per coordinate of the axes between the prefix
+                // and it, and both sides share the run length and the trailing
+                // block.
+                let post = self.strides[axis] as usize * self.datum_type().size_of();
+                let len = post * range.len();
                 if len > 0 {
-                    if self.plain_storage().as_ptr() != src.plain_storage().as_ptr() {
-                        std::ptr::copy_nonoverlapping(
-                            src.plain_storage().as_ptr().offset(src_start),
-                            self.plain_storage_mut().as_mut_ptr().offset(dst_start),
-                            len,
-                        );
-                    } else {
-                        std::ptr::copy(
-                            src.plain_storage().as_ptr().offset(src_start),
-                            self.plain_storage_mut().as_mut_ptr().offset(dst_start),
-                            len,
-                        );
+                    let outer: usize = self.shape[prefix.len()..axis].iter().product();
+                    let dst_block = post * self.shape[axis];
+                    let src_block = post * src.shape[axis];
+                    let src_ptr = src
+                        .plain_storage()
+                        .as_ptr()
+                        .add(src.prefix_offset(src_prefix) + post * src_range.start);
+                    let aliasing = self.plain_storage().as_ptr() == src.plain_storage().as_ptr();
+                    let dst_offset = self.prefix_offset(prefix) + post * range.start;
+                    let dst_ptr = self.plain_storage_mut().as_mut_ptr().add(dst_offset);
+                    for run in 0..outer {
+                        let from = src_ptr.add(run * src_block);
+                        let to = dst_ptr.add(run * dst_block);
+                        if aliasing {
+                            std::ptr::copy(from, to, len);
+                        } else {
+                            std::ptr::copy_nonoverlapping(from, to, len);
+                        }
                     }
                 }
             } else {
                 dispatch_datum!(assign_slice_t(self.datum_type())(
-                    self, range, src, src_range, axis
+                    self, prefix, range, src, src_prefix, src_range, axis
                 ));
             }
         }
+    }
+    /// Fill `range` along `axis` with `value`, a one-element tensor of this
+    /// tensor's datum type.
+    pub fn fill_slice(
+        &mut self,
+        range: impl std::ops::RangeBounds<usize>,
+        value: &Tensor,
+        axis: usize,
+    ) -> TractResult<()> {
+        self.fill_slice_at_prefix(&[], range, value, axis)
+    }
+
+    /// Fill `range` along `axis` of the sub-tensor at `prefix`, which indexes
+    /// the leading axes as [`Tensor::view_at_prefix`] does, with `value`, a
+    /// one-element tensor of this tensor's datum type. `axis` stays an axis of
+    /// the whole tensor, so it has to sit past `prefix`.
+    pub fn fill_slice_at_prefix(
+        &mut self,
+        prefix: &[usize],
+        range: impl std::ops::RangeBounds<usize>,
+        value: &Tensor,
+        axis: usize,
+    ) -> TractResult<()> {
+        ensure!(axis < self.rank(), "Filling axis {axis} of {self:?}");
+        ensure!(
+            prefix.len() <= axis,
+            "Filling axis {axis} of {self:?} at prefix {prefix:?}, which reaches it"
+        );
+        ensure!(
+            izip!(prefix, self.shape()).all(|(ix, dim)| ix < dim),
+            "Filling {self:?} at prefix {prefix:?}"
+        );
+        ensure!(
+            value.datum_type() == self.datum_type() && value.len() == 1,
+            "Filling {:?} with {value:?}",
+            self.datum_type()
+        );
+        let range = clip_range_bounds(self.shape[axis], range);
+        ensure!(
+            range.end <= self.shape[axis],
+            "Filling invalid slice (axis {axis}, {range:?}) of {self:?}"
+        );
+        if !self.datum_type().is_copy() {
+            return dispatch_datum!(Self::fill_slice_t(self.datum_type())(
+                self, prefix, range, value, axis
+            ));
+        }
+        // Tensors carry natural strides, so the range is one contiguous run per
+        // coordinate of the axes between the prefix and `axis`, and a run of one
+        // datum grows to its whole length in log2(len) copies of itself.
+        let dt_size = self.datum_type().size_of();
+        let post = self.strides[axis] as usize * dt_size;
+        let len = post * range.len();
+        if len == 0 {
+            return Ok(());
+        }
+        let block = post * self.shape[axis];
+        let runs: usize = self.shape[prefix.len()..axis].iter().product();
+        let start = self.prefix_offset(prefix) + range.start * post;
+        let value = &value.as_bytes()[..dt_size];
+        let data = self.as_bytes_mut();
+        for run in 0..runs {
+            let run = &mut data[start + run * block..start + run * block + len];
+            run[..dt_size].copy_from_slice(value);
+            let mut written = dt_size;
+            while written < len {
+                let grow = written.min(len - written);
+                run.copy_within(0..grow, written);
+                written += grow;
+            }
+        }
+        Ok(())
+    }
+
+    fn fill_slice_t<T: Datum>(
+        &mut self,
+        prefix: &[usize],
+        range: Range<usize>,
+        value: &Tensor,
+        axis: usize,
+    ) -> TractResult<()> {
+        let value = value.try_as_plain()?.to_scalar::<T>()?.clone();
+        let mut view = self.to_plain_array_view_mut::<T>()?;
+        for (ax, ix) in prefix.iter().enumerate() {
+            view.slice_axis_inplace(Axis(ax), (*ix..*ix + 1).into());
+        }
+        view.slice_axis_mut(Axis(axis), range.into()).fill(value);
+        Ok(())
     }
 
     /// Get the datum type of the tensor.
@@ -918,6 +1203,9 @@ impl Tensor {
         if self.shape() != other.shape() {
             bail!("Shape mismatch {:?} != {:?}", self.shape(), other.shape())
         }
+        if let Approximation::Ulp(max_ulp) = approx {
+            return self.ulp_close_enough(other, max_ulp);
+        }
         let (atol, rtol, outliers) = approx.atol_rtol_outliers(&self.datum_type());
         let ma = self.cast_to::<f32>()?;
         let ma = ma.to_plain_array_view::<f32>()?;
@@ -942,8 +1230,12 @@ impl Tensor {
             let indices = first_outlier.unwrap();
             let a = ma[&*indices];
             let b = mb[&*indices];
+            let ulp = self
+                .max_ulp_distance(other)
+                .map(|(d, _)| format!("{d}"))
+                .unwrap_or_else(|_| "n/a".to_string());
             bail!(
-                "Mismatch. First outlier: {:?} for {:?}) at {:?} {} != {}. Outliers: {} / {} = {:0.5} > {:0.5}.",
+                "Mismatch. First outlier: {:?} for {:?}) at {:?} {} != {}. Outliers: {} / {} = {:0.5} > {:0.5}. Max ULP ({:?}): {}.",
                 approx,
                 self.datum_type(),
                 indices,
@@ -952,10 +1244,85 @@ impl Tensor {
                 outliers_count,
                 self.volume(),
                 outliers_count as f64 / self.volume() as f64,
-                outliers
+                outliers,
+                self.ulp_comparison_dt(),
+                ulp,
             );
         }
         Ok(())
+    }
+
+    /// The float type ULP distances against this tensor are measured in.
+    ///
+    /// Float tensors are compared in their own type, so an f16 comparison stays an
+    /// f16 comparison. Anything else falls back to f32, matching what
+    /// `close_enough` does for its tolerance check.
+    pub fn ulp_comparison_dt(&self) -> DatumType {
+        match self.datum_type() {
+            dt @ (DatumType::F16 | DatumType::F32 | DatumType::F64) => dt,
+            _ => DatumType::F32,
+        }
+    }
+
+    /// Largest integer ULP distance between `self` and `other`, and the flat index
+    /// where it occurs.
+    ///
+    /// Comparison happens in [`Self::ulp_comparison_dt`]. See [`crate::ulp`] for
+    /// the exact convention around signed zeros, infinities and NaN.
+    pub fn max_ulp_distance(&self, other: &Self) -> TractResult<(u64, Option<usize>)> {
+        if self.shape() != other.shape() {
+            bail!("Shape mismatch {:?} != {:?}", self.shape(), other.shape())
+        }
+        let dt = self.ulp_comparison_dt();
+        let a = self.cast_to_dt(dt)?;
+        let b = other.cast_to_dt(dt)?;
+        fn worst<D: Datum + crate::ulp::UlpFloat>(
+            a: &Tensor,
+            b: &Tensor,
+        ) -> TractResult<(u64, Option<usize>)> {
+            let a = a.to_plain_array_view::<D>()?;
+            let b = b.to_plain_array_view::<D>()?;
+            Ok(crate::ulp::max_ulp_distance(a.iter().copied(), b.iter().copied()))
+        }
+        match dt {
+            DatumType::F16 => worst::<f16>(&a, &b),
+            DatumType::F32 => worst::<f32>(&a, &b),
+            DatumType::F64 => worst::<f64>(&a, &b),
+            dt => bail!("No ULP comparison for {dt:?}"),
+        }
+    }
+
+    /// Compare two tensors by integer ULP distance, accepting a distance up to
+    /// `max_ulp`.
+    fn ulp_close_enough(&self, other: &Self, max_ulp: u64) -> TractResult<()> {
+        let (worst, at) = self.max_ulp_distance(other)?;
+        if worst <= max_ulp {
+            return Ok(());
+        }
+        let dt = self.ulp_comparison_dt();
+        let indices = at
+            .map(|flat| {
+                let mut rest = flat;
+                let mut indices = vec![0; self.rank()];
+                for (ix, dim) in self.shape().iter().enumerate().rev() {
+                    indices[ix] = rest % dim;
+                    rest /= dim;
+                }
+                format!("{indices:?}")
+            })
+            .unwrap_or_else(|| "?".to_string());
+        let a = self.cast_to::<f64>()?;
+        let b = other.cast_to::<f64>()?;
+        let (a, b) = (a.to_plain_array_view::<f64>()?, b.to_plain_array_view::<f64>()?);
+        let flat = at.unwrap_or(0);
+        bail!(
+            "Mismatch. Max ULP distance ({dt:?}): {} > {}, at {} ({} != {}).",
+            worst,
+            max_ulp,
+            indices,
+            a.iter().nth(flat).copied().unwrap_or(f64::NAN),
+            b.iter().nth(flat).copied().unwrap_or(f64::NAN),
+        );
     }
 
     /// Transform the tensor into a `ndarray::Array`.
@@ -1428,7 +1795,7 @@ impl Tensor {
         unsafe fn nth_t<T: Datum>(me: &Tensor, nth: usize, output: &mut Tensor) {
             unsafe {
                 let value = me.as_slice_unchecked::<T>()[nth].clone();
-                output.as_slice_mut_unchecked::<T>()[0] = value;
+                std::ptr::write(output.as_slice_mut_unchecked::<T>().as_mut_ptr(), value);
             }
         }
         unsafe {
@@ -1554,18 +1921,13 @@ impl Tensor {
         if start > self.shape[axis] || end > self.shape[axis] || start >= end {
             bail!("Invalid slicing range {start}..{end} on axis {axis} for {self:?}");
         }
-        fn slice_t<T: Datum>(
-            t: &Tensor,
-            axis: usize,
-            start: usize,
-            end: usize,
-        ) -> TractResult<Tensor> {
-            Ok(t.to_plain_array_view::<T>()?
-                .slice_axis(ndarray::Axis(axis), (start..end).into())
-                .into_owned()
-                .into_tensor())
+        let mut shape: TVec<usize> = self.shape().into();
+        shape[axis] = end - start;
+        unsafe {
+            let mut tensor = Tensor::uninitialized_dt(self.datum_type(), &shape)?;
+            tensor.assign_slice_from_resolved(&[], 0..end - start, self, &[], start..end, axis);
+            Ok(tensor)
         }
-        dispatch_datum!(slice_t(self.datum_type())(self, axis, start, end))
     }
 
     #[inline]
@@ -1849,6 +2211,20 @@ mod tests {
     use proptest::collection::vec;
     use proptest::prelude::*;
 
+    // Regression for sonos/tract#2390: from_raw must reject a content length that
+    // does not match the declared shape rather than panicking in copy_from_slice.
+    #[test]
+    fn from_raw_rejects_length_mismatch() {
+        // shape [2, 3] of f32 needs 24 bytes; supply 12.
+        let err = unsafe { Tensor::from_raw_dt(f32::datum_type(), &[2, 3], &[0u8; 12]) }
+            .expect_err("from_raw must reject a short content buffer, not panic");
+        assert!(err.to_string().contains("does not match shape"), "unexpected error: {err}");
+        // Too-long content is rejected as well.
+        assert!(unsafe { Tensor::from_raw_dt(f32::datum_type(), &[2, 3], &[0u8; 32]) }.is_err());
+        // Exact match still succeeds.
+        assert!(unsafe { Tensor::from_raw_dt(f32::datum_type(), &[2, 3], &[0u8; 24]) }.is_ok());
+    }
+
     #[derive(Debug)]
     struct PermuteAxisProblem {
         shape: Vec<usize>,
@@ -1998,5 +2374,399 @@ mod tests {
         let a = symbols.sym("a");
         let t = tensor0(TDim::from(a));
         let _ = t.clone();
+    }
+
+    #[test]
+    fn ulp_approximation_accepts_within_bound() -> TractResult<()> {
+        let a = tensor1(&[1.0f32, 2.0, 3.0]);
+        let b = tensor1(&[
+            f32::from_bits(1.0f32.to_bits() + 1),
+            2.0,
+            f32::from_bits(3.0f32.to_bits() + 2),
+        ]);
+        a.close_enough(&b, Approximation::Ulp(2))?;
+        assert!(a.close_enough(&b, Approximation::Ulp(1)).is_err());
+        assert_eq!(a.max_ulp_distance(&b)?, (2, Some(2)));
+        Ok(())
+    }
+
+    #[test]
+    fn ulp_approximation_uses_the_tensor_own_float_type() -> TractResult<()> {
+        // One f16 rounding step is ~8192 f32 steps. Measuring in f32 would make an
+        // adjacent-f16 pair look wildly off, so the comparison must stay in f16.
+        let one = f16::from_f32(1.0);
+        let a = tensor1(&[one]);
+        let b = tensor1(&[f16::from_bits(one.to_bits() + 1)]);
+        assert_eq!(a.ulp_comparison_dt(), DatumType::F16);
+        assert_eq!(a.max_ulp_distance(&b)?, (1, Some(0)));
+        a.close_enough(&b, Approximation::Ulp(1))?;
+        Ok(())
+    }
+
+    #[test]
+    fn ulp_approximation_is_scale_free() -> TractResult<()> {
+        // The same relative error at wildly different magnitudes reads the same,
+        // which a shared atol cannot do.
+        let a = tensor1(&[1e-30f32, 1e30]);
+        let b = tensor1(&[
+            f32::from_bits(1e-30f32.to_bits() + 1),
+            f32::from_bits(1e30f32.to_bits() + 1),
+        ]);
+        a.close_enough(&b, Approximation::Ulp(1))?;
+        Ok(())
+    }
+
+    #[test]
+    fn ulp_approximation_rejects_shape_mismatch() {
+        let a = tensor1(&[1.0f32, 2.0]);
+        let b = tensor1(&[1.0f32]);
+        assert!(a.close_enough(&b, Approximation::Ulp(1000)).is_err());
+    }
+
+    // stack_tensors picks between three copy strategies by block size; they must
+    // all agree with plain index arithmetic. Sizes 1/2/4/8 cover the typed-copy
+    // dispatch, and a trailing axis of 1 gives the one-datum blocks that
+    // FastEnhancer's [1, 256, 1, 2] and DTLN's [1, 2, 128, 2] concats produce.
+    fn stack_reference<T: Datum + Copy + num_traits::Zero>(
+        axis: usize,
+        tensors: &[Tensor],
+    ) -> Tensor {
+        let mut shape: TVec<usize> = tensors[0].shape().into();
+        shape[axis] = tensors.iter().map(|t| t.shape()[axis]).sum();
+        let mut out = Tensor::zero::<T>(&shape).unwrap();
+        let outer: usize = shape[..axis].iter().product();
+        let inner: usize = shape[axis + 1..].iter().product();
+        let mid = shape[axis];
+        let ov = unsafe { out.as_slice_mut_unchecked::<T>() };
+        let mut base = 0;
+        for t in tensors {
+            let m = t.shape()[axis];
+            let tv = unsafe { t.as_slice_unchecked::<T>() };
+            for o in 0..outer {
+                for j in 0..m {
+                    for i in 0..inner {
+                        ov[(o * mid + base + j) * inner + i] = tv[(o * m + j) * inner + i];
+                    }
+                }
+            }
+            base += m;
+        }
+        out
+    }
+
+    fn ramp<T: Datum + Copy + From<u8>>(shape: &[usize], seed: u8) -> Tensor {
+        let n: usize = shape.iter().product();
+        let v: Vec<T> = (0..n).map(|i| T::from(seed.wrapping_add(i as u8))).collect();
+        Tensor::from_shape(shape, &v).unwrap()
+    }
+
+    macro_rules! stack_agrees_for {
+        ($name:ident, $t:ty) => {
+            #[test]
+            fn $name() {
+                for shape in [
+                    tvec!(1usize, 256, 1, 1),
+                    tvec!(1usize, 2, 128, 1),
+                    tvec!(1usize, 35, 35, 8),
+                    tvec!(4usize, 3),
+                    tvec!(7usize),
+                ] {
+                    for axis in 0..shape.len() {
+                        let a: Tensor = ramp::<$t>(&shape, 1);
+                        let b: Tensor = ramp::<$t>(&shape, 100);
+                        let c: Tensor = ramp::<$t>(&shape, 200);
+                        for n in 1..=3 {
+                            let ins = [a.clone(), b.clone(), c.clone()][..n].to_vec();
+                            let got = Tensor::stack_tensors(axis, &ins).unwrap();
+                            let want = stack_reference::<$t>(axis, &ins);
+                            assert_eq!(got, want, "shape {shape:?} axis {axis} n {n}");
+                        }
+                    }
+                }
+            }
+        };
+    }
+
+    stack_agrees_for!(stack_tensors_agrees_u8, u8);
+    stack_agrees_for!(stack_tensors_agrees_u16, u16);
+    stack_agrees_for!(stack_tensors_agrees_u32, u32);
+    stack_agrees_for!(stack_tensors_agrees_u64, u64);
+
+    // A zero extent before the concatenated axis makes `outer` zero; the block
+    // path divides by it, so it must not be taken.
+    #[test]
+    fn stack_tensors_tolerates_a_zero_outer_extent() {
+        let a = Tensor::zero::<f32>(&[0, 2, 3]).unwrap();
+        let stacked = Tensor::stack_tensors(2, &[a.clone(), a.clone()]).unwrap();
+        assert_eq!(stacked.shape(), &[0, 2, 6]);
+    }
+
+    // assign_slice copies one contiguous run per coordinate of the axes before
+    // `axis`; the runs must agree with plain index arithmetic for every axis,
+    // including the trailing one where each run is a single datum.
+    fn assign_slice_reference<T: Datum + Copy>(
+        dst: &Tensor,
+        dst_range: Range<usize>,
+        src: &Tensor,
+        src_range: Range<usize>,
+        axis: usize,
+    ) -> Tensor {
+        let mut out = dst.clone();
+        let outer: usize = dst.shape()[..axis].iter().product();
+        let inner: usize = dst.shape()[axis + 1..].iter().product();
+        let dst_mid = dst.shape()[axis];
+        let src_mid = src.shape()[axis];
+        let sv = unsafe { src.as_slice_unchecked::<T>() };
+        let ov = unsafe { out.as_slice_mut_unchecked::<T>() };
+        for o in 0..outer {
+            for j in 0..dst_range.len() {
+                for i in 0..inner {
+                    ov[(o * dst_mid + dst_range.start + j) * inner + i] =
+                        sv[(o * src_mid + src_range.start + j) * inner + i];
+                }
+            }
+        }
+        out
+    }
+
+    macro_rules! assign_slice_agrees_for {
+        ($name:ident, $t:ty) => {
+            #[test]
+            fn $name() {
+                for (shape, axis, dst_mid, src_mid, dst_start, len, src_start) in [
+                    (tvec!(1usize, 56, 24), 2, 24, 8, 16, 8, 0),
+                    (tvec!(1usize, 56, 24), 2, 24, 24, 0, 16, 8),
+                    (tvec!(1usize, 32, 4, 128), 3, 128, 128, 0, 64, 64),
+                    (tvec!(1usize, 8, 16, 64), 2, 16, 1, 3, 1, 0),
+                    (tvec!(3usize, 5), 0, 3, 7, 1, 2, 4),
+                    (tvec!(4usize, 3), 1, 3, 3, 0, 3, 0),
+                    (tvec!(7usize), 0, 7, 7, 2, 0, 5),
+                ] {
+                    let mut dst_shape = shape.clone();
+                    dst_shape[axis] = dst_mid;
+                    let mut src_shape = shape.clone();
+                    src_shape[axis] = src_mid;
+                    let mut got: Tensor = ramp::<$t>(&dst_shape, 1);
+                    let src: Tensor = ramp::<$t>(&src_shape, 100);
+                    let want = assign_slice_reference::<$t>(
+                        &got,
+                        dst_start..dst_start + len,
+                        &src,
+                        src_start..src_start + len,
+                        axis,
+                    );
+                    got.assign_slice(
+                        dst_start..dst_start + len,
+                        &src,
+                        src_start..src_start + len,
+                        axis,
+                    )
+                    .unwrap();
+                    assert_eq!(got, want, "shape {dst_shape:?} axis {axis}");
+                }
+            }
+        };
+    }
+
+    assign_slice_agrees_for!(assign_slice_agrees_u8, u8);
+    assign_slice_agrees_for!(assign_slice_agrees_u16, u16);
+    assign_slice_agrees_for!(assign_slice_agrees_u32, u32);
+    assign_slice_agrees_for!(assign_slice_agrees_u64, u64);
+
+    // The prefixed assign copies the same runs inside one sub-tensor of each
+    // side, and the prefixed axes are free to differ in extent.
+    macro_rules! assign_slice_at_prefix_agrees_for {
+        ($name:ident, $t:ty) => {
+            #[test]
+            fn $name() {
+                for (shape, prefix, src_lead, src_prefix, axis, start, len, src_start) in [
+                    (tvec!(3usize, 5, 7), tvec!(2usize), 4, tvec!(3usize), 2, 3, 4, 0),
+                    (tvec!(3usize, 5, 7), tvec!(0usize), 1, tvec!(0usize), 1, 1, 3, 2),
+                    (tvec!(2usize, 4, 8, 3), tvec!(1usize, 2), 2, tvec!(0usize, 1), 3, 0, 3, 0),
+                    (tvec!(4usize, 6), tvec!(), 4, tvec!(), 1, 2, 4, 2),
+                ] {
+                    let mut src_shape = shape.clone();
+                    src_shape[0] = src_lead;
+                    let mut got: Tensor = ramp::<$t>(&shape, 1);
+                    let src: Tensor = ramp::<$t>(&src_shape, 100);
+                    // A prefixed assign is the same assign between the two
+                    // sub-tensors, which a slice materializes.
+                    let mut want_sub = sub_tensor(&got, &prefix);
+                    want_sub
+                        .assign_slice(
+                            start..start + len,
+                            &sub_tensor(&src, &src_prefix),
+                            src_start..src_start + len,
+                            axis - prefix.len(),
+                        )
+                        .unwrap();
+                    got.assign_slice_at_prefix(
+                        &prefix,
+                        start..start + len,
+                        &src,
+                        &src_prefix,
+                        src_start..src_start + len,
+                        axis,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        sub_tensor(&got, &prefix),
+                        want_sub,
+                        "shape {shape:?} prefix {prefix:?} axis {axis}"
+                    );
+                }
+            }
+        };
+    }
+
+    fn sub_tensor(t: &Tensor, prefix: &[usize]) -> Tensor {
+        let mut sub = t.clone();
+        for ix in prefix {
+            sub = sub.slice(0, *ix, ix + 1).unwrap();
+            sub.remove_axis(0).unwrap();
+        }
+        sub
+    }
+
+    assign_slice_at_prefix_agrees_for!(assign_slice_at_prefix_agrees_u8, u8);
+    assign_slice_at_prefix_agrees_for!(assign_slice_at_prefix_agrees_u16, u16);
+    assign_slice_at_prefix_agrees_for!(assign_slice_at_prefix_agrees_u32, u32);
+    assign_slice_at_prefix_agrees_for!(assign_slice_at_prefix_agrees_u64, u64);
+
+    // fill_slice writes one contiguous run per coordinate of the axes between
+    // the prefix and `axis`; the runs must agree with plain index arithmetic,
+    // including on the trailing axis where each run is a single datum.
+    fn fill_slice_reference<T: Datum + Copy>(
+        data: &Tensor,
+        prefix: &[usize],
+        range: Range<usize>,
+        value: T,
+        axis: usize,
+    ) -> Tensor {
+        let mut out = data.clone();
+        let shape = data.shape().to_vec();
+        let inner: usize = shape[axis + 1..].iter().product();
+        let mid = shape[axis];
+        let outer: usize = shape[prefix.len()..axis].iter().product();
+        let at: usize = izip!(prefix, data.strides()).map(|(ix, s)| ix * *s as usize).sum();
+        let ov = unsafe { out.as_slice_mut_unchecked::<T>() };
+        for o in 0..outer {
+            for j in range.clone() {
+                for i in 0..inner {
+                    ov[at + (o * mid + j) * inner + i] = value;
+                }
+            }
+        }
+        out
+    }
+
+    macro_rules! fill_slice_agrees_for {
+        ($name:ident, $t:ty) => {
+            #[test]
+            fn $name() {
+                for (shape, prefix, axis, start, len) in [
+                    (tvec!(1usize, 56, 24), tvec!(), 2, 16, 8),
+                    (tvec!(3usize, 5, 7), tvec!(), 1, 1, 3),
+                    (tvec!(3usize, 5, 7), tvec!(2usize), 2, 3, 4),
+                    (tvec!(3usize, 5, 7), tvec!(1usize, 4), 2, 0, 7),
+                    (tvec!(4usize, 3), tvec!(), 0, 1, 2),
+                    (tvec!(2usize, 8, 16, 64), tvec!(1usize), 2, 3, 1),
+                    (tvec!(7usize), tvec!(), 0, 2, 0),
+                ] {
+                    let value: $t = 42 as $t;
+                    let mut got: Tensor = ramp::<$t>(&shape, 1);
+                    let want =
+                        fill_slice_reference::<$t>(&got, &prefix, start..start + len, value, axis);
+                    got.fill_slice_at_prefix(&prefix, start..start + len, &tensor0(value), axis)
+                        .unwrap();
+                    assert_eq!(got, want, "shape {shape:?} prefix {prefix:?} axis {axis}");
+                }
+            }
+        };
+    }
+
+    fill_slice_agrees_for!(fill_slice_agrees_u8, u8);
+    fill_slice_agrees_for!(fill_slice_agrees_u16, u16);
+    fill_slice_agrees_for!(fill_slice_agrees_u32, u32);
+    fill_slice_agrees_for!(fill_slice_agrees_u64, u64);
+
+    #[test]
+    fn fill_slice_carries_non_copy_data() {
+        let strings = |v: [&str; 6]| {
+            ndarray::Array2::from_shape_vec((2, 3), v.iter().map(|s| s.to_string()).collect())
+                .unwrap()
+                .into_tensor()
+        };
+        let mut data = strings(["a", "b", "c", "d", "e", "f"]);
+        data.fill_slice(1..3, &tensor0("x".to_string()), 1).unwrap();
+        assert_eq!(data, strings(["a", "x", "x", "d", "x", "x"]));
+    }
+
+    #[test]
+    fn assign_slice_carries_non_copy_data() {
+        let strings = |v: [&str; 6]| {
+            ndarray::Array2::from_shape_vec((2, 3), v.iter().map(|s| s.to_string()).collect())
+                .unwrap()
+                .into_tensor()
+        };
+        let mut dst = strings(["a", "b", "c", "d", "e", "f"]);
+        let src = ndarray::Array2::from_shape_vec((2, 1), vec!["x".to_string(), "y".to_string()])
+            .unwrap()
+            .into_tensor();
+        dst.assign_slice(1..2, &src, 0..1, 1).unwrap();
+        assert_eq!(dst, strings(["a", "x", "c", "d", "y", "f"]));
+    }
+
+    // The run-based broadcast must agree with the ndarray view it replaced, over
+    // leading, middle and trailing broadcast axes and over ranks that grow.
+    #[test]
+    fn broadcast_to_shape_agrees_with_the_view() {
+        for (src, dst) in [
+            (tvec!(1usize, 8, 1, 7, 4), tvec!(1usize, 8, 4, 7, 4)),
+            (tvec!(1usize, 1, 1, 7), tvec!(2usize, 3, 5, 7)),
+            (tvec!(4usize), tvec!(2usize, 3, 5, 4)),
+            (tvec!(1usize, 5, 3), tvec!(6usize, 5, 3)),
+            (tvec!(2usize, 3), tvec!(2usize, 3)),
+            (tvec!(1usize), tvec!(3usize, 1, 2)),
+            (tvec!(3usize, 1), tvec!(3usize, 0)),
+        ] {
+            for dt in [f32::datum_type(), u8::datum_type(), i32::datum_type()] {
+                let t = Tensor::zero_dt(dt, &src).unwrap().cast_to_dt(dt).unwrap().into_owned();
+                let got = t.broadcast_to_shape(&dst).unwrap();
+                let want = dispatch_datum!(Tensor::broadcast_to_shape_t(dt)(&t, &dst)).unwrap();
+                assert_eq!(got.shape(), &*dst, "{src:?} -> {dst:?}");
+                assert_eq!(got, want, "{src:?} -> {dst:?} {dt:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn broadcast_to_shape_carries_values_and_rejects_mismatches() {
+        let t = tensor2(&[[1u8, 2, 3], [4, 5, 6]]);
+        let got = t.clone().into_shape(&[2, 1, 3]).unwrap().broadcast_to_shape(&[2, 2, 3]).unwrap();
+        assert_eq!(got, tensor3(&[[[1u8, 2, 3], [1, 2, 3]], [[4, 5, 6], [4, 5, 6]]]));
+        assert!(t.broadcast_to_shape(&[3, 3]).is_err());
+        assert!(t.broadcast_to_shape(&[3]).is_err());
+    }
+
+    #[test]
+    fn slice_keeps_the_datum_type_and_the_values() {
+        let t = ramp::<u32>(&tvec!(2usize, 3, 4), 0);
+        let got = t.slice(1, 1, 3).unwrap();
+        let mut want = Tensor::zero::<u32>(&[2, 2, 4]).unwrap();
+        want.assign_slice(0..2, &t, 1..3, 1).unwrap();
+        assert_eq!(got, want);
+        let quantized = Tensor::zero_dt(
+            i8::datum_type().quantize(QParams::ZpScale { zero_point: 3, scale: 0.5 }),
+            &[2, 4],
+        )
+        .unwrap();
+        assert_eq!(quantized.slice(1, 0, 2).unwrap().datum_type(), quantized.datum_type());
+    }
+
+    #[test]
+    fn ulp_bounds_are_distinguished_by_equality() {
+        assert_eq!(Approximation::Ulp(1), Approximation::Ulp(1));
+        assert_ne!(Approximation::Ulp(1), Approximation::Ulp(2));
     }
 }

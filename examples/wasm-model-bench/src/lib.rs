@@ -14,7 +14,7 @@ pub fn build_zero_inputs(model: &Runnable) -> Result<TVec<TValue>> {
     for &outlet in typed.input_outlets()?.iter() {
         let fact = typed.outlet_fact(outlet)?;
         let shape: Vec<usize> =
-            fact.shape.iter().map(|d| d.to_usize()).collect::<TractResult<Vec<_>>>()?;
+            fact.shape.iter().map(|d| d.to_usize()).collect::<Result<Vec<_>, _>>()?;
         let dt = fact.datum_type;
         let tensor = Tensor::zero_dt(dt, &shape)?;
         inputs.push(tensor.into_tvalue());
@@ -57,7 +57,7 @@ pub fn run_quality_check(model: &Runnable, inputs: &TVec<TValue>) -> Result<()> 
         let dt = out.datum_type();
         let shape = out.shape();
         if dt == DatumType::F32 {
-            let tensor: &Tensor = &*out;
+            let tensor: &Tensor = out;
             let slice: &[f32] = unsafe { tensor.as_slice_unchecked::<f32>() };
             let n = slice.len();
             let l2: f64 = slice.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();

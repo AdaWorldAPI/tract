@@ -349,17 +349,18 @@ impl SymbolScopeData {
         let mut visited = vec![];
         let mut todo = vec![t.clone()];
         while let Some(t) = todo.pop() {
-            if t.to_i64().is_ok_and(|i| i >= 0) {
+            if t.as_i64().is_some_and(|i| i >= 0) {
                 return true;
             }
             if t.inclusive_bound(self, false).is_some_and(|l| l >= 0) {
                 return true;
             }
             // Div(a, q) with q >= 1 is non-negative whenever a is non-negative.
-            if let TDim::Div(a, q) = &t {
-                if *q >= 1 && self.prove_positive_or_zero_inner_with_extra(a, extra) {
-                    return true;
-                }
+            if let TDim::Div(a, q) = &t
+                && *q >= 1
+                && self.prove_positive_or_zero_inner_with_extra(a, extra)
+            {
+                return true;
             }
             let syms = t.symbols();
             for s in syms {

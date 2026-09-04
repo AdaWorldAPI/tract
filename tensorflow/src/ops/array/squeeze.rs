@@ -5,11 +5,11 @@ use tract_hir::ops::array::Squeeze;
 
 pub fn squeeze(_ctx: &ParsingContext, pb: &NodeDef) -> TractResult<Box<dyn InferenceOp>> {
     let squeeze_dims = pb.get_attr_opt_list_int("squeeze_dims")?;
-    if let Some(mut squeeze_dims) = squeeze_dims {
-        if squeeze_dims.len() > 0 {
-            squeeze_dims.sort();
-            return Ok(expand(Squeeze::new(Some(squeeze_dims))));
-        }
+    if let Some(mut squeeze_dims) = squeeze_dims
+        && squeeze_dims.len() > 0
+    {
+        squeeze_dims.sort();
+        return Ok(expand(Squeeze::new(Some(squeeze_dims))));
     }
     Ok(expand(Squeeze::default()))
 }
@@ -24,7 +24,12 @@ mod tests {
     where
         I: Into<Tensor>,
     {
-        expand(op).eval(tvec![input.into().into()]).unwrap().pop().unwrap().into_tensor()
+        expand(op)
+            .eval(&EvalContext::out_of_plan(), tvec![input.into().into()])
+            .unwrap()
+            .pop()
+            .unwrap()
+            .into_tensor()
     }
 
     #[test]

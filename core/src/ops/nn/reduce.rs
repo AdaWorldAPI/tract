@@ -10,6 +10,7 @@ use std::iter::Sum;
 use std::mem::transmute;
 use tract_data::internal::ClampCast;
 use tract_data::itertools::Itertools;
+use tract_linalg::routines::Func;
 use tract_ndarray::prelude::*;
 use tract_num_traits::{AsPrimitive, Bounded};
 
@@ -208,39 +209,57 @@ impl Reducer {
                     .map(|(idx, dim)| if idx != axis { *dim } else { 1 })
                     .collect_vec();
 
-                output = Some(ArrayD::from_shape_fn(output_shape.clone(), |coords| {
-                    let mut view = input_view.view();
-                    for ix in 0..output_shape.len() {
-                        if ix != axis {
-                            view.collapse_axis(Axis(ix), coords[ix]);
-                        }
-                    }
-
-                    if let Some(slice) = view.as_slice() {
-                        if T::datum_type() == f16::datum_type() {
-                            let slice: &[f16] = unsafe { std::mem::transmute(slice) };
-                            (tract_linalg::ops().sum_f16)()
-                                .run_with_params(slice, ())
-                                .unwrap()
-                                .as_()
-                        } else if T::datum_type() == f32::datum_type() {
-                            let slice: &[f32] = unsafe { std::mem::transmute(slice) };
-                            (tract_linalg::ops().sum_f32)()
-                                .run_with_params(slice, ())
-                                .unwrap()
-                                .as_()
-                        } else {
-                            slice.iter().cloned().sum::<T>()
-                        }
-                    } else {
+                output = Some(if let Some(full) = input_view.as_slice() {
+                    // Whole input is C-contiguous and `axis` is the last axis,
+                    // so it lays out as [n_rows, reduced_dim] row-major: sum
+                    // each row in one pass. Rows split across threads while
+                    // each row's reduction stays serial and bit-identical.
+                    let n_rows = full.len() / reduced_dim;
+                    let mut out = vec![T::zero(); n_rows];
+                    let total = full.len();
+                    // Reduce kernels are Send + Sync; build once and share by ref.
+                    let sum_f16 = Func::ReduceSum.reduce_f16().unwrap();
+                    let sum_f32 = Func::ReduceSum.reduce_f32().unwrap();
+                    tract_linalg::multithread::par_chunks_mut(
+                        &mut out,
+                        1,
+                        total,
+                        |first_row, o| {
+                            let rows = full[first_row * reduced_dim..][..o.len() * reduced_dim]
+                                .chunks_exact(reduced_dim);
+                            if reduced_dim >= 4 && T::datum_type() == f16::datum_type() {
+                                for (x, c) in o.iter_mut().zip(rows) {
+                                    let c: &[f16] = unsafe { std::mem::transmute(c) };
+                                    *x = sum_f16.run_with_params(c, ())?.as_();
+                                }
+                            } else if reduced_dim >= 4 && T::datum_type() == f32::datum_type() {
+                                for (x, c) in o.iter_mut().zip(rows) {
+                                    let c: &[f32] = unsafe { std::mem::transmute(c) };
+                                    *x = sum_f32.run_with_params(c, ())?.as_();
+                                }
+                            } else {
+                                // reduced_dim < 4 (kernel dispatch not worth it) or a
+                                // non-f16/f32 type: a plain sum matches the kernel's
+                                // remainder path bit-for-bit.
+                                for (x, c) in o.iter_mut().zip(rows) {
+                                    *x = c.iter().cloned().sum::<T>();
+                                }
+                            }
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                    ArrayD::from_shape_vec(output_shape.clone(), out).unwrap()
+                } else {
+                    ArrayD::from_shape_fn(output_shape.clone(), |coords| {
                         let first: *const T = &input_view[coords];
                         let mut sum = T::zero();
                         for i in 0..reduced_dim {
                             sum = sum + unsafe { *(first.add(i * input_stride)) };
                         }
                         sum
-                    }
-                }));
+                    })
+                });
             }
             output.unwrap().into_tensor()
         }
@@ -295,9 +314,12 @@ where
 {
     if T::datum_type() == f32::datum_type()
         && let Some(slice) = v.as_slice()
+        && !slice.is_empty()
     {
         let slice = unsafe { transmute::<&[T], &[f32]>(slice) };
-        (tract_linalg::ops().max_f32)().run(slice).unwrap();
+        let max = Func::ReduceMax.reduce_f32().unwrap().run(slice).unwrap();
+        // SAFETY: T is f32 in this branch (checked above).
+        return unsafe { std::mem::transmute_copy::<f32, T>(&max) };
     }
     v.fold(T::min_value(), |acc, &v| if acc > v { acc } else { v })
 }
@@ -306,6 +328,15 @@ fn min_t<T>(v: ArrayViewD<T>, _: ()) -> T
 where
     T: Copy + Datum + num_traits::Bounded + ::std::cmp::PartialOrd,
 {
+    if T::datum_type() == f32::datum_type()
+        && let Some(slice) = v.as_slice()
+        && !slice.is_empty()
+    {
+        let slice = unsafe { transmute::<&[T], &[f32]>(slice) };
+        let min = Func::ReduceMin.reduce_f32().unwrap().run(slice).unwrap();
+        // SAFETY: T is f32 in this branch (checked above).
+        return unsafe { std::mem::transmute_copy::<f32, T>(&min) };
+    }
     v.fold(T::max_value(), |acc, &v| if acc < v { acc } else { v })
 }
 
@@ -361,11 +392,9 @@ impl Op for Reduce {
 }
 
 impl EvalOp for Reduce {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         Ok(tvec!(self.reducer.reduce(&self.axes, &inputs[0])?.into()))
     }
 }
@@ -627,4 +656,64 @@ pub fn expand_mean_of_squares(
     }
     patch.shunt_outside(model, node.id.into(), wire[0])?;
     Ok(Some(patch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Guards the f32 max reduction (max_t): the SIMD `max_f32` kernel result must
+    // be returned (contiguous path), with the scalar fold used only for strided
+    // slices. Checked against explicit per-row / per-col references.
+    #[test]
+    fn reduce_max_f32_contiguous_and_strided() {
+        let (r, c) = (5usize, 37usize); // c not a multiple of the SIMD width (tail)
+        let data: Vec<f32> = (0..r * c).map(|i| ((i * 31 % 97) as f32) - 48.0).collect();
+        let t = Tensor::from_shape(&[r, c], &data).unwrap();
+
+        // axis 1: per-row max — contiguous slices -> SIMD path.
+        let got = Reducer::Max.reduce(&[1], &t).unwrap();
+        assert_eq!(got.shape(), &[r, 1]);
+        for (i, &g) in unsafe { got.as_slice_unchecked::<f32>() }.iter().enumerate() {
+            let want = data[i * c..(i + 1) * c].iter().copied().fold(f32::MIN, f32::max);
+            assert_eq!(g, want, "row {i}");
+        }
+
+        // axis 0: per-col max — strided slices -> scalar fold.
+        let got = Reducer::Max.reduce(&[0], &t).unwrap();
+        assert_eq!(got.shape(), &[1, c]);
+        for (j, &g) in unsafe { got.as_slice_unchecked::<f32>() }.iter().enumerate() {
+            let want = (0..r).map(|i| data[i * c + j]).fold(f32::MIN, f32::max);
+            assert_eq!(g, want, "col {j}");
+        }
+
+        // k == 1 (single-element reduction) exercises the SIMD-path length guard.
+        let t1 = Tensor::from_shape(&[3, 1], &[1.0f32, -2.0, 3.0]).unwrap();
+        let got = Reducer::Max.reduce(&[1], &t1).unwrap();
+        assert_eq!(unsafe { got.as_slice_unchecked::<f32>() }, &[1.0, -2.0, 3.0]);
+    }
+
+    // Same coverage for the f32 min reduction (min_t -> SIMD min_f32 / scalar fold).
+    #[test]
+    fn reduce_min_f32_contiguous_and_strided() {
+        let (r, c) = (5usize, 37usize); // c not a multiple of the SIMD width (tail)
+        let data: Vec<f32> = (0..r * c).map(|i| ((i * 31 % 97) as f32) - 48.0).collect();
+        let t = Tensor::from_shape(&[r, c], &data).unwrap();
+
+        // axis 1: per-row min — contiguous slices -> SIMD path.
+        let got = Reducer::Min.reduce(&[1], &t).unwrap();
+        assert_eq!(got.shape(), &[r, 1]);
+        for (i, &g) in unsafe { got.as_slice_unchecked::<f32>() }.iter().enumerate() {
+            let want = data[i * c..(i + 1) * c].iter().copied().fold(f32::MAX, f32::min);
+            assert_eq!(g, want, "row {i}");
+        }
+
+        // axis 0: per-col min — strided slices -> scalar fold.
+        let got = Reducer::Min.reduce(&[0], &t).unwrap();
+        assert_eq!(got.shape(), &[1, c]);
+        for (j, &g) in unsafe { got.as_slice_unchecked::<f32>() }.iter().enumerate() {
+            let want = (0..r).map(|i| data[i * c + j]).fold(f32::MAX, f32::min);
+            assert_eq!(g, want, "col {j}");
+        }
+    }
 }

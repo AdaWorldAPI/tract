@@ -1,7 +1,15 @@
 {#
 // vim: set syntax=asm :
 
-// TODO[TSolberg] : Not validated.
+// AVX-512 (zmm, 16-wide) tanh. Polynomial-numerator / polynomial-denominator
+// rational approximation of tanh clamped to [-7.5, 7.5]. Validated against the
+// generic scalar reference via tanh_frame_tests! (see x86_64.rs).
+//
+// The coefficients are this kernel's own, not the fit the other f32 tanh kernels
+// share, so its clamp answers to its own error. That clamp alone holds the result
+// in [-1, 1], so the quotient carries none: raising it voids the range, as the
+// quotient crosses 1 from 8.13 up, where 1 - tanh(x) has fallen under the fmadd
+// chains' rounding error.
 
 System V ABI:
     args: rdi, rsi, rdx, rcx, r8, r9
@@ -88,7 +96,7 @@ avx512_tanh_f32_{{suffix}} proc
     cmp     rsi, 0
     je      {{L}}done
 
-    cmp     rsi, 32
+    cmp     rsi, 64
     jl      {{L}}loop_1
 
 {{L}}loop_4:
@@ -188,8 +196,8 @@ avx512_tanh_f32_{{suffix}} proc
     vmovaps [rdi + 192], zmm7
 
     add     rdi, 256
-    sub     rsi, 32
-    cmp     rsi, 32
+    sub     rsi, 64
+    cmp     rsi, 64
     jg      {{L}}loop_4
 
     cmp     rsi, 0
@@ -235,8 +243,8 @@ avx512_tanh_f32_{{suffix}} proc
     vdivps          zmm4, zmm4, zmm12
 
     vmovaps [rdi], zmm4
-    add     rdi, 32
-    sub     rsi, 8
+    add     rdi, 64
+    sub     rsi, 16
     jnz     {{L}}loop_1
 
 {{L}}done:
@@ -276,9 +284,9 @@ avx512_tanh_f32_{{suffix}} proc
 {% set float %}{% if msvc %} real4 {%else%} .float {%endif%}{% endset %}
 
 {{L}}coeffs_num_low:
-    {{float}} -9.0                     // low
+    {{float}} -7.5                     // low
 {{L}}coeffs_num_high:
-    {{float}} 9.0                      // high
+    {{float}} 7.5                      // high
 
 {{L}}coeffs_num_alpha_13:
     {{float}} -2.76076847742355e-16    // alpha_13

@@ -65,7 +65,7 @@ impl Debug for TfliteRunnable {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct TfliteState(TfliteRunnable);
 
 impl State for TfliteState {
@@ -126,10 +126,6 @@ impl State for TfliteState {
     }
 
     fn runnable(&self) -> &dyn Runnable {
-        todo!()
-    }
-
-    fn freeze(&self) -> Box<dyn FrozenState> {
         todo!()
     }
 }

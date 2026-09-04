@@ -15,11 +15,9 @@ impl Op for SpaceToBatch {
 }
 
 impl EvalOp for SpaceToBatch {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (input, block_shape, paddings) = args_3!(inputs);
         let block_shape = block_shape.cast_to::<i32>()?;
         let block_shape = block_shape.to_plain_array_view::<i32>()?.into_dimensionality()?;
@@ -108,11 +106,9 @@ impl Op for BatchToSpace {
 }
 
 impl EvalOp for BatchToSpace {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (input, block_shape, crops) = args_3!(inputs);
         let block_shape = block_shape.cast_to::<i32>()?;
         let block_shape = block_shape.to_plain_array_view::<i32>()?.into_dimensionality()?;
