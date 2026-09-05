@@ -385,6 +385,10 @@ fn llc_bytes() -> usize {
     max.unwrap_or(32 * 1024 * 1024)
 }
 
+// The arguments ARE the benchmarked shape — datum type plus the GEMM's own
+// dimensions. Folding them into a parameter struct would name the same eight
+// values one indirection away without making any call site clearer.
+#[allow(clippy::too_many_arguments)]
 fn bench_shape(
     dt: DatumType,
     m: usize,

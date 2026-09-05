@@ -1,3 +1,7 @@
+# Bump log (append-only):
+# - 2026-09-05: pinned to a fixed channel (was floating "stable"), joining
+#   the workspace-wide Rust toolchain sweep. A future bump edits only the
+#   `channel` line below — the version lives in exactly one place.
 [toolchain]
-channel = "stable"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]

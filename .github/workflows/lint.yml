@@ -1,0 +1,55 @@
+name: lint
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: false
+  CARGO_NET_RETRY: 10
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # `rustup show` installs and activates whatever `rust-toolchain.toml`
+      # pins, so the version lives in exactly ONE place. This is also the
+      # repo's own idiom — the other workflows drive rustup directly rather
+      # than through a third-party toolchain action.
+      - name: Setup rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup component add rustfmt
+
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup component add clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - run: cargo clippy --all-targets -- -D warnings
