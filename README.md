@@ -1,7 +1,7 @@
 ![tract-logo](assets/tract-logo/PNG/tract-horizontal-blue.png)
 
 ![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)
-![rustc >= 1.97.0](https://img.shields.io/badge/rustc-%3E%3D1.97.0-brightgreen)
+![rustc >= 1.98.0](https://img.shields.io/badge/rustc-%3E%3D1.98.0-brightgreen)
 ![MIT/Apache 2](https://img.shields.io/crates/l/tract)
 [![Native Linux test status](https://github.com/sonos/tract/workflows/Native%20Linux/badge.svg)](https://github.com/sonos/tract/actions)
 [![Embedded targets status](https://github.com/sonos/tract/workflows/Embedded%20targets/badge.svg)](https://github.com/sonos/tract/actions)
