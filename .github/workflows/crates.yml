@@ -160,11 +160,13 @@ jobs:
       with:
         save-if: ${{ github.ref == 'refs/heads/main' }}
 
+    # Advisory only (no -D warnings) — the enforced gate lives in lint.yml.
     - run: rustup component add clippy && cargo clippy --all-targets
     - name: clippy (bench-suite feature)
       run: cargo clippy -p tract-cli --features bench-suite
     - name: test (bench-suite feature)
       run: cargo test -p tract-cli --features bench-suite --bin tract bench_
+    # Enforced fmt check also runs in lint.yml; kept here too for this job's own gating.
     - name: fmt
       run: rustup component add rustfmt --toolchain stable && cargo +stable fmt --check
     - name: Warnings
