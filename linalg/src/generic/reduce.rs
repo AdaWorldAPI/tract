@@ -227,8 +227,8 @@ pub mod softmax_l2 {
     #[inline]
     fn exp_sum_impl(x: &mut [f32], max: f32) -> f32 {
         let mut acc = [0f32; 4];
-        let mut it = x.chunks_exact_mut(4);
-        for c in &mut it {
+        let (chunks, remainder) = x.as_chunks_mut::<4>();
+        for c in chunks.iter_mut() {
             for (j, v) in c.iter_mut().enumerate() {
                 let y = accurate_exp_f32(*v - max);
                 *v = y;
@@ -236,7 +236,7 @@ pub mod softmax_l2 {
             }
         }
         let mut sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
-        for v in it.into_remainder().iter_mut() {
+        for v in remainder.iter_mut() {
             let y = accurate_exp_f32(*v - max);
             *v = y;
             sum += y;
