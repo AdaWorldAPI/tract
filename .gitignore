@@ -20,3 +20,9 @@ proptest-regressions
 wheelhouse
 target-bisector*
 /nvidia
+
+# Cargo.lock is not committed in this fork: the workspace consumes the
+# AdaWorldAPI/ndarray fork by git branch, and a committed lock pins a stale
+# revision of it (measured: the lock held ndarray e55af0e3 while the branch
+# was at f43338fb, so builds silently used a two-merge-old dependency).
+Cargo.lock
