@@ -317,8 +317,7 @@ pub fn ace_top_mxfp8_block(
 ) {
     let mut bsr = AceBsr::init();
     bsr.load_group0(a_scale, b_scale);
-    for (za, zb) in a.chunks_exact(ACE_ZMM_BYTES).zip(b.chunks_exact(ACE_ZMM_BYTES)) {
-        let (za, zb) = (za.try_into().unwrap(), zb.try_into().unwrap());
+    for (za, zb) in a.as_chunks::<ACE_ZMM_BYTES>().0.iter().zip(b.as_chunks::<ACE_ZMM_BYTES>().0) {
         ace_top4mxf8ps(dst, za, AceFp8::Hf8, zb, AceFp8::Hf8, &bsr, 0);
     }
 }
@@ -333,8 +332,8 @@ pub fn ace_top_mxint8_block(
 ) {
     let mut bsr = AceBsr::init();
     bsr.load_group0(a_scale, b_scale);
-    for (za, zb) in a.chunks_exact(ACE_ZMM_BYTES).zip(b.chunks_exact(ACE_ZMM_BYTES)) {
-        ace_top4mxbssps(dst, za.try_into().unwrap(), zb.try_into().unwrap(), &bsr, 0);
+    for (za, zb) in a.as_chunks::<ACE_ZMM_BYTES>().0.iter().zip(b.as_chunks::<ACE_ZMM_BYTES>().0) {
+        ace_top4mxbssps(dst, za, zb, &bsr, 0);
     }
 }
 

@@ -52,4 +52,6 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - run: cargo clippy --all-targets -- -D warnings
+      # derive-new expands `Self { field: field }` with the field's own span, so
+      # clippy reports redundant_field_names on every #[derive(new)] struct.
+      - run: cargo clippy --all-targets -- -D warnings -A clippy::redundant_field_names

@@ -81,8 +81,7 @@ mod tests {
         let mut model = TypedModel::default();
         let s = model.add_source("s", f32::datum_type().fact([2usize, 3]))?;
         let node = model.node(s.node);
-        let change =
-            AxisOp::Reshape(0, tvec![4.to_dim(), 5.to_dim()].into(), tvec![20.to_dim()].into());
+        let change = AxisOp::Reshape(0, tvec![4.to_dim(), 5.to_dim()], tvec![20.to_dim()]);
         let blocked = node
             .op
             .change_axes(&model, node, InOut::Out(0), &change)

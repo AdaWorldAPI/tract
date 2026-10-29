@@ -78,7 +78,7 @@ pub struct ScratchSpaceImpl<TI: LADatum> {
     remnant_right: usize,
 }
 
-#[derive(Debug, new)]
+#[derive(Debug)]
 struct LocDependent {
     spec: usize,
     ker_spec: usize,
