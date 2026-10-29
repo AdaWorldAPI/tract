@@ -160,6 +160,42 @@ unsafe fn x86_64_avx512_leaky_relu_f32_64n_run(buf: &mut [f32], alpha: f32) {
     }
 }
 
+// leaky_relu(x) = x > 0 ? x : alpha * x, built on `ndarray::simd::F32x16` instead of
+// hand-rolled intrinsics/asm. Additional candidate alongside
+// `x86_64_avx512_leaky_relu_f32_64n` above: `F32x16` resolves at ndarray's own compile
+// time to a native `__m512`-backed type under `avx512f`, or to a pair of `__m256`
+// halves otherwise, so this single body serves both without tract choosing between
+// them itself. Declared at `X86_64Avx2` because that is what a tract build (no global
+// `avx512f` target feature) actually links against.
+routine_ew_rust!(x86_64;
+    f32,
+    x86_64_ndarray_leaky_relu_f32_16n,
+    16,
+    16,
+    #[inline(never)]
+    fn run(buf: &mut [f32], alpha: f32) {
+        debug_assert!(buf.len() % Self::nr() == 0);
+        debug_assert!(buf.as_ptr() as usize % Self::alignment_bytes() == 0);
+        x86_64_ndarray_leaky_relu_f32_16n_run(buf, alpha)
+    },
+    func(LeakyRelu),
+    param,
+    isa(X86_64Avx2)
+);
+
+#[cfg(target_arch = "x86_64")]
+fn x86_64_ndarray_leaky_relu_f32_16n_run(buf: &mut [f32], alpha: f32) {
+    use ndarray::simd::F32x16;
+    let alpha_v = F32x16::splat(alpha);
+    let zero = F32x16::splat(0.0);
+    for chunk in buf.as_chunks_mut::<{ F32x16::LANES }>().0 {
+        let x = F32x16::from_slice(chunk.as_slice());
+        let scaled = x * alpha_v;
+        let y = x.simd_gt(zero).select(x, scaled);
+        y.copy_to_slice(chunk.as_mut_slice());
+    }
+}
+
 // Tanh-form GELU (pow=3) matching tract's GeluApproximate:
 //   gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 // Composed at the kernel level (mirrors arm64): save the original x, compute

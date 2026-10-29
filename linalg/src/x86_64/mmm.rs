@@ -127,6 +127,72 @@ MMMExternKernel!(x86_64; avx512_mmm_f32_128x1<f32>(128, 1)@(512,4) isa(X86_64Avx
 MMMExternKernel!(x86_64; avx512_mmm_f32_16x1 <f32>( 16, 1)@(512,4) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_16x12<f32>( 16,12)@(512,4) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_16x8 <f32>( 16, 8)@(512,4) isa(X86_64Avx512f));
+
+// Pilot: same 16x8 tile geometry as avx512_mmm_f32_16x8 above, so the two are directly
+// comparable, but the AddMatMul accumulation calls into the AdaWorldAPI ndarray fork's
+// `BlasLevel3::blas_gemm` instead of hand-written asm.
+//
+// Deliberately NOT registered through the `(x86_64; ...)` macro sugar, which also
+// `inventory::submit!`s an `MmmRoutine` that `MmmDispatch::native()` (and so
+// `core::ops::einsum::kernel_selection::strategize`'s symbolic-N fallback, which picks the
+// largest-`nr` kernel per packing group and bypasses `preferred`/boost entirely) would
+// discover automatically. Calling the lower-level form directly skips that
+// `inventory::submit!`, so the kernel stays reachable for direct construction (this pilot's
+// own bench/tests) but invisible to automatic dispatch.
+MMMRustKernel!(ndarray_gemm::kernel::<16, 8> => ndarray_avx512_mmm_f32_16x8<f32>(16, 8)
+    built(cfg!(target_arch = "x86_64")) arch(Some(crate::isa::Arch::X86_64)) isa(X86_64Avx512f));
+
+// Pilot v2: 16x16 tile geometry (matching ndarray's fixed bf16_tile_gemm_16x16 shape). The
+// AddMatMul accumulation truncates operands to bf16 and calls the AdaWorldAPI ndarray fork's
+// `simd::bf16_tile_gemm_16x16_packed` (AMX / AVX-512-VNNI-bf16 / FMA-polyfill tiers) instead of
+// hand-written asm -- see ndarray_bf16_gemm.rs's module doc for the precision tradeoff and the
+// honest read on how this compares structurally and numerically to pilot v1's blas_gemm
+// candidate.
+//
+// Deliberately NOT registered through the `(x86_64; ...)` macro sugar, which also
+// `inventory::submit!`s an `MmmRoutine` that `MmmDispatch::native()` (and so
+// `core::ops::einsum::kernel_selection::strategize`) discovers automatically. This kernel's
+// nr=16 is larger than every existing f32 AVX-512 kernel (max nr=12, `avx512_mmm_f32_16x12`),
+// so the symbolic-N grouped fallback in `strategize` -- which picks the largest-`nr` kernel
+// per packing group, bypassing `preferred`/boost entirely -- would silently select this
+// bf16-truncating kernel for real f32 models with a dynamic N dimension. Calling the lower-level
+// form directly skips that `inventory::submit!`, so the kernel stays reachable for direct
+// construction (this pilot's own bench/tests) but invisible to automatic dispatch -- the
+// concrete guarantee "purely additive, no behavior change" actually requires.
+//
+// `lossy_no_exact_tests(true)`: this kernel's accumulate path truncates its f32 operands to
+// bf16 before compute, so it cannot pass `MMMKernel!`'s auto-generated bit-exact test suite
+// (`test_mmm_kernel!`) by construction -- that suite compares against an exact f32 reference.
+// `ndarray_bf16_gemm.rs`'s own `bf16_tolerance` module is this kernel's real correctness test.
+MMMRustKernel!(ndarray_bf16_gemm::kernel => ndarray_avx512_bf16_mmm_f32_16x16<f32>(16, 16)
+    built(cfg!(target_arch = "x86_64")) arch(Some(crate::isa::Arch::X86_64)) isa(X86_64Avx512f)
+    lossy_no_exact_tests(true));
+
+// AMX-native sibling of the kernel above: `AddMatMul` consumes operands already converted to
+// bf16 and VNNI-packed at `prepare_one` time (`ndarray_amx_native_pack.rs`'s
+// `NdarrayAmxBf16A`/`NdarrayAmxBf16B`, packing index 1) instead of redoing that work on every
+// tile call -- see `ndarray_bf16_native_gemm.rs`'s module doc. Same non-`inventory::submit!`
+// registration as the kernel above, for the same reason: reachable only by direct
+// construction, never through `MmmDispatch::native()`.
+//
+// `lossy_no_exact_tests(true)` for the same reason as above; packing 1's own
+// `mmm_packed_packed_tests!` (added by the `packing[1]` clause) is this kernel's auto-generated
+// correctness coverage, on top of `ndarray_bf16_native_gemm.rs`'s own `bf16_tolerance` module.
+//
+// `ndarray_amx_native_pack.rs` and `ndarray_bf16_native_gemm.rs` are both
+// `#![cfg(target_arch = "x86_64")]` at the module level (unlike the other pilot kernels in this
+// file, which stay compiled everywhere `feature = "foreign-inventory"` reaches with an internal
+// stub) -- this registration must match that gate or a foreign-inventory build on another arch
+// fails to resolve the now-nonexistent symbols.
+#[cfg(target_arch = "x86_64")]
+MMMRustKernel!(ndarray_bf16_native_gemm::kernel => ndarray_amx_native_bf16_mmm_f32_16x16<f32>(16, 16)
+    built(cfg!(target_arch = "x86_64")) arch(Some(crate::isa::Arch::X86_64)) isa(X86_64Avx512f)
+    packing[1] = amx_bf16_native => |k| k.with_packing(
+        crate::x86_64::ndarray_amx_native_pack::NdarrayAmxBf16A::new(16),
+        crate::x86_64::ndarray_amx_native_pack::NdarrayAmxBf16B::new(16),
+    );
+    lossy_no_exact_tests(true));
+
 MMMExternKernel!(x86_64; avx512_mmm_f32_32x6 <f32>( 32, 6)@(512,4) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_32x5 <f32>( 32, 5)@(512,4) isa(X86_64Avx512f));
 MMMExternKernel!(x86_64; avx512_mmm_f32_48x4 <f32>( 48, 4)@(512,4) isa(X86_64Avx512f));
@@ -424,7 +490,7 @@ fn avx2_preferred(
 ) -> Option<&'static str> {
     match (dt, query.n) {
         (DatumType::I32, Some(1)) => None,
-        (DatumType::I32, _) => Some(&mmm::avx2_mmm_i32_8x8.name.as_str()),
+        (DatumType::I32, _) => Some(mmm::avx2_mmm_i32_8x8.name.as_str()),
         _ => None,
     }
 }

@@ -211,6 +211,10 @@ mod tests {
     use super::*;
     use crate::ops::test_utils::arb;
 
+    // A test helper whose arguments are the layer's own inputs: three shape
+    // values and the six tensors the operator consumes. Grouping them would
+    // obscure exactly what each case is feeding in.
+    #[allow(clippy::too_many_arguments)]
     fn run(
         s_len: usize,
         heads: usize,
