@@ -1688,12 +1688,13 @@ mod test {
         Ok(())
     }
 
-    fn filled(shape: &[usize], mut f: impl FnMut(usize) -> f32) -> Tensor {
+    fn filled(shape: &[usize], f: impl FnMut(usize) -> f32) -> Tensor {
         let n: usize = shape.iter().product();
-        let data: Vec<f32> = (0..n).map(|i| f(i)).collect();
+        let data: Vec<f32> = (0..n).map(f).collect();
         Tensor::from_shape(shape, &data).unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_lazy(
         fmt: DataFormat,
         input: &Tensor,

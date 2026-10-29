@@ -105,7 +105,8 @@ fn main() -> TractResult<()> {
         let embeddings = embeddings.try_as_plain_ram()?;
         for (i, value) in output[0].try_as_plain_ram()?.as_slice::<f32>()?.iter().enumerate() {
             // Store per-token MoE logits; consumers add their own history sum.
-            let sum: f32 = embeddings.as_slice::<f32>()?.chunks_exact(32).map(|r| r[i % 32]).sum();
+            let sum: f32 =
+                embeddings.as_slice::<f32>()?.as_chunks::<32>().0.iter().map(|r| r[i % 32]).sum();
             let value = value - sum;
             writeln!(expected, "{value:.9}")?;
         }

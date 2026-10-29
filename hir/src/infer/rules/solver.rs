@@ -547,7 +547,7 @@ macro_rules! given_tuple {
 
             /// Returns the paths that the rule depends on.
             fn get_paths(&self) -> Vec<&Path> {
-                let mut v = vec!();
+                let mut v = vec![];
                 $(v.extend(self.$id.get_paths());)*
                 v
             }

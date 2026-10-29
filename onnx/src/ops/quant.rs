@@ -298,18 +298,18 @@ fn min_max_with_zero(xs: &[f32]) -> (f32, f32) {
     const LANES: usize = 16;
     let mut lo = [0f32; LANES];
     let mut hi = [0f32; LANES];
-    let mut chunks = xs.chunks_exact(LANES);
-    for c in &mut chunks {
+    let (chunks, rest) = xs.as_chunks::<LANES>();
+    for c in chunks {
         for ((l, h), &v) in lo.iter_mut().zip(hi.iter_mut()).zip(c) {
             *l = if v < *l { v } else { *l };
             *h = if v > *h { v } else { *h };
         }
     }
     let (mut min, mut max) = (0f32, 0f32);
-    for &v in lo.iter().chain(chunks.remainder()) {
+    for &v in lo.iter().chain(rest) {
         min = if v < min { v } else { min };
     }
-    for &v in hi.iter().chain(chunks.remainder()) {
+    for &v in hi.iter().chain(rest) {
         max = if v > max { v } else { max };
     }
     (min, max)

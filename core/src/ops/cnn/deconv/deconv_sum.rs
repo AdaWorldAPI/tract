@@ -261,7 +261,7 @@ fn write_non_overlapping<T: Datum + Copy>(
                 let tap_row = |kx: usize| &gemm_nc[(ky * sw + kx) * plane + iy * iw..][..iw];
                 if sw == 2 {
                     for (pair, (&even, &odd)) in
-                        row.chunks_exact_mut(2).zip(tap_row(0).iter().zip(tap_row(1)))
+                        row.as_chunks_mut::<2>().0.iter_mut().zip(tap_row(0).iter().zip(tap_row(1)))
                     {
                         pair[0] = add(even, b);
                         pair[1] = add(odd, b);
