@@ -43,7 +43,7 @@ fn k_padded(k: usize) -> usize {
 /// kernel's bf16 rounding.
 fn simulate_bf16_precision_loss(mut tensor: Tensor) -> TractResult<Tensor> {
     if tensor.datum_type() == f32::datum_type() {
-        let mut plain = tensor.try_as_plain_mut()?;
+        let mut plain = tensor.try_as_plain_ram_mut()?;
         let slice = plain.as_slice_mut::<f32>()?;
         let mut bits = vec![0u16; slice.len()];
         f32_to_bf16_batch_rne(slice, &mut bits);
